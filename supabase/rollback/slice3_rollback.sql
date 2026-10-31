@@ -4,6 +4,9 @@
 --   1. Refuses to run if real (non-mock) data would be lost: any recon_imports row with is_mock = false, any pay_line_locks
 --      row (payroll actual), any pay_adjustments row whose external_ref is not 'mock-%' (Kyle's manual adjustments / Cancel Commission),
 --      any policy_count_claims row, or any non-null sales.premier_member_id / sales.lead_source. Export first.
+--      rev 2: also refuses when Kyle's settings would be lost: recon_pay_config differs from its shipped defaults (e.g.
+--      payroll_owner_user_id, cutover_date, a decided OPEN item), agent_pay_rules or premier_addon_map differ from the seed,
+--      or payroll_cutoffs holds a row that is not a MOCK seed row (real submit times).
 --   2. Drops the 9 slice-three views, the slice-three functions, the 11 slice-three tables (their triggers and policies go
 --      with them) and the sales columns premier_member_id + lead_source.
 --   3. Deletes the 3 slice-three versions from supabase_migrations.schema_migrations (slice one + two rows stay).
@@ -11,7 +14,7 @@
 -- audit / premier.* / payroll.adjustment.recorded rows stay as history).
 begin;
 
-do $$ declare n bigint; begin
+do $$ declare n bigint; fp text; begin
   if to_regclass('public.recon_imports') is not null then
     execute 'select count(*) from public.recon_imports where not is_mock' into n;
     if n > 0 then raise exception 'slice-three rollback refused: % non-mock import(s) in recon_imports; export them first', n; end if;
@@ -27,6 +30,35 @@ do $$ declare n bigint; begin
   if to_regclass('public.policy_count_claims') is not null then
     execute 'select count(*) from public.policy_count_claims' into n;
     if n > 0 then raise exception 'slice-three rollback refused: % policy_count_claims row(s); export them first', n; end if;
+  end if;
+  if to_regclass('public.recon_pay_config') is not null then
+    -- compare with a freshly defaulted row (same table definition), ignoring id / note / updated_at
+    create temp table slice3_rb_default (like public.recon_pay_config including defaults) on commit drop;
+    insert into slice3_rb_default default values;
+    execute $q$select count(*) from public.recon_pay_config c, slice3_rb_default d
+                where (to_jsonb(c) - 'id' - 'note' - 'updated_at') is distinct from (to_jsonb(d) - 'id' - 'note' - 'updated_at')$q$ into n;
+    if n > 0 then raise exception 'slice-three rollback refused: recon_pay_config was changed from its defaults (owner / cutover / decisions); export it first'; end if;
+  end if;
+  if to_regclass('public.agent_pay_rules') is not null then
+    execute $q$select count(*) from (
+                 (select agent_name, base_rate_override, addon_bonus_override, no_spiff from public.agent_pay_rules
+                  except select * from (values ('Kaitlyn Romine', 0.25::numeric, 0.00::numeric, false), ('Loreidy Martinez', null::numeric, null::numeric, true)) v)
+                 union all
+                 (select * from (values ('Kaitlyn Romine', 0.25::numeric, 0.00::numeric, false), ('Loreidy Martinez', null::numeric, null::numeric, true)) v
+                  except select agent_name, base_rate_override, addon_bonus_override, no_spiff from public.agent_pay_rules)) x$q$ into n;
+    if n > 0 then raise exception 'slice-three rollback refused: agent_pay_rules differ from the seed; export them first'; end if;
+  end if;
+  if to_regclass('public.premier_addon_map') is not null then
+    -- fingerprint of the 13 seeded mapping rows (Payroll's list as shipped; ProtectLife still 'proposed')
+    execute $q$select md5(string_agg(concat_ws('|', source, pattern, addon_key, tier, qualifies_bonus, status, active, owner), E'\n' order by source, pattern))
+                 from public.premier_addon_map$q$ into fp;
+    if fp is distinct from 'f17a972fa11d6f75d8d34c175c680f87' then
+      raise exception 'slice-three rollback refused: premier_addon_map differs from the seeded list (Payroll / Kyle edits); export it first';
+    end if;
+  end if;
+  if to_regclass('public.payroll_cutoffs') is not null then
+    execute $q$select count(*) from public.payroll_cutoffs where coalesce(note, '') not like 'MOCK seed:%'$q$ into n;
+    if n > 0 then raise exception 'slice-three rollback refused: % real payroll cutoff(s) (Kyle''s submit times); export them first', n; end if;
   end if;
   if exists (select 1 from information_schema.columns where table_schema='public' and table_name='sales' and column_name='premier_member_id') then
     execute 'select count(*) from public.sales where premier_member_id is not null' into n;
@@ -47,9 +79,11 @@ drop view if exists public.premier_recon_unmatched_board;
 drop view if exists public.premier_recon_lines;
 drop view if exists public.premier_member_status;
 drop view if exists public.premier_products_current;
+drop view if exists public.board_submissions_current;
 
 drop function if exists public.premier_log_recon_events();
 drop function if exists public.premier_lock_payday(date);
+drop function if exists public.my_pay_adjustments();
 
 drop table if exists public.pay_adjustments;
 drop table if exists public.pay_line_locks;
@@ -69,6 +103,10 @@ drop function if exists public.pay_lock_immutable();
 drop function if exists public.recon_staging_immutable();
 drop function if exists public.board_parse_raw();
 drop function if exists public.premier_parse_raw();
+drop function if exists public.recon_import_check();
+drop function if exists public.recon_premier_required_cols();
+drop function if exists public.recon_premier_allowed_cols();
+drop function if exists public.recon_board_expected_cols();
 drop function if exists public.recon_spiff_payday(timestamptz, date);
 drop function if exists public.abs_item_count(numeric);
 drop function if exists public.board_answer_addons(text);

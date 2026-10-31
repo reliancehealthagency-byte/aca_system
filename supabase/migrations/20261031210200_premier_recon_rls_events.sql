@@ -11,7 +11,7 @@ begin
     execute format('revoke all on public.%I from public, anon, authenticated', t);
   end loop;
 end $$;
-revoke all on public.premier_products_current, public.premier_member_status, public.premier_recon_lines,
+revoke all on public.board_submissions_current, public.premier_products_current, public.premier_member_status, public.premier_recon_lines,
               public.premier_recon_unmatched_board, public.premier_recon_unmatched_premier, public.premier_recon_open_items,
               public.premier_policy_count_check, public.premier_recon_trueup, public.sales_missing_member_id
   from public, anon, authenticated;
@@ -21,7 +21,7 @@ revoke all on public.premier_products_current, public.premier_member_status, pub
 grant select on public.recon_pay_config, public.agent_pay_rules, public.payroll_cutoffs, public.recon_imports,
                 public.premier_member_products, public.board_submissions, public.premier_addon_map, public.policy_count_claims,
                 public.pay_line_locks, public.pay_adjustments,
-                public.premier_products_current, public.premier_member_status, public.premier_recon_lines,
+                public.board_submissions_current, public.premier_products_current, public.premier_member_status, public.premier_recon_lines,
                 public.premier_recon_unmatched_board, public.premier_recon_unmatched_premier, public.premier_recon_open_items,
                 public.premier_policy_count_check, public.premier_recon_trueup, public.sales_missing_member_id
   to authenticated;
@@ -35,15 +35,25 @@ do $$
 declare t text;
 begin
   foreach t in array array['recon_pay_config','agent_pay_rules','payroll_cutoffs','recon_imports','premier_member_products',
-                           'board_submissions','premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments'] loop
+                           'board_submissions','premier_addon_map','policy_count_claims','pay_line_locks'] loop
     execute format('drop policy if exists %1$s_admin on public.%1$I', t);
     execute format('create policy %1$s_admin on public.%1$I for all to authenticated using (public.is_admin()) with check (public.is_admin())', t);
   end loop;
 end $$;
+-- pay_adjustments (rev 2): admins READ; only the payroll owner (recon_pay_config.payroll_owner_user_id, set by Kyle;
+-- NULL = nobody) may INSERT. Rows are immutable (trigger), so there is no update/delete policy. The BEFORE INSERT trigger
+-- enforces the same rule and overwrites entered_by / entered_by_uid / created_by from auth.uid().
+drop policy if exists pay_adjustments_admin on public.pay_adjustments;
+drop policy if exists pay_adjustments_admin_read on public.pay_adjustments;
+drop policy if exists pay_adjustments_owner_insert on public.pay_adjustments;
+create policy pay_adjustments_admin_read on public.pay_adjustments for select to authenticated using (public.is_admin());
+create policy pay_adjustments_owner_insert on public.pay_adjustments for insert to authenticated
+  with check (auth.uid() is not null
+              and auth.uid() = (select c.payroll_owner_user_id from public.recon_pay_config c where c.id));
 
 -- ---------- diff-event logger ----------
 -- Compares the reconciliation with what was last logged (premier_recon_event_state) and writes ONLY changes to event_log:
---   premier.premium_diff, premier.paid_status_diff, premier.pay_week_diff, premier.post_date_diff  (first run: vs the board claim)
+--   premium_mismatch (same name as slice one's sales trigger), premier.paid_status_diff, premier.pay_week_diff, premier.post_date_diff  (first run: vs the board claim)
 --   premier.info (once per item): duplicate board row, late CS add-on ignored, Premier agent label differs (attribution
 --   unchanged), blank member ID, PHS-only member, OPEN decision, possible rerun, ABS amount flag, clawback proposed.
 -- Nothing about pay or attribution is changed by an event. Re-running with the same data writes nothing.
@@ -67,8 +77,8 @@ begin
     if (base->>'premium') is distinct from (cur->>'premium')
        and abs(coalesce((base->>'premium')::numeric, 0) - coalesce((cur->>'premium')::numeric, 0)) > 0.01 then
       insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
-      values ('premier.premium_diff', uid, rl, 'board_submissions', r.line_key, 'EVENT',
-              jsonb_build_object('member_id', r.member_id, 'agent', r.agent_name, 'attribution', 'unchanged',
+      values ('premium_mismatch', uid, rl, 'board_submissions', r.line_key, 'EVENT',
+              jsonb_build_object('source', 'premier_recon', 'line_key', r.line_key, 'member_id', r.member_id, 'agent', r.agent_name, 'attribution', 'unchanged',
                                  'from', base->'premium', 'from_source', case when prev is null then 'board_claim' else 'premier_previous' end,
                                  'to', cur->'premium', 'premier_excl_one_time', r.premier_premium_excl_one_time,
                                  'paid_on', 'premier_premium', 'open_item', r.open_item));
@@ -151,13 +161,19 @@ begin
                               'note', 'flag only: the new ID is credited only if it is on the board')
       from public.premier_member_status o
       join public.premier_member_status n on n.member_id <> o.member_id
-       and (n.phone1 = o.phone1 or n.email = o.email)
+       and (n.phone_sha256 = o.phone_sha256 or n.email_sha256 = o.email_sha256)
        and n.member_created_date between o.member_created_date and o.member_created_date + (select rerun_match_days from public.recon_pay_config where id)
      where o.paid_status = 'refunded' and n.paid_status in ('confirmed', 'confirmed_inactive')
+    union all
+    select 'revised:' || b.submission_key || ':' || b.id, b.submission_key || '-P',
+           jsonb_build_object('kind', 'board_submission_revised', 'submission_key', b.submission_key, 'member_id', b.member_id,
+                              'agent', b.agent_name, 'versions', b.versions, 'current_import_id', b.import_id,
+                              'note', 'a later board export changed this submission; only the latest version is paid')
+      from public.board_submissions_current b where b.versions > 1
   loop
     if not exists (select 1 from public.premier_recon_event_state where state_key = 'info:' || r.k) then
       insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
-      values (case when r.d->>'kind' = 'addon_mismatch' then 'premier.addon_mismatch' else 'premier.info' end,
+      values (case when r.d->>'kind' = 'addon_mismatch' then 'addon_mismatch' else 'premier.info' end,
               uid, rl, 'board_submissions', r.ref, 'EVENT', r.d);
       insert into public.premier_recon_event_state(state_key, state) values ('info:' || r.k, r.d);
       n := n + 1;
@@ -176,14 +192,16 @@ begin
     raise exception 'premier_lock_payday: admin only';
   end if;
   if extract(dow from p_payday) <> 5 then raise exception 'payday must be a Friday'; end if;
-  insert into public.pay_line_locks(line_key, payday, agent_name, commission, spiffs, board_estimate, premier_corrected, note)
+  insert into public.pay_line_locks(line_key, payday, agent_name, commission, spiffs, missed_spiffs, board_estimate, premier_corrected, note)
   select l.line_key, p_payday, l.agent_name,
          case when l.commission_pay_friday = p_payday then l.actual_commission else 0 end,
-         case when l.spiff_pay_friday = p_payday then l.actual_spiffs else 0 end,
+         case when l.spiff_pay_friday = p_payday then l.actual_spiffs - coalesce(l.missed_spiffs, 0) else 0 end,
+         case when l.missed_spiff_pay_friday = p_payday then coalesce(l.missed_spiffs, 0) else 0 end,
          l.expected_total, l.actual_total, 'locked by premier_lock_payday'
     from public.premier_recon_lines l
    where l.agent_name is not null and l.actual_commission is not null and l.actual_spiffs is not null
-     and (l.commission_pay_friday = p_payday or l.spiff_pay_friday = p_payday)
+     and l.line_status <> 'duplicate_board_row'
+     and (l.commission_pay_friday = p_payday or l.spiff_pay_friday = p_payday or l.missed_spiff_pay_friday = p_payday)
   on conflict (line_key, payday) do nothing;
   get diagnostics n = row_count;
   return n;
@@ -192,7 +210,9 @@ end $$;
 revoke execute on function public.premier_log_recon_events(), public.premier_lock_payday(date) from public, anon;
 grant execute on function public.premier_log_recon_events(), public.premier_lock_payday(date) to authenticated, service_role;
 revoke execute on function public.premier_parse_raw(), public.board_parse_raw(), public.recon_staging_immutable(),
-                           public.pay_lock_immutable() from public, anon, authenticated;
+                           public.pay_lock_immutable(), public.recon_import_check() from public, anon, authenticated;
+revoke execute on function public.recon_premier_required_cols(), public.recon_premier_allowed_cols(), public.recon_board_expected_cols()
+  from public, anon;
 
 -- Slice-three helper functions: signed-in users and server roles only (PUBLIC/anon get nothing).
 revoke execute on function public.recon_parse_date(text), public.recon_parse_ts_et(text), public.recon_parse_money(text),
@@ -222,3 +242,21 @@ drop trigger if exists pay_adjustments_event on public.pay_adjustments;
 create trigger pay_adjustments_event after insert on public.pay_adjustments
   for each row execute function public.log_pay_adjustment();
 revoke execute on function public.log_pay_adjustment(), public.pay_adjustment_open_payday() from public, anon, authenticated;
+
+-- ---------- agent view of their OWN adjustments (rev 2) ----------
+-- Agents can't read pay_adjustments (admin-only RLS). This security-definer function returns only the caller's rows
+-- (roster match: agents.display_name = pay_adjustments.agent_name for agents.user_id = auth.uid()), only amount + note
+-- (never internal_note, never who entered it), and only once the payday's spiff cutoff is recorded as Kyle's submit
+-- (PB §1.8 visibility gate: hidden until the cutoff is set).
+create or replace function public.my_pay_adjustments()
+returns table(payday date, amount numeric, note text, kind text, member_id text)
+language sql stable security definer set search_path = public, pg_temp as $$
+  select a.payday, a.amount, a.reason, a.kind, a.member_id
+    from public.pay_adjustments a
+    join public.agents ag on lower(ag.display_name) = lower(a.agent_name) and ag.user_id = auth.uid()
+   where auth.uid() is not null
+     and exists (select 1 from public.payroll_cutoffs c where c.payday = a.payday and c.source = 'submit')
+   order by a.payday, a.id
+$$;
+revoke execute on function public.my_pay_adjustments() from public, anon;
+grant execute on function public.my_pay_adjustments() to authenticated;

@@ -61,7 +61,12 @@ res "A12 event_log delta from paste (config-row audit only)" "$([ $((EV1-EV0)) -
 # B. rollback: guards, then exact revert
 for g in "update sales set lead_source='web' where ctid=(select ctid from sales limit 1)|lead_source" \
          "insert into pay_adjustments(agent_name,payday,kind,amount,reason,entered_by) values ('Test Agent','2026-11-06','manual',5,'real adj','Kyle')|non-mock pay adjustment" \
-         "insert into recon_imports(kind,file_name,file_sha256,encoding,line_ending,header,row_count,is_mock) values ('sales_board','real.csv',repeat('b',64),'utf-8','CRLF','{A}',0,false)|non-mock import"; do
+         "insert into recon_imports(kind,file_name,file_sha256,encoding,line_ending,header,row_count,is_mock) select kind,'real.csv',repeat('b',64),encoding,line_ending,header,0,false from (values ('sales_board','utf-8','CRLF',(select header from (select array['Timestamp','Member ID','Date Booked','x','Active Date','Agent','Premium','Customer Name','Customer Email','Customer Phone','x','x','Post Date','Email','x','ABS Addon?','x','Deal Type','Agent','x','FFM','Client Name','x','x','Date Booked','x','x','x','Income','x','x','Premier/Neo Addon?','Premier/Neo Member ID','Premier/Neo Premium','ABS Addon?','ABS Member ID','ABS Premium','x','Phone Number','x','Increased Comm/Spiff Product?','Agent']::text[] header) h))) v(kind,encoding,line_ending,header)|non-mock import" \
+         "update recon_pay_config set cutover_date='2026-10-30' where id|changed recon_pay_config (Kyle's cutover)" \
+         "update recon_pay_config set payroll_owner_user_id=gen_random_uuid() where id|payroll owner set" \
+         "insert into payroll_cutoffs(payday,cutoff_at,source,note) values ('2026-11-06','2026-11-05 14:10 America/New_York','submit','Kyle submit')|real payroll cutoff" \
+         "update premier_addon_map set status='approved' where status='proposed'|edited add-on map" \
+         "update agent_pay_rules set no_spiff=false where agent_name='Loreidy Martinez'|edited agent_pay_rules"; do
   G=t3_guard; psql -q -d postgres -c "drop database if exists $G" -c "create database $G template $D" >/dev/null 2>&1
   q $G -c "${g%%|*}" >/dev/null
   psql -X -q -v ON_ERROR_STOP=1 -d $G -f $RB >/tmp/rb.out 2>&1; rc=$?
@@ -95,6 +100,64 @@ q $D -c "alter table sales drop column lead_source" >/dev/null
 res "C3 after undoing, standalone preflight is PASS again" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF | cut -d'|' -f1)"
 D=t3_noslice2; liveish $D noslice2
 abort_case "C4 paste aborts when slice two is not applied" $D ""
+
+# E. import script: header contract, minimization, output handling (local files only; mock data)
+M=/workspace/artifacts/premier_mock; T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+PH=$M/MOCK_PHS_Member_Products_2026-10-31.csv; BD=$M/MOCK_Sales_Board_Form_Responses_1_slice_2026-10-25_to_10-31.csv
+python3 - "$PH" "$T/no_lp.csv" <<'PY'
+import csv, sys
+rows = list(csv.reader(open(sys.argv[1], encoding='cp1252', newline='')))
+i = rows[0].index('Last Payment')
+w = csv.writer(open(sys.argv[2], 'w', encoding='cp1252', newline=''), lineterminator='\r\n')
+w.writerows([r[:i] + r[i + 1:] for r in rows])
+PY
+python3 scripts/csv_to_recon_sql.py --mock --premier "$T/no_lp.csv" >/dev/null 2>"$T/e1"; rc=$?
+res "E1 script refuses a Premier file missing 'Last Payment' (named-column check, not count-only)" "$([ $rc != 0 ] && grep -q "required Premier column(s) missing: Last Payment" "$T/e1" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e1")"
+python3 - "$BD" "$T/moved.csv" <<'PY'
+import csv, sys
+rows = list(csv.reader(open(sys.argv[1], encoding='utf-8', newline='')))
+for r in rows: r[40], r[39] = r[39], r[40]
+csv.writer(open(sys.argv[2], 'w', encoding='utf-8', newline=''), lineterminator='\r\n').writerows(rows)
+PY
+python3 scripts/csv_to_recon_sql.py --mock --board "$T/moved.csv" >/dev/null 2>"$T/e2"; rc=$?
+res "E2 script refuses a board file whose AO column moved" "$([ $rc != 0 ] && grep -q "required board column(s) missing or moved" "$T/e2" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e2")"
+head -c 0 /dev/null; python3 - "$BD" "$T/41.csv" <<'PY'
+import csv, sys
+rows = list(csv.reader(open(sys.argv[1], encoding='utf-8', newline='')))
+csv.writer(open(sys.argv[2], 'w', encoding='utf-8', newline=''), lineterminator='\r\n').writerows([r[:41] for r in rows])
+PY
+python3 scripts/csv_to_recon_sql.py --mock --board "$T/41.csv" >/dev/null 2>"$T/e3"; rc=$?
+res "E3 script refuses a stale 41-column board layout (board_live.csv shape)" "$([ $rc != 0 ] && grep -q "expected the live Sales Board columns" "$T/e3" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e3")"
+python3 scripts/csv_to_recon_sql.py --premier "$PH" >/dev/null 2>"$T/e4"; rc=$?
+res "E4 real (non-mock) import refuses stdout (must use --psql or --out)" "$([ $rc != 0 ] && grep -q "must use --psql" "$T/e4" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e4")"
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --out "$T/real.sql" 2>"$T/e5"; rc=$?
+res "E5 --out writes a 0600 file and prints the delete reminder" "$([ $rc = 0 ] && [ "$(stat -c %a "$T/real.sql")" = 600 ] && grep -q "shred -u" "$T/e5" && echo PASS || echo FAIL)" "mode=$(stat -c %a "$T/real.sql" 2>/dev/null)"
+PII=$(python3 - "$PH" "$BD" <<'PY'
+import csv, sys
+p = list(csv.DictReader(open(sys.argv[1], encoding='cp1252', newline='')))
+b = list(csv.reader(open(sys.argv[2], encoding='utf-8', newline='')))[1:]
+vals = set()
+for r in p:
+    for c in ('First Name', 'Last Name', 'Phone 1', 'Email', 'City'):
+        if len(r[c].strip()) > 3: vals.add(r[c].strip())
+for r in b:
+    for j in (7, 8, 9, 13, 21, 38):
+        if len(r[j].strip()) > 3: vals.add(r[j].strip())
+print('\n'.join(sorted(vals)))
+PY
+)
+NPII=$(printf '%s\n' "$PII" | grep -c .); HIT=$(printf '%s\n' "$PII" | grep -v '^$' | grep -F -f - "$T/real.sql" supabase/seed_slice3_mock.sql | wc -l)
+res "E6 generated SQL (real mode + the committed mock seed) contains none of the $NPII client name/phone/email/city values" "$([ "$NPII" -gt 0 ] && [ "$HIT" = 0 ] && echo PASS || echo FAIL)" "hits=$HIT"
+D=t3_imp; liveish $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --psql "-d $D" >/dev/null 2>&1; rc=$?
+res "E7 --psql streams a real-mode import straight into the DB (no file); minimized rows land" "$([ $rc = 0 ] && [ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select max(cardinality(raw_fields)) from premier_member_products')" = 51 ] && echo PASS || echo FAIL)" "exit=$rc rows=$(q $D -c 'select count(*) from premier_member_products')"
+psql -q -d postgres -c "drop database if exists t3_imp" >/dev/null 2>&1
+
+# F. slices one and two untouched in the repo (only the slice-two paste builder glob changed, output byte-identical)
+CH=$(git diff --name-only main -- supabase/migrations/2026103119*.sql supabase/migrations/2026103120*.sql supabase/seed.sql supabase/seed_slice2.sql supabase/tests/verify.sql supabase/tests/verify_slice2.sql supabase/rollback/slice2_rollback.sql supabase/deploy/slice2_* | paste -sd,)
+res "F1 slice-one/two migrations, seeds, verify files and rollback unchanged vs main" "$([ -z "$CH" ] && echo PASS || echo FAIL)" "${CH:-none changed}"
+bash scripts/build_slice2_paste.sh "$T/s2.sql" >/dev/null
+res "F2 slice-two paste rebuilt from this branch is byte-identical to the applied one" "$([ "$(sha256sum < "$T/s2.sql")" = "$(sha256sum < $PASTE2)" ] && echo PASS || echo FAIL)" "$(sha256sum < "$T/s2.sql" | cut -c1-16)"
 
 # D. fresh build from the repo
 D=t3_fresh; newdb $D

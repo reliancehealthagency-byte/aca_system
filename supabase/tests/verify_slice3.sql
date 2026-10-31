@@ -63,15 +63,53 @@ select pg_temp.r('T5. hours are not an input: no column like %hour% in any slice
   not exists (select 1 from information_schema.columns where table_schema='public' and column_name ilike '%hour%' and table_name in
     ('recon_pay_config','agent_pay_rules','payroll_cutoffs','recon_imports','premier_member_products','board_submissions',
      'premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments')));
-select pg_temp.r('T6. raw ingest: 66 Premier rows x 132 fields (cp1252/CRLF), 35 board rows x 42 fields, raw kept verbatim',
-  (select count(*) = 66 and bool_and(cardinality(raw_fields) = 132) from public.premier_member_products)
+select pg_temp.r('T6. minimized ingest: 66 Premier rows x 51 allow-listed fields (of 132), 35 board rows x 42 (A..AP), cp1252/utf-8 CRLF recorded',
+  (select count(*) = 66 and bool_and(cardinality(raw_fields) = 51) from public.premier_member_products)
   and (select count(*) = 35 and bool_and(cardinality(raw_fields) = 42) from public.board_submissions)
-  and (select bool_and(encoding = case kind when 'premier_member_products' then 'cp1252' else 'utf-8' end and line_ending = 'CRLF') from public.recon_imports)
-  and exists (select 1 from public.premier_member_products where raw_fields::text like '%Wellness Plan of America' || chr(160) || '%'),
-  (select string_agg(kind || ' ' || row_count || ' ' || encoding || ' ' || line_ending, '; ') from public.recon_imports));
+  and (select bool_and(encoding = case kind when 'premier_member_products' then 'cp1252' else 'utf-8' end and line_ending = 'CRLF') from public.recon_imports),
+  (select string_agg(kind || ' ' || row_count || ' ' || encoding || ' ' || line_ending || ' ' || cardinality(header) || ' cols', '; ') from public.recon_imports));
+select pg_temp.r('T6b. data minimization: no Premier name/phone/email/gender/city/ethnicity/height/weight/disability column stored; board H I J N V AC AM blank; hashes only',
+  not exists (select 1 from public.recon_imports i, unnest(i.header) c where i.kind = 'premier_member_products'
+               and c in ('First Name','Last Name','Phone 1','Phone 2','Phone 3','Email','Email2','Email 3','Gender','City','Other City',
+                         'County','Ethnicity','Height','Weight','Disability','Refund Comment','Company Name'))
+  and not exists (select 1 from public.board_submissions b, unnest(array['H','I','J','N','V','AC','AM']) k where btrim(b.raw ->> k) <> '')
+  and not exists (select 1 from information_schema.columns where table_schema = 'public'
+                   and table_name in ('premier_member_products','board_submissions') and column_name in ('first_name','last_name','phone1','email'))
+  and (select count(*) filter (where phone_sha256 ~ '^[0-9a-f]{64}$') > 0 and count(*) filter (where email_sha256 ~ '^[0-9a-f]{64}$') > 0
+         from public.premier_member_products)
+  and (select bool_and(hash_scheme in ('sha256', 'hmac-sha256')) from public.recon_imports));
 do $$ begin
   insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count)
-  select kind, file_name, file_sha256, encoding, line_ending, header, row_count from public.recon_imports limit 1;
+  select kind, 'VERIFY no Last Payment', repeat('c', 64), encoding, line_ending, array_remove(header, 'Last Payment'), 0
+    from public.recon_imports where kind = 'premier_member_products';
+  perform pg_temp.r('H1. Premier import missing a named column (Last Payment) is refused', false, 'insert succeeded');
+exception when others then perform pg_temp.r('H1. Premier import missing a named column (Last Payment) is refused', sqlerrm like '%required column(s) missing: Last Payment%', sqlerrm); end $$;
+do $$ begin
+  insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count)
+  select kind, 'VERIFY with PII', repeat('d', 64), encoding, line_ending, header || array['Phone 1', 'First Name'], 0
+    from public.recon_imports where kind = 'premier_member_products';
+  perform pg_temp.r('H2. Premier import carrying client PII columns (Phone 1, First Name) is refused', false, 'insert succeeded');
+exception when others then perform pg_temp.r('H2. Premier import carrying client PII columns (Phone 1, First Name) is refused', sqlerrm like '%allow-list%Phone 1%', sqlerrm); end $$;
+do $$ begin
+  insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count)
+  select kind, 'VERIFY moved AO', repeat('e', 64), encoding, line_ending, header[1:40] || array['Something Else', 'Agent'], 0
+    from public.recon_imports where kind = 'sales_board';
+  perform pg_temp.r('H3. board import whose AO column (Increased Comm/Spiff Product?) is missing is refused', false, 'insert succeeded');
+exception when others then perform pg_temp.r('H3. board import whose AO column (Increased Comm/Spiff Product?) is missing is refused', sqlerrm like '%AO Increased Comm/Spiff Product?%', sqlerrm); end $$;
+do $$ begin
+  insert into public.board_submissions (import_id, row_num, raw_fields)
+  select b.import_id, 901, (b.raw_fields[1:7] || array['Real Client Name'] || b.raw_fields[9:42])
+    from public.board_submissions b where b.member_id = '687990107';
+  perform pg_temp.r('H4. board row with a client name in H is refused (minimization enforced in the database)', false, 'insert succeeded');
+exception when others then perform pg_temp.r('H4. board row with a client name in H is refused (minimization enforced in the database)', sqlerrm like '%column H holds client data%', sqlerrm); end $$;
+do $$ begin
+  insert into public.board_submissions (import_id, row_num, raw_fields)
+  select b.import_id, 902, b.raw_fields from public.board_submissions b where b.member_id = '687990107';
+  perform pg_temp.r('H5. two rows with one Timestamp in one board file are refused (ambiguous identity)', false, 'insert succeeded');
+exception when unique_violation then perform pg_temp.r('H5. two rows with one Timestamp in one board file are refused (ambiguous identity)', true, sqlerrm); end $$;
+do $$ begin
+  insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count)
+  select kind, file_name, file_sha256, encoding, line_ending, header, row_count from public.recon_imports where kind = 'sales_board';
   perform pg_temp.r('T7. re-importing the same file (same sha256) is refused', false, 'insert succeeded');
 exception when unique_violation then perform pg_temp.r('T7. re-importing the same file (same sha256) is refused', true, sqlerrm); end $$;
 \ir ../seed_slice3_mock.sql
@@ -94,14 +132,14 @@ update ev set n2 = public.premier_log_recon_events();
 select pg_temp.r('T9. event logger: first run logs diffs, second run is a no-op', (select n1 > 0 and n2 = 0 from ev),
   (select format('run1=%s run2=%s', n1, n2) from ev));
 select pg_temp.r('T9b. events by type: premium 2 (S18 247->297, S19 450->427), paid status 6, pay week 2, post date 1, addon_mismatch 6, adjustment 1',
-  (select count(*) from public.event_log where event_type='premier.premium_diff') = 2
+  (select count(*) from public.event_log where event_type='premium_mismatch' and table_name='board_submissions') = 2
   and (select count(*) from public.event_log where event_type='premier.paid_status_diff') = 6
   and (select count(*) from public.event_log where event_type='premier.pay_week_diff') = 2
   and (select count(*) from public.event_log where event_type='premier.post_date_diff') = 1
-  and (select count(*) from public.event_log where event_type='premier.addon_mismatch') = 6
+  and (select count(*) from public.event_log where event_type='addon_mismatch' and table_name='board_submissions') = 6
   and (select count(*) from public.event_log where event_type='payroll.adjustment.recorded') = 1,
   (select string_agg(event_type || '=' || c, ', ' order by event_type) from
-     (select event_type, count(*) c from public.event_log where event_type like 'premier.%' or event_type like 'payroll.%' group by 1) x));
+     (select event_type, count(*) c from public.event_log where table_name in ('board_submissions','pay_adjustments') and action = 'EVENT' group by 1) x));
 
 -- Scenario table: Kyle's-rule expected values (README "Expected under Kyle's rules", MOCK files 10/31 17:13 ET).
 create temp table L as select * from public.premier_recon_lines;
@@ -132,7 +170,7 @@ insert into X values
  ('S27','687990296','P',71.06,0,'2026-11-06',null,'half policy'),
  ('S30','687990909','ABS',0,80,null,null,'ABS Only 4 x 34.98'),
  ('S31','687990912','ABS',0,20,null,null,'ABS Only 1 item, no ACA'),
- ('S33','687990310','P',173.72,50,'2026-11-06','2026-10-30','same-day Edge, AO blank: missed spiff paid'),
+ ('S33','687990310','P',173.72,50,'2026-11-06',null,'same-day Edge, AO blank: missed spiff paid'),
  ('S34','687990317','P',119.32,0,'2026-11-06',null,'Ultra created day after booking: no 43%, no spiff'),
  ('S35','687990324','P',119.32,0,'2026-11-06',null,'board-only Edge claim pays $0'),
  ('S37','687990338','P',119.32,0,'2026-10-23',null,'later CS Ultra pays nothing');
@@ -187,7 +225,7 @@ select pg_temp.r('S18. OPEN (one-time enrollment fee in premium): actual NULL, r
   (select open_item = 'one_time_fee_in_premium' and actual_commission is null and open_alt_a_total = 93.86 and open_alt_b_total = 112.86
      from L where member_id='687990233'));
 select pg_temp.r('S19. premium_diff event 450 -> 427, attribution unchanged; Premier label (Nick) logged as reference only',
-  exists (select 1 from public.event_log where event_type='premier.premium_diff' and detail->>'member_id'='687990240'
+  exists (select 1 from public.event_log where event_type='premium_mismatch' and detail->>'member_id'='687990240'
           and (detail->>'from')::numeric = 450 and (detail->>'to')::numeric = 427 and detail->>'attribution'='unchanged')
   and (select agent_name = 'James Carangelo' from L where member_id='687990240')
   and exists (select 1 from public.event_log where detail->>'kind'='premier_agent_label_differs' and detail->>'member_id'='687990240'));
@@ -208,12 +246,12 @@ select pg_temp.r('S32. ACA Only: $30 flat',
      and board_id not in (select board_id from L where line_type='PADD'))));
 select pg_temp.r('S35. board-only Edge claim: expected (board) 185.02 vs actual 119.32, addon_mismatch logged',
   (select expected_total = 185.02 and actual_total = 119.32 from L where member_id='687990324')
-  and exists (select 1 from public.event_log where event_type='premier.addon_mismatch' and detail->>'member_id'='687990324'));
+  and exists (select 1 from public.event_log where event_type='addon_mismatch' and detail->>'member_id'='687990324'));
 select pg_temp.r('S36. post-dated, AD&D created before the post date counts: projected 109.22 at 43%, payday 11/13, $0 now, no spiff',
   (select projected_commission = 109.22 and commission_pay_friday = '2026-11-13' and actual_commission = 0 and projected_spiffs = 0
           and addon_cutoff_source = 'board_active_date_provisional (Q11 pending Kyle)' from L where member_id='687990331'));
 select pg_temp.r('S37. Kyle''s manual adjustment +$75 to Nicholas Ziccardi on 11/06 (agent sees amount + note); rule still pays the add-on $0',
-  exists (select 1 from public.pay_adjustments where member_id='687990338' and amount=75 and payday='2026-11-06' and entered_by='Kyle')
+  exists (select 1 from public.pay_adjustments where member_id='687990338' and amount=75 and payday='2026-11-06' and source_entered_by='Kyle')
   and (select adjustments_total = 75 and stage2_premier_corrected = 119.32 from public.premier_recon_trueup where member_id='687990338')
   and exists (select 1 from public.event_log where event_type='payroll.adjustment.recorded' and (detail->'agent_visible'->>'amount')::numeric = 75));
 select pg_temp.r('OPEN list = exactly S05 + S18 (pending Kyle)',
@@ -222,11 +260,25 @@ select pg_temp.r('Unmatched board list empty for the mock (every board member is
   (select count(*) from public.premier_recon_unmatched_board) = 0);
 
 -- Configurability + true-up + locks (all inside this transaction)
+insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count, is_mock, hash_scheme, note)
+select kind, 'VERIFY extra board rows', repeat('f', 64), encoding, line_ending, header, 2, true, 'sha256', 'VERIFY'
+  from public.recon_imports where kind = 'sales_board';
+-- (1) a Premier row with a blank Member ID; (2) an ACA + wrap row with an ABS add-on whose wrap member (S10's, never billed) is not paid
 insert into public.board_submissions (import_id, row_num, raw_fields)
-select id, 999, array_fill(''::text, array[42]) from public.recon_imports where kind='sales_board';
-update public.board_submissions set raw_fields = raw_fields where false;  -- no-op
+select (select id from public.recon_imports where file_name = 'VERIFY extra board rows'), 1,
+       array['10/30/2026 15:00:00', ''] || b.raw_fields[3:42]
+  from public.board_submissions b where b.member_id = '687990107';
+insert into public.board_submissions (import_id, row_num, raw_fields)
+select (select id from public.recon_imports where file_name = 'VERIFY extra board rows'), 2,
+       array['10/30/2026 15:05:00'] || b.raw_fields[2:20] || array['9990001111'] || b.raw_fields[22:32]
+       || array['687990170'] || b.raw_fields[34:34] || array['Yes', '687990915', '29.98'] || b.raw_fields[38:42]
+  from public.board_submissions b where b.wrap_member_id = '687990226';
 select pg_temp.r('C1. board row with blank Member ID shows in unmatched board as missing_member_id',
   exists (select 1 from public.premier_recon_unmatched_board where reason='missing_member_id'));
+select pg_temp.r('N1. ABS on an ACA + wrap row resolves its parent to the PADD line (wrap not paid -> ABS parent_not_paid, not NOID)',
+  (select line_status = 'parent_not_paid' from public.premier_recon_lines where line_key = '20261030150500-ABS'),
+  (select line_status || ' / PADD ' || (select line_status from public.premier_recon_lines where line_key = '20261030150500-PADD')
+     from public.premier_recon_lines where line_key = '20261030150500-ABS'));
 update public.premier_addon_map set status = 'approved' where pattern = '(^|[^a-z])add([^a-z]|$)';
 select pg_temp.r('C2. approving the proposed ADD mapping (one row) makes S05 pay 119.54, no code change',
   (select actual_commission = 119.54 and open_item is null from public.premier_recon_lines where member_id='687990135'));
@@ -259,6 +311,39 @@ select pg_temp.r('C4. policy-count check: typed 5 vs board/Premier 4.5 = mismatc
 select pg_temp.r('C5. sales.premier_member_id + lead_source added (nullable); 5 seed sales flagged missing a member ID',
   (select count(*) from information_schema.columns where table_schema='public' and table_name='sales' and column_name in ('premier_member_id','lead_source') and is_nullable='YES') = 2
   and (select count(*) from public.sales_missing_member_id) = 5);
+-- RE1. Board RE-EXPORT (Orchestrator test): the next export carries S01 with a corrected agent, S02 with an edited premium,
+-- and S37 unchanged. Only the latest version of each submission may pay; nothing doubles.
+create temp table before_re as select line_key, agent_name, actual_total from public.premier_recon_lines;
+insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count, is_mock, hash_scheme, note)
+select kind, 'VERIFY board re-export', repeat('1', 64), encoding, line_ending, header, 3, true, 'sha256', 'VERIFY'
+  from public.recon_imports where kind = 'sales_board' and file_name not like 'VERIFY%';
+insert into public.board_submissions (import_id, row_num, raw_fields)
+select (select id from public.recon_imports where file_name = 'VERIFY board re-export'), row_number() over (order by b.member_id),
+       case b.member_id when '687990107' then b.raw_fields[1:5] || array['Chris Wilfong'] || b.raw_fields[7:42]
+                        when '687990114' then b.raw_fields[1:6] || array['499.00'] || b.raw_fields[8:42]
+                        else b.raw_fields end
+  from public.board_submissions b join public.recon_imports i on i.id = b.import_id
+ where i.file_name not like 'VERIFY%' and b.member_id in ('687990107', '687990114', '687990338');
+select pg_temp.r('RE1a. line IDs stay unique after the re-export (lines and true-up)',
+  (select count(*) = count(distinct line_key) from public.premier_recon_lines)
+  and (select count(*) = count(distinct line_key) from public.premier_recon_trueup)
+  and (select count(*) from public.premier_recon_lines) = (select count(*) from before_re),
+  (select format('lines=%s distinct=%s before=%s', count(*), count(distinct line_key), (select count(*) from before_re)) from public.premier_recon_lines));
+select pg_temp.r('RE1b. S02 premium edit: one P line (board claim 499, still paid on Premier 214.57) and ABS paid ONCE ($20)',
+  (select count(*) = 1 and bool_and(board_premium = 499.00 and actual_commission = 214.57) from public.premier_recon_lines where member_id = '687990114' and line_type = 'P')
+  and (select count(*) = 1 and sum(actual_spiffs) = 20 from public.premier_recon_lines where member_id = '687990903' and line_type = 'ABS'),
+  (select string_agg(line_key || ' ' || actual_total, ', ') from public.premier_recon_lines where member_id in ('687990114', '687990903')));
+select pg_temp.r('RE1c. S01 agent correction: pay moves to the corrected agent (Chris Wilfong 137.56), nothing left with Nicholas Ziccardi',
+  (select count(*) = 1 and bool_and(agent_name = 'Chris Wilfong' and actual_total = 137.56) from public.premier_recon_lines where member_id = '687990107')
+  and not exists (select 1 from public.premier_recon_trueup where member_id = '687990107' and agent_name <> 'Chris Wilfong'),
+  (select string_agg(agent_name || ' ' || actual_total, ', ') from public.premier_recon_lines where member_id = '687990107'));
+select pg_temp.r('RE1d. total pay unchanged by the re-export (no double pay anywhere); S37 adjustment still +75 once',
+  (select sum(coalesce(actual_total, 0)) from public.premier_recon_lines) = (select sum(coalesce(actual_total, 0)) from before_re)
+  and (select adjustments_total = 75 from public.premier_recon_trueup where member_id = '687990338'),
+  (select format('after=%s before=%s', (select sum(coalesce(actual_total, 0)) from public.premier_recon_lines), sum(coalesce(actual_total, 0))) from before_re));
+select public.premier_log_recon_events();
+select pg_temp.r('RE1e. each revised submission is logged once (board_submission_revised x3)',
+  (select count(*) from public.event_log where detail ->> 'kind' = 'board_submission_revised') = 3);
 create temp table lk as select public.premier_lock_payday('2026-11-06') n1, public.premier_lock_payday('2026-11-06') n2;
 select pg_temp.r('C6. lock 11/06 writes payroll-actual rows once (second call 0); OPEN rows are not locked',
   (select n1 > 0 and n2 = 0 from lk) and not exists (select 1 from public.pay_line_locks k join L on L.line_key = k.line_key where L.open_item is not null),
@@ -267,6 +352,22 @@ do $$ begin
   update public.pay_line_locks set commission = 0 where true;
   perform pg_temp.r('C7. locks are immutable', false, 'update succeeded');
 exception when others then perform pg_temp.r('C7. locks are immutable', sqlerrm like '%immutable%', sqlerrm); end $$;
+-- RE2. Re-export AFTER the 11/06 lock: S01's agent changes again. The lock is not duplicated or re-paid; the change is flagged.
+insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count, is_mock, hash_scheme, note)
+select kind, 'VERIFY board re-export 2', repeat('2', 64), encoding, line_ending, header, 1, true, 'sha256', 'VERIFY'
+  from public.recon_imports where kind = 'sales_board' and file_name not like 'VERIFY%';
+insert into public.board_submissions (import_id, row_num, raw_fields)
+select (select id from public.recon_imports where file_name = 'VERIFY board re-export 2'), 1,
+       b.raw_fields[1:5] || array['Suzelaine Similien'] || b.raw_fields[7:42]
+  from public.board_submissions b join public.recon_imports i on i.id = b.import_id
+ where i.file_name not like 'VERIFY%' and b.member_id = '687990107';
+select pg_temp.r('RE2. after lock: S01 still one line, one lock (137.56, Chris), final payable 137.56 (not doubled), agent change flagged',
+  (select count(*) from public.premier_recon_trueup where member_id = '687990107') = 1
+  and (select count(*) from public.pay_line_locks where line_key = (select line_key from public.premier_recon_lines where member_id = '687990107')) = 1
+  and (select locked_commission = 137.56 and final_payable = 137.56 and agent_changed_after_lock and locked_agent_names = 'Chris Wilfong'
+         from public.premier_recon_trueup where member_id = '687990107'),
+  (select format('agent=%s locked_by=%s final=%s changed=%s', agent_name, locked_agent_names, final_payable, agent_changed_after_lock)
+     from public.premier_recon_trueup where member_id = '687990107'));
 -- Premier later shows S19 at a different premium: the lock keeps 162.26, the true-up shows the difference.
 insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count, is_mock, note)
 select kind, 'VERIFY later file', repeat('a', 64), encoding, line_ending, header, 1, true, 'VERIFY' from public.recon_imports where kind='premier_member_products';
@@ -281,8 +382,8 @@ select pg_temp.r('C8. after lock, a new Premier premium (400+48) changes stage 2
      from public.premier_recon_trueup where member_id='687990240'),
   (select format('stage2=%s locked=%s due=%s', stage2_premier_corrected, locked_commission, true_up_commission_due) from public.premier_recon_trueup where member_id='687990240'));
 select public.premier_log_recon_events();
-select pg_temp.r('C8b. that premium change is logged once as premier.premium_diff 427 -> 448',
-  exists (select 1 from public.event_log where event_type='premier.premium_diff' and detail->>'member_id'='687990240' and (detail->>'from')::numeric=427 and (detail->>'to')::numeric=448));
+select pg_temp.r('C8b. that premium change is logged once as premium_mismatch 427 -> 448',
+  exists (select 1 from public.event_log where event_type='premium_mismatch' and detail->>'member_id'='687990240' and (detail->>'from')::numeric=427 and (detail->>'to')::numeric=448));
 do $$ begin
   insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by) values ('James Carangelo', '2026-11-06', 'manual', 10, 'late', 'Kyle');
   perform pg_temp.r('C8c. adjustment on a locked (submitted) payday is refused', false, 'insert succeeded');
@@ -298,6 +399,70 @@ select public.premier_log_recon_events();
 select pg_temp.r('C10. Cancel Commission survives a re-run: final = locked 162.26 + 0 spiff - 162.26 = 0, cancelled flag set',
   (select final_payable = 0 and commission_cancelled from public.premier_recon_trueup where member_id='687990240'),
   (select format('final=%s cancelled=%s', final_payable, commission_cancelled) from public.premier_recon_trueup where member_id='687990240'));
+
+-- Q12 missed spiffs (default next_open_payday, pending Kyle)
+select pg_temp.r('Q12a. S33 missed Edge $50 (board AO blank) carries to the next open payday 11/06 (10/30 already submitted)',
+  (select missed_spiffs = 50 and missed_spiff_pay_friday = '2026-11-06' from public.premier_recon_lines where member_id = '687990310'));
+select pg_temp.r('Q12b. S03: board-claimed Edge $50 stays on 10/30, missed Wellness $20 carries to 11/06; S20 missed Asset $20 on 11/06',
+  (select actual_spiffs = 70 and missed_spiffs = 20 and spiff_pay_friday = '2026-10-30' and missed_spiff_pay_friday = '2026-11-06'
+     from public.premier_recon_lines where member_id = '687990121')
+  and (select missed_spiffs = 20 and missed_spiff_pay_friday = '2026-11-06' from public.premier_recon_lines where member_id = '687990247'));
+update public.recon_pay_config set missed_spiff_payday = 'booked_cycle' where id;
+select pg_temp.r('Q12c. config booked_cycle puts S33''s missed spiff back on its Date Booked cycle (10/30)',
+  (select missed_spiff_pay_friday = '2026-10-30' from public.premier_recon_lines where member_id = '687990310'));
+update public.recon_pay_config set missed_spiff_payday = 'next_open_payday' where id;
+
+-- Cutover (hub already paid paydays)
+select pg_temp.r('CUT1. cutover_date NULL (pending Kyle): S37 (hub paid 10/23) is NOT payable: pay NULL, flagged cutover_pending_kyle',
+  (select pay_commission is null and final_payable is null and cutover_status = 'cutover_pending_kyle' from public.premier_recon_trueup where member_id = '687990338'),
+  (select format('pay=%s final=%s status=%s', pay_commission, final_payable, cutover_status) from public.premier_recon_trueup where member_id = '687990338'));
+update public.recon_pay_config set cutover_date = '2026-10-30' where id;
+select pg_temp.r('CUT2. cutover 10/30: S37 commission paid_by_hub ($0 here), final = Kyle''s +$75 only; S03 10/30 Edge $0, its 11/06 missed $20 still payable',
+  (select pay_commission = 0 and final_payable = 75 and cutover_status = 'paid_by_hub' from public.premier_recon_trueup where member_id = '687990338')
+  and (select pay_claimed_spiffs = 0 and pay_missed_spiffs = 20 from public.premier_recon_trueup where member_id = '687990121'),
+  (select format('S37 final=%s status=%s', final_payable, cutover_status) from public.premier_recon_trueup where member_id = '687990338'));
+update public.recon_pay_config set cutover_date = null where id;
+select pg_temp.r('N2. imported hub adjustment takes its component from the file (S37: no Covers -> other), entered_by set server-side',
+  (select component = 'other' and entered_by = 'server:postgres' and source_entered_by = 'Kyle' from public.pay_adjustments where member_id = '687990338'));
+
+-- "Kyle-only" adjustments: only recon_pay_config.payroll_owner_user_id may insert
+select pg_temp.act('authenticated','admin.test@example.com');
+do $$ begin
+  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason) values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY owner unset');
+  reset role; perform pg_temp.r('K1. owner not set (NULL): even an admin cannot record an adjustment', false, 'insert succeeded');
+exception when others then reset role; perform pg_temp.r('K1. owner not set (NULL): even an admin cannot record an adjustment', sqlerrm like '%not set yet%', sqlerrm); end $$;
+update public.recon_pay_config set payroll_owner_user_id = (select id from auth.users where email = 'admin.test@example.com') where id;
+select pg_temp.act('authenticated','admin.test@example.com');
+insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by, external_ref)
+values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY owner entry', 'Somebody Else', 'verify-owner-1');
+reset role;
+select pg_temp.r('K2. the configured owner can record one; a spoofed entered_by is ignored (set from auth.uid() server-side)',
+  (select entered_by = 'Test Admin (fake)' and entered_by_uid = (select id from auth.users where email = 'admin.test@example.com')
+     from public.pay_adjustments where external_ref = 'verify-owner-1'),
+  (select format('entered_by=%s', entered_by) from public.pay_adjustments where external_ref = 'verify-owner-1'));
+insert into auth.users (email) values ('admin2.test@example.com');
+insert into public.agents (display_name, email, role, user_id)
+select 'Second Admin (fake)', 'admin2.test@example.com', 'admin', id from auth.users where email = 'admin2.test@example.com';
+select pg_temp.act('authenticated','admin2.test@example.com');
+do $$ begin
+  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by) values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY other admin', 'Kyle');
+  reset role; perform pg_temp.r('K3. another admin (not the owner) is refused, even claiming entered_by = Kyle', false, 'insert succeeded');
+exception when others then reset role; perform pg_temp.r('K3. another admin (not the owner) is refused, even claiming entered_by = Kyle', sqlerrm like '%only the payroll owner%', sqlerrm); end $$;
+
+-- Agents see their own adjustment (amount + note), never the internal note, only after the payday's submit
+reset role; select set_config('request.jwt.claims', '', true);   -- back to the plain owner session (server path)
+insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, internal_note, external_ref) values
+  ('Alex Testagent (fake)', '2026-10-30', 'manual', 12.5, 'VERIFY visible note', 'VERIFY SECRET internal', 'verify-agent-1'),
+  ('Alex Testagent (fake)', '2026-11-13', 'manual', 7, 'VERIFY not yet visible', null, 'verify-agent-2'),
+  ('Chris Wilfong', '2026-10-30', 'manual', 9, 'VERIFY someone else', null, 'verify-agent-3');
+select pg_temp.act('authenticated','agent.test@example.com');
+create temp table mine as select * from public.my_pay_adjustments();
+reset role;
+select pg_temp.r('V1. agent sees only their own released adjustment: amount 12.50 + note; no internal note, no other agent, not the 11/13 one',
+  (select count(*) = 1 and bool_and(amount = 12.5 and note = 'VERIFY visible note') from mine)
+  and not exists (select 1 from mine m where to_jsonb(m)::text like '%SECRET%')
+  and (select count(*) from information_schema.columns where table_name = 'mine' and column_name in ('internal_note', 'entered_by')) = 0,
+  (select string_agg(to_jsonb(m)::text, '; ') from mine m));
 
 -- RLS as users
 select pg_temp.act('authenticated','agent.test@example.com');
@@ -320,11 +485,11 @@ do $$ begin
   reset role; perform pg_temp.r('R3. agent cannot run the event logger', false, 'ran');
 exception when others then reset role; perform pg_temp.r('R3. agent cannot run the event logger', true, sqlerrm); end $$;
 select pg_temp.act('authenticated','admin.test@example.com');
-do $$ declare n int; begin
-  select count(*) into n from public.premier_recon_lines;
-  reset role;
-  perform pg_temp.r('R4. admin user sees the reconciliation (38 mock lines + 1 VERIFY blank board row = 39)', n = 39, format('lines=%s', n));
-end $$;
+create temp table seen as select count(*) n from public.premier_recon_lines;
+reset role;
+select pg_temp.r('R4. admin user sees the same reconciliation lines as the owner role',
+  (select n from seen) = (select count(*) from public.premier_recon_lines) and (select n from seen) > 0,
+  (select format('admin=%s owner=%s', (select n from seen), count(*)) from public.premier_recon_lines));
 
 reset role;
 \o

@@ -97,7 +97,7 @@ $$;
 create or replace view public.premier_products_current with (security_invoker = true) as
 select distinct on (p.member_id, p.product_id, p.product_created_date)
        p.id, p.import_id, p.row_num, p.member_id, p.product_id, p.product_label, p.product_benefit, p.period_label,
-       p.agent_label, p.first_name, p.last_name, p.phone1, p.email, p.member_created_date, p.product_created_date,
+       p.agent_label, p.phone_sha256, p.email_sha256, p.member_created_date, p.product_created_date,
        p.active_date, p.first_billing_date, p.next_billing_date, p.inactive_date, p.hold_date, p.hold_reason,
        p.paid, p.last_payment, p.refund_requested, p.refund_provided, p.refund_provided_date,
        f.recurring as recurring_fee, f.one_time as one_time_fee, a.addon_key, a.tier as addon_tier, a.qualifies as addon_qualifies,
@@ -120,7 +120,7 @@ with a as (
          min(first_billing_date) first_billing_date, min(next_billing_date) next_billing_date, min(active_date) active_min,
          bool_or(inactive_date is not null) any_inactive, max(inactive_date) inactive_max,
          string_agg(distinct hold_reason, '; ') hold_reasons, max(agent_label) agent_label,
-         min(member_created_date) member_created_date, max(phone1) phone1, max(email) email, max(last_name) last_name,
+         min(member_created_date) member_created_date, max(phone_sha256) phone_sha256, max(email_sha256) email_sha256,
          bool_or(is_mock) is_mock
     from public.premier_products_current group by member_id)
 select a.*,
@@ -136,6 +136,17 @@ select a.*,
                         from public.premier_products_current p
                        where p.member_id = a.member_id and p.recurring_fee + p.one_time_fee > 0) v;
 
+-- Current version of each board submission. Supersede rule (rev 2): a submission is identified by its Timestamp
+-- (submission_key); when a later export carries the same submission (edited premium, corrected agent / member, ...), the
+-- row from the most recent import (imported_at, then import id) is the ONLY version used for pay. Older versions stay in
+-- board_submissions as evidence. A submission missing from a later export keeps its last version (exports are weekly slices).
+create or replace view public.board_submissions_current with (security_invoker = true) as
+select distinct on (bs.submission_key) bs.*, i.is_mock, i.imported_at,
+       (select count(*) from public.board_submissions o where o.submission_key = bs.submission_key) as versions
+  from public.board_submissions bs join public.recon_imports i on i.id = bs.import_id
+ where public.recon_can_read()
+ order by bs.submission_key, i.imported_at desc, i.id desc;
+
 -- Every board pay line (P = Premier policy, PADD = ACA wrap, ACA = $30 flat, ABS = $/item), reconciled to Premier.
 -- Kyle 10/31 add-on rulings (recorded by Payroll in payroll-breakdown.md, header update 5:10 PM): Premier products win over
 -- the board AO for both the +5% and spiffs; missed spiffs pay; board-only claims pay $0; only products created on or before
@@ -143,13 +154,10 @@ select a.*,
 create or replace view public.premier_recon_lines with (security_invoker = true) as
 with cfg as (select * from public.recon_pay_config where id),
 rt as (select * from public.commission_rates()),
-b as (  -- latest copy of each board row (same timestamp + same fields = same row across re-imports)
-  select distinct on (bs.submitted_at, bs.raw_fields) bs.*, i.is_mock
-    from public.board_submissions bs join public.recon_imports i on i.id = bs.import_id
-   where public.recon_can_read()
-   order by bs.submitted_at, bs.raw_fields, i.imported_at desc, i.id desc, bs.row_num),
+last_submit as (select max(payday) payday from public.payroll_cutoffs where source = 'submit'),
+b as (select * from public.board_submissions_current),
 bl as (
-  select b.id board_id, b.row_num, v.line_type, v.member_id, b.member_id raw_member, v.d, v.claim_premium,
+  select b.id board_id, b.row_num, b.submission_key, v.line_type, v.member_id, b.member_id raw_member, v.d, v.claim_premium,
          b.submitted_at, b.agent_name, b.agent_source_col, b.deal_type, b.line_kind, b.board_post_date, b.board_active_date,
          b.increased_answer, b.aca_ffm, b.is_mock
     from b
@@ -166,9 +174,9 @@ bl as (
 ),
 k as (
   select bl.*,
-         to_char(bl.submitted_at at time zone 'America/New_York', 'YYYYMMDDHH24MISS') || '-'
-           || coalesce(case when bl.line_type = 'ACA' then bl.aca_ffm else bl.member_id end, 'NOID') || '-' || bl.line_type as line_key,
-         to_char(bl.submitted_at at time zone 'America/New_York', 'YYYYMMDDHH24MISS') || '-' || coalesce(bl.raw_member, 'NOID') || '-P' as parent_key,
+         bl.submission_key || '-' || bl.line_type as line_key,     -- unique: one current version per submission, one line per type
+         -- the hub's Line ID (Timestamp-Member-Type), kept so hub "Covers" references (spiff:<id>) can be matched
+         bl.submission_key || '-' || coalesce(case when bl.line_type = 'ACA' then bl.aca_ffm else bl.member_id end, 'NOID') || '-' || bl.line_type as hub_line_id,
          case when bl.line_type in ('P', 'PADD') and bl.member_id is not null then
            row_number() over (partition by bl.line_type in ('P', 'PADD'), bl.member_id order by bl.submitted_at, bl.board_id) end as dup_rank
     from bl
@@ -239,7 +247,11 @@ pr as (
          (select coalesce(sum(case t when 'asset' then c.spiff_cc_asset when 'edge' then c.spiff_cc_edge when 'ultra' then c.spiff_cc_ultra end), 0)
             from unnest(w.p_tiers) t, cfg c) + coalesce(w.p_wellness, 0) * (select spiff_wellness from cfg) spiff_premier_raw,
          (select coalesce(sum(case t when 'asset' then c.spiff_cc_asset when 'edge' then c.spiff_cc_edge when 'ultra' then c.spiff_cc_ultra end), 0)
-            from unnest(w.b_tiers) t, cfg c) + case when w.b_wellness then (select spiff_wellness from cfg) else 0 end spiff_board_raw
+            from unnest(w.b_tiers) t, cfg c) + case when w.b_wellness then (select spiff_wellness from cfg) else 0 end spiff_board_raw,
+         -- the part of Premier's spiffs the board also claimed (the rest is "missed", PB Q12)
+         (select coalesce(sum(case t when 'asset' then c.spiff_cc_asset when 'edge' then c.spiff_cc_edge when 'ultra' then c.spiff_cc_ultra end), 0)
+            from unnest(w.p_tiers) t, cfg c where t = any (w.b_tiers))
+           + case when w.b_wellness and coalesce(w.p_wellness, 0) > 0 then (select spiff_wellness from cfg) else 0 end spiff_claimed_raw
     from w cross join rt
 ),
 pf as (
@@ -251,11 +263,12 @@ pf as (
          case when pr.line_type = 'PADD' then (select aca_wrap_rate from cfg)
               else pr.base_r + case when pr.b_qual then pr.bonus_r else 0 end end rate_board,
          case when pr.no_spiff or pr.post_dated then 0 else pr.spiff_premier_raw end spiff_premier,
+         case when pr.no_spiff or pr.post_dated then 0 else least(pr.spiff_claimed_raw, pr.spiff_premier_raw) end spiff_claimed,
          case when pr.no_spiff or pr.board_post_date then 0 else pr.spiff_board_raw end spiff_board
     from pr
 ),
 p_out as (
-  select pf.line_key, pf.board_id, pf.row_num, pf.line_type, pf.member_id, pf.agent_name, pf.agent_source_col, pf.d date_booked,
+  select pf.line_key, pf.hub_line_id, pf.submission_key, pf.board_id, pf.row_num, pf.line_type, pf.member_id, pf.agent_name, pf.agent_source_col, pf.d date_booked,
          pf.submitted_at, pf.is_mock,
          case when pf.dup_rank > 1 then 'duplicate_board_row' when not pf.in_premier then 'not_in_premier' else pf.paid_status end line_status,
          pf.paid_status, pf.claim_premium board_premium,
@@ -266,6 +279,12 @@ p_out as (
          public.recon_friday_after_week(pf.d) expected_pay_friday,
          public.recon_friday_after_week(pf.pay_basis) commission_pay_friday,
          public.recon_spiff_payday(pf.submitted_at, pf.d) spiff_pay_friday,
+         -- missed spiffs (Premier-only, board did not claim): PB Q12, configurable, pending Kyle
+         case when pf.in_premier then pf.spiff_premier - pf.spiff_claimed else 0 end missed_spiffs_projected,
+         case when (select missed_spiff_payday from cfg) = 'next_open_payday'
+                   and public.recon_spiff_payday(pf.submitted_at, pf.d) <= coalesce((select payday from last_submit), date '1900-01-05')
+              then (select payday from last_submit) + 7
+              else public.recon_spiff_payday(pf.submitted_at, pf.d) end missed_spiff_pay_friday_calc,
          -- stage 1: board estimate (board premium + board AO only)
          round(pf.claim_premium * pf.rate_board, 2) expected_commission, pf.spiff_board expected_spiffs,
          -- stage 2: Premier-corrected. Member not in Premier yet: the board claim stays an estimate (Pending PHS), $0 now.
@@ -287,12 +306,13 @@ p_final as (
               when p.mapping_open or p.premium_open then null
               when p.collected then p.projected_commission else 0 end actual_commission,
          case when p.line_status = 'duplicate_board_row' then 0
-              when p.collected then p.projected_spiffs else 0 end actual_spiffs
+              when p.collected then p.projected_spiffs else 0 end actual_spiffs,
+         case when p.line_status = 'duplicate_board_row' or not p.collected then 0 else p.missed_spiffs_projected end actual_missed_spiffs
     from p_out p
 ),
 o as (  -- ABS + ACA lines (dropped with a duplicate board row)
-  select k.line_key, k.board_id, k.row_num, k.line_type, k.member_id, k.agent_name, k.agent_source_col, k.d date_booked,
-         k.submitted_at, k.is_mock, k.claim_premium, k.parent_key, coalesce(apr.no_spiff, false) no_spiff,
+  select k.line_key, k.hub_line_id, k.submission_key, k.board_id, k.row_num, k.line_type, k.member_id, k.agent_name, k.agent_source_col, k.d date_booked,
+         k.submitted_at, k.is_mock, k.claim_premium, coalesce(apr.no_spiff, false) no_spiff,
          case when k.line_type = 'ABS' then (public.abs_item_count(k.claim_premium)).items end abs_items,
          case when k.line_type = 'ABS' then (public.abs_item_count(k.claim_premium)).flagged end abs_flagged
     from k left join public.agent_pay_rules apr on apr.agent_name = k.agent_name
@@ -311,7 +331,8 @@ o_final as (
          case when o.line_type = 'ABS' then public.recon_spiff_payday(o.submitted_at, o.date_booked) end spiff_pay_friday,
          case when o.line_type = 'ACA' then (select aca_flat from cfg) else 0 end expected_commission,
          case when o.line_type = 'ABS' and not o.no_spiff then o.abs_items * (select abs_spiff_per_item from cfg) else 0 end expected_spiffs
-    from o left join p_out par on par.line_key = o.parent_key and o.line_type = 'ABS'
+    -- parent = the P (Premier deal) or PADD (ACA + wrap) line of the SAME board submission (rev 2: no NOID fallback)
+    from o left join p_out par on par.board_id = o.board_id and par.line_type in ('P', 'PADD') and o.line_type = 'ABS'
 )
 select p.line_key, p.board_id, p.row_num board_row, p.line_type, p.member_id, p.agent_name, p.agent_source_col, p.date_booked,
        p.submitted_at, p.line_status, p.paid_status,
@@ -340,7 +361,10 @@ select p.line_key, p.board_id, p.row_num board_row, p.line_type, p.member_id, p.
        case when p.line_type = 'P' and p.board_premium is not null then
          case when p.board_premium < (select half_policy_threshold from cfg) then (select half_policy_value from cfg) else 1 end end
          as board_policy_count,
-       p.late_addons, p.hold_reasons, p.refund_pending, p.blank_created, p.is_mock
+       p.late_addons, p.hold_reasons, p.refund_pending, p.blank_created, p.is_mock,
+       p.hub_line_id, p.submission_key,
+       p.actual_missed_spiffs as missed_spiffs,
+       case when p.actual_missed_spiffs <> 0 or p.missed_spiffs_projected <> 0 then p.missed_spiff_pay_friday_calc end as missed_spiff_pay_friday
   from p_final p
 union all
 select o.line_key, o.board_id, o.row_num, o.line_type, o.member_id, o.agent_name, o.agent_source_col, o.date_booked,
@@ -355,10 +379,11 @@ select o.line_key, o.board_id, o.row_num, o.line_type, o.member_id, o.agent_name
        o.expected_commission, case when o.line_status = 'board_confirmed' then o.expected_spiffs else 0 end,
        o.expected_commission + case when o.line_status = 'board_confirmed' then o.expected_spiffs else 0 end,
        null, null, null, null, null, null, null,
-       o.abs_items, o.abs_flagged, null, null, null, null, null, null, o.is_mock
+       o.abs_items, o.abs_flagged, null, null, null, null, null, null, o.is_mock,
+       o.hub_line_id, o.submission_key, 0, null
   from o_final o;
 comment on view public.premier_recon_lines is
-  'Board pay lines reconciled to Premier. expected_* = board estimate (stage 1), projected_*/actual_* = Premier-corrected (stage 2; actual = collected per Premier). NULL actual + open_item = pending Kyle''s decision (readings in open_alt_a_total / open_alt_b_total).';
+  'Board pay lines reconciled to Premier. One row per (current board submission, line type): line_key = <submission_key>-<type> is unique. expected_* = board estimate (stage 1), projected_*/actual_* = Premier-corrected (stage 2; actual = collected per Premier). actual_spiffs includes missed_spiffs, which pay on missed_spiff_pay_friday (PB Q12). NULL actual + open_item = pending Kyle''s decision (readings in open_alt_a_total / open_alt_b_total).';
 
 -- Board side with no Premier match (or no member ID at all).
 create or replace view public.premier_recon_unmatched_board with (security_invoker = true) as
@@ -378,7 +403,7 @@ select ms.member_id, ms.agent_label as premier_agent_label_reference, ms.member_
             else 'Never billed: counted, not flagged' end as note,
        ms.is_mock
   from public.premier_member_status ms
- where not exists (select 1 from public.board_submissions b
+ where not exists (select 1 from public.board_submissions_current b
                     where ms.member_id in (b.member_id, b.wrap_member_id, b.abs_member_id))
 union all
 select null, p.agent_label, p.member_created_date, null, 1, f.recurring, 'blank_member_id', 0,
@@ -414,29 +439,81 @@ select coalesce(l.agent_name, t.agent_name) agent_name, coalesce(l.week_start, t
   from l full join t on t.agent_name = l.agent_name and t.week_start = l.week_start;
 
 -- True-up: stage 1 board estimate -> stage 2 Premier-corrected -> stage 3 payroll actual (locks) + adjustments.
--- A component (commission / spiffs) is locked once a pay_line_locks row exists for its payday; re-runs never change a
--- locked amount, they only show the true-up due. Adjustments (Cancel Commission, approved clawbacks, true-ups) add on top.
+-- Keys (rev 2): line_key is unique in premier_recon_lines, locks are unique per (line_key, payday) and locks/adjustments are
+-- pre-aggregated per key before joining, so nothing can fan out. Three components, each with its own payday:
+--   commission (commission_pay_friday), board-claimed spiffs (spiff_pay_friday), missed spiffs (missed_spiff_pay_friday).
+-- A component is LOCKED when a lock row exists for its payday (the locked amount wins over any re-run; the difference is
+-- the true-up due). Cutover: a component due on or before recon_pay_config.cutover_date was paid by the hub -> payable 0;
+-- with cutover_date NULL (pending Kyle) a non-zero component due on a payday the hub already submitted -> payable NULL + flag.
+-- A lock written for a different agent than the line's current agent (agent corrected after payroll) is flagged.
 create or replace view public.premier_recon_trueup with (security_invoker = true) as
-select l.line_key, l.agent_name, l.line_type, l.member_id, l.line_status,
-       l.expected_total as stage1_board_estimate,
-       l.actual_total as stage2_premier_corrected,
-       lk.locked_commission, lk.locked_spiffs, lk.commission_locked, lk.spiffs_locked,
-       case when lk.commission_locked or lk.spiffs_locked then lk.locked_commission + lk.locked_spiffs end as stage3_payroll_actual,
-       case when lk.commission_locked then l.actual_commission - lk.locked_commission end as true_up_commission_due,
-       case when lk.spiffs_locked then l.actual_spiffs - lk.locked_spiffs end as true_up_spiffs_due,
-       coalesce(adj.total, 0) as adjustments_total, adj.kinds as adjustment_kinds,
-       coalesce(adj.cancelled, false) as commission_cancelled,
-       case when lk.commission_locked then lk.locked_commission else l.actual_commission end
-         + case when lk.spiffs_locked then lk.locked_spiffs else l.actual_spiffs end
-         + coalesce(adj.total, 0) as final_payable
-  from public.premier_recon_lines l
-  cross join lateral (
-    select coalesce(sum(k.commission), 0) locked_commission, coalesce(sum(k.spiffs), 0) locked_spiffs,
-           coalesce(bool_or(k.payday = l.commission_pay_friday), false) commission_locked,
-           coalesce(bool_or(k.payday = l.spiff_pay_friday), false) spiffs_locked
-      from public.pay_line_locks k where k.line_key = l.line_key) lk
-  left join lateral (select sum(a.amount) total, string_agg(distinct a.kind, ',') kinds, bool_or(a.kind = 'cancel_commission') cancelled
-                       from public.pay_adjustments a where a.line_key = l.line_key) adj on true
+with cfg as (select cutover_date from public.recon_pay_config where id),
+last_submit as (select max(payday) payday from public.payroll_cutoffs where source = 'submit'),
+lk as (select line_key, payday, sum(commission) commission, sum(spiffs) spiffs, sum(missed_spiffs) missed_spiffs,
+              string_agg(distinct agent_name, ', ') agents
+         from public.pay_line_locks where public.recon_can_read() group by line_key, payday),
+adj as (select line_key, sum(amount) total, string_agg(distinct kind, ',') kinds, bool_or(kind = 'cancel_commission') cancelled
+          from public.pay_adjustments where line_key is not null and public.recon_can_read() group by line_key),
+c as (
+  select l.*, coalesce(l.actual_spiffs, 0) - coalesce(l.missed_spiffs, 0) as claimed_spiffs,
+         lc.commission lc_commission, ls.spiffs ls_spiffs, lm.missed_spiffs lm_missed,
+         (select string_agg(distinct x, ', ' order by x) from unnest(array[lc.agents, ls.agents, lm.agents]) x) locked_agents,
+         (select cutover_date from cfg) cutover, (select payday from last_submit) last_submit
+    from public.premier_recon_lines l
+    left join lk lc on lc.line_key = l.line_key and lc.payday = l.commission_pay_friday
+    left join lk ls on ls.line_key = l.line_key and ls.payday = l.spiff_pay_friday
+    left join lk lm on lm.line_key = l.line_key and lm.payday = l.missed_spiff_pay_friday
+),
+d as (
+  select c.*,
+         case when lc_commission is not null then lc_commission
+              when actual_commission is null then null
+              when actual_commission = 0 then 0
+              when cutover is not null and commission_pay_friday <= cutover then 0
+              when cutover is null and commission_pay_friday <= last_submit then null
+              else actual_commission end as pay_commission,
+         case when ls_spiffs is not null then ls_spiffs
+              when claimed_spiffs = 0 then 0
+              when cutover is not null and spiff_pay_friday <= cutover then 0
+              when cutover is null and spiff_pay_friday <= last_submit then null
+              else claimed_spiffs end as pay_claimed_spiffs,
+         case when lm_missed is not null then lm_missed
+              when coalesce(missed_spiffs, 0) = 0 then 0
+              when cutover is not null and missed_spiff_pay_friday <= cutover then 0
+              when cutover is null and missed_spiff_pay_friday <= last_submit then null
+              else missed_spiffs end as pay_missed_spiffs,
+         case when cutover is null and last_submit is not null and (
+                     (lc_commission is null and coalesce(actual_commission, 0) <> 0 and commission_pay_friday <= last_submit)
+                  or (ls_spiffs is null and claimed_spiffs <> 0 and spiff_pay_friday <= last_submit)
+                  or (lm_missed is null and coalesce(missed_spiffs, 0) <> 0 and missed_spiff_pay_friday <= last_submit))
+              then 'cutover_pending_kyle'
+              when cutover is not null and (
+                     (lc_commission is null and coalesce(actual_commission, 0) <> 0 and commission_pay_friday <= cutover)
+                  or (ls_spiffs is null and claimed_spiffs <> 0 and spiff_pay_friday <= cutover)
+                  or (lm_missed is null and coalesce(missed_spiffs, 0) <> 0 and missed_spiff_pay_friday <= cutover))
+              then 'paid_by_hub' end as cutover_status
+    from c
+)
+select d.line_key, d.hub_line_id, d.agent_name, d.line_type, d.member_id, d.line_status,
+       d.expected_total as stage1_board_estimate,
+       d.actual_total as stage2_premier_corrected,
+       coalesce(d.lc_commission, 0) as locked_commission,
+       coalesce(d.ls_spiffs, 0) + coalesce(d.lm_missed, 0) as locked_spiffs,
+       d.lc_commission is not null as commission_locked,
+       d.ls_spiffs is not null or d.lm_missed is not null as spiffs_locked,
+       case when d.lc_commission is not null or d.ls_spiffs is not null or d.lm_missed is not null
+            then coalesce(d.lc_commission, 0) + coalesce(d.ls_spiffs, 0) + coalesce(d.lm_missed, 0) end as stage3_payroll_actual,
+       case when d.lc_commission is not null then d.actual_commission - d.lc_commission end as true_up_commission_due,
+       case when d.ls_spiffs is not null or d.lm_missed is not null
+            then d.actual_spiffs - coalesce(d.ls_spiffs, 0) - coalesce(d.lm_missed, 0) end as true_up_spiffs_due,
+       coalesce(a.total, 0) as adjustments_total, a.kinds as adjustment_kinds,
+       coalesce(a.cancelled, false) as commission_cancelled,
+       d.locked_agents as locked_agent_names,
+       coalesce(d.locked_agents is not null and strpos(d.locked_agents, d.agent_name) = 0, false) as agent_changed_after_lock,
+       d.cutover_status,
+       d.pay_commission, d.pay_claimed_spiffs, d.pay_missed_spiffs,
+       d.pay_commission + d.pay_claimed_spiffs + d.pay_missed_spiffs + coalesce(a.total, 0) as final_payable
+  from d left join adj a on a.line_key = d.line_key
  where public.recon_can_read();
 
 -- Sales with no Premier member ID (the source of that ID is OPEN with Kyle).
