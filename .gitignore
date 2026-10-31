@@ -1,0 +1,20 @@
+# secrets and env files (keep only the names-only example)
+.env*
+!.env.example
+!**/.env.example
+secrets/
+*.pem
+*.key
+test_users.env
+supabase_db_password*
+# deps / build
+node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+*.tsbuildinfo
+# supabase local
+supabase/.temp/
+supabase/.branches/
+dist/
+.DS_Store
