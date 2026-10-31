@@ -11,7 +11,8 @@ DEFAULT = READ-ONLY. Nothing is written to the live project:
   - 2 throwaway auth users (verify-<tag>-admin/agent@example.com) + 2 agents rows (display_name 'VERIFY ...'),
   - 1 revenue_adjustments row (description 'VERIFY ...', a -25.00 chargeback),
   - 1 rejected expense insert (unknown category; fails, writes nothing).
-  Every row written is tagged VERIFY and ALL cleanup runs in a finally block (also sweeps any leftover VERIFY rows).
+  Every row written is tagged VERIFY. Cleanup runs in a finally block and DELETES this run's rows plus any leftover
+  VERIFY-tagged expenses / revenue_adjustments / agents rows and verify-*@example.com auth users, then confirms none remain.
   The event log keeps the audit rows for these writes (append-only by design).
 Never prints key or password values.
 """
@@ -63,7 +64,8 @@ print('mode:', 'READ-ONLY + WRITE TESTS (--allow-writes)' if ARGS.allow_writes e
 
 # ---------- 1. data (service role, GET only) ----------
 s, exp = svc('expenses?select=id,date,category,amount,description,source,vendor,external_ref,created_by&order=date')
-rec('1a. expenses reachable with new columns (source, vendor, external_ref, created_by)', s == 200 and exp and all('source' in e for e in exp), f'HTTP {s}')
+rec('1a. expenses reachable with new columns (source, vendor, external_ref, created_by)', s == 200 and exp and all('source' in e for e in exp),
+    f'HTTP {s}' + (f' {exp.get("code")} {exp.get("message")} (before slice two is applied this 400/42703 is expected)' if isinstance(exp, dict) else ''))
 exp = exp if isinstance(exp, list) else []
 old = sorted([e for e in exp if (e.get('external_ref') or '').startswith('seed-s1-')], key=lambda e: e['external_ref'])
 new = [e for e in exp if (e.get('external_ref') or '').startswith('seed-s2-')]
@@ -121,23 +123,35 @@ tag = secrets.token_hex(4)
 temp = {'admin': {'email': f'verify-{tag}-admin@example.com', 'role': 'admin'},
         'agent': {'email': f'verify-{tag}-agent@example.com', 'role': 'agent'}}
 def cleanup():
-    """Runs in finally: removes everything this script could have written (and any leftover VERIFY rows)."""
-    out = {}
-    s, _, _ = req('DELETE', f'/rest/v1/revenue_adjustments?description=like.{TAG}*', SVC); out['adjustments_delete'] = s
+    """Runs in finally (only in --allow-writes mode). DELETES everything this script could have written, plus any
+    leftover VERIFY-tagged rows from earlier runs, then confirms nothing is left:
+      revenue_adjustments.description like 'VERIFY%', expenses.description like 'VERIFY%',
+      agents rows with display_name like 'VERIFY%' and email like 'verify-%@example.com',
+      auth users with email like 'verify-%@example.com' (this run's two plus any leftovers)."""
+    q = urllib.parse.quote
+    s_ra, _, _ = req('DELETE', f'/rest/v1/revenue_adjustments?description=like.{TAG}*', SVC)
+    s_ex, _, _ = req('DELETE', f'/rest/v1/expenses?description=like.{TAG}*', SVC)
     for k, u in temp.items():
         if u.get('agent_id'): req('DELETE', f'/rest/v1/agents?id=eq.{u["agent_id"]}', SVC)
-    s, _, _ = req('DELETE', f'/rest/v1/agents?display_name=like.{TAG}*&email=like.verify-*', SVC); out['agents_sweep'] = s
+    s_ag, _, _ = req('DELETE', f'/rest/v1/agents?display_name=like.{TAG}*&email=like.verify-*', SVC)
+    uids = {u['uid'] for u in temp.values() if u.get('uid')}
+    s_l, lst, _ = req('GET', '/auth/v1/admin/users?page=1&per_page=1000', SVC)
+    users = (lst or {}).get('users', []) if isinstance(lst, dict) else []
+    uids |= {x['id'] for x in users if (x.get('email') or '').startswith('verify-') and (x.get('email') or '').endswith('@example.com')}
+    for uid in uids:
+        req('DELETE', f'/auth/v1/admin/users/{uid}', SVC)
     gone = []
-    for k, u in temp.items():
-        if u.get('uid'):
-            req('DELETE', f'/auth/v1/admin/users/{u["uid"]}', SVC)
-            s2, _, _ = req('GET', f'/auth/v1/admin/users/{u["uid"]}', SVC); gone.append(s2 == 404)
-    s, left_a = svc('agents?select=id&email=like.verify-*')
-    s, left_r = svc(f'revenue_adjustments?select=id&description=like.{TAG}*')
-    s, left_e = svc(f'expenses?select=id&description=like.{TAG}*')
-    ok = all(gone) and left_a == [] and left_r == [] and left_e == []
-    rec('9. cleanup: VERIFY users, agents rows, adjustments and expenses all gone', ok,
-        f'auth users gone={gone} agents left={len(left_a or [])} adjustments left={len(left_r or [])} expenses left={len(left_e or [])}')
+    for uid in uids:
+        s2, _, _ = req('GET', f'/auth/v1/admin/users/{uid}', SVC); gone.append(s2 == 404)
+    s_l2, lst2, _ = req('GET', '/auth/v1/admin/users?page=1&per_page=1000', SVC)
+    left_u = [x['id'] for x in ((lst2 or {}).get('users', []) if isinstance(lst2, dict) else []) if (x.get('email') or '').startswith('verify-')]
+    _, left_a = svc('agents?select=id&email=like.verify-*')
+    _, left_r = svc(f'revenue_adjustments?select=id&description=like.{TAG}*')
+    _, left_e = svc(f'expenses?select=id&description=like.{TAG}*')
+    ok = all(gone) and not left_u and left_a == [] and left_r == [] and left_e == []
+    rec('9. cleanup: VERIFY adjustments, expenses, agents rows and verify-* auth users deleted, none left', ok,
+        f'deletes: adjustments {s_ra}, expenses {s_ex}, agents {s_ag}, auth users {len(uids)} (list {s_l}); '
+        f'left: users {len(left_u)}, agents {len(left_a or [])}, adjustments {len(left_r or [])}, expenses {len(left_e or [])}')
 
 if not ARGS.allow_writes:
     print('\nskipped write tests (throwaway users, chargeback, FK insert). Re-run with --allow-writes to include them.')

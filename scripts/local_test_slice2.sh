@@ -24,7 +24,10 @@ SNAP="select md5(string_agg(t,'|' order by t)) from (
 
 # A. live-like upgrade
 D=t_live; liveish $D
-res "A1 standalone preflight before apply" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF)"
+LIVE=$(python3 -c "import json;print('; '.join(f\"{r['date']} {float(r['amount']):.2f} {r['description']} {r['category']}\" for r in sorted(json.load(open('supabase/deploy/live_expenses_preapply.json'))['rows'], key=lambda r:(r['date'],r['amount']))))")
+LOC=$(q $D -c "select string_agg(format('%s %s %s %s', date, amount, description, category), '; ' order by date, amount) from expenses")
+res "A0 local slice-one expenses == live rows read 10/31 (date, amount, description, category)" "$([ "$LIVE" = "$LOC" ] && echo PASS || echo FAIL)" "$LOC"
+res "A1 standalone preflight before apply" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF | cut -d'|' -f1-4)"
 BEFORE=$(q $D -c "$SNAP"); EV0=$(q $D -c "select count(*) from event_log")
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1; rc=$?
 EV1=$(q $D -c "select count(*) from event_log")
@@ -37,7 +40,7 @@ MV=$(q $D -c "select string_agg(version||':'||name, ',' order by version) from s
 res "A5 schema_migrations has 4 slice-one + 3 slice-two versions" "$([ "$(q $D -c 'select count(*) from supabase_migrations.schema_migrations')" = 7 ] && echo PASS || echo FAIL)" "$MV"
 n=$(passes $D supabase/tests/verify.sql); res "A6 verify.sql (slice one) after upgrade" "$([ $n = 24 ] && echo PASS || echo FAIL)" "$n/24 $(fails $D supabase/tests/verify.sql)"
 n=$(passes $D supabase/tests/verify_slice2.sql); T=$(psql -X -q -d $D -f supabase/tests/verify_slice2.sql 2>/dev/null | grep -cE '^ +[0-9]+ \|')
-res "A7 verify_slice2.sql after upgrade" "$([ $n = $T ] && echo PASS || echo FAIL)" "$n/$T $(fails $D supabase/tests/verify_slice2.sql)"
+res "A7 verify_slice2.sql after upgrade" "$([ $T -gt 0 ] && [ $n = $T ] && echo PASS || echo FAIL)" "$n/$T $(fails $D supabase/tests/verify_slice2.sql)"
 EVD=$(q $D -c "select string_agg(table_name||' '||action||' '||c, ', ') from (select table_name, action, count(*) c from event_log where id > $EV0 group by 1,2 order by 1,2) x")
 res "A8 event_log delta from paste" "$([ $((EV1-EV0)) = 34 ] && echo PASS || echo FAIL)" "+$((EV1-EV0)): $EVD"
 
@@ -70,11 +73,20 @@ psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/tmp/pf.out 2>&1; rc=$?
 EVb=$(q $D -c "select count(*) from event_log"); Hb=$(q $D -c "$SNAP")
 S2=$(q $D -c "select concat_ws(',', to_regclass('public.expense_categories'), to_regclass('supabase_migrations.schema_migrations'))")
 res "C1 paste aborts on mutated category, changes nothing" "$([ $rc != 0 ] && grep -q 'preflight failed' /tmp/pf.out && [ "$EVa" = "$EVb" ] && [ "$Ha" = "$Hb" ] && [ -z "$S2" ] && echo PASS || echo FAIL)" "$(grep -o 'ERROR: .*' /tmp/pf.out | head -1 | cut -c1-120)"
-res "C2 standalone preflight reports FAIL" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = FAIL ] && echo PASS || echo FAIL)" "$(q $D -f $PF)"
+res "C2 standalone preflight reports FAIL" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = FAIL ] && echo PASS || echo FAIL)" "$(q $D -f $PF | cut -d'|' -f1-4)"
 q $D -c "update expenses set category='Leads' where amount=175.00" >/dev/null
-q $D -c "insert into expenses(category,amount,date,description) values ('Leads',1,'2026-10-31','extra')" >/dev/null
-psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/tmp/pf.out 2>&1; rc=$?
-res "C3 paste aborts on a 5th expense row" "$([ $rc != 0 ] && grep -q 'preflight failed' /tmp/pf.out && echo PASS || echo FAIL)" "$(grep -o 'ERROR: .*' /tmp/pf.out | head -1 | cut -c1-120)"
+abort_case(){ # $1 name, $2 mutate SQL, $3 undo SQL
+  q $D -c "$2" >/dev/null; local ea=$(q $D -c "select count(*) from event_log")
+  psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/tmp/pf.out 2>&1; local rc=$?
+  local eb=$(q $D -c "select count(*) from event_log") pf=$(q $D -f $PF | cut -d'|' -f1)
+  res "$1" "$([ $rc != 0 ] && grep -q 'preflight failed' /tmp/pf.out && [ "$ea" = "$eb" ] && [ "$pf" = FAIL ] && [ -z "$(q $D -c "select to_regclass('public.expense_categories')")" ] && echo PASS || echo FAIL)" "standalone=$pf; $(grep -o 'ERROR: .*' /tmp/pf.out | head -1 | cut -c1-110)"
+  q $D -c "$3" >/dev/null; }
+abort_case "C3 paste aborts on a 5th expense row" "insert into expenses(category,amount,date,description) values ('Leads',1,'2026-10-31','extra')" "delete from expenses where description='extra'"
+abort_case "C4 paste aborts on a changed description" "update expenses set description='FAKE seed: lead spend!' where amount=200.00" "update expenses set description='FAKE seed: lead spend' where amount=200.00"
+abort_case "C5 paste aborts on a changed amount" "update expenses set amount=49.01 where amount=49.00" "update expenses set amount=49.00 where amount=49.01"
+abort_case "C6 paste aborts on a changed date" "update expenses set date='2026-10-27' where amount=200.00" "update expenses set date='2026-10-26' where amount=200.00"
+abort_case "C7 paste aborts when a row is swapped (same count, one row replaced)" "update expenses set category='Software', description='FAKE seed: subscription' where amount=150.00" "update expenses set category='Leads', description='FAKE seed: lead spend' where amount=150.00"
+res "C8 after undoing every mutation, standalone preflight is PASS again" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF | cut -d'|' -f1-4)"
 
 # D. fresh build from the repo
 D=t_fresh; newdb $D

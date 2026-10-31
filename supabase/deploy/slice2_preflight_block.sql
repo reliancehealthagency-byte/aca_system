@@ -1,10 +1,10 @@
 -- ===== PREFLIGHT (read-only; runs inside the transaction before any change) =====
--- Fresh apply: expenses must be exactly the slice-one seed (Leads x3 + Software x1, 4 rows) and no slice-two table may
+-- Fresh apply: expenses must be exactly the 4 slice-one rows (date, amount, description, category) and no slice-two table may
 -- exist yet; anything else aborts the whole paste. Re-run: if expense_categories exists AND all 3 slice-two versions
 -- are recorded in supabase_migrations.schema_migrations, slice two is already applied and the rest is a no-op.
 do $$
 declare
-  n int; leads int; sw int; found text; applied int := 0; has_s2 boolean;
+  n int; leads int; sw int; found text; applied int := 0; has_s2 boolean;  -- leads = unexpected rows, sw = missing rows
 begin
   has_s2 := to_regclass('public.expense_categories') is not null;
   if to_regclass('supabase_migrations.schema_migrations') is not null then
@@ -18,12 +18,26 @@ begin
   if has_s2 or applied > 0 then
     raise exception 'preflight failed: partial slice-two state (expense_categories present=%, versions recorded=%/3)', has_s2, applied;
   end if;
-  select count(*), count(*) filter (where category = 'Leads'), count(*) filter (where category = 'Software')
-    into n, leads, sw from public.expenses;
-  select coalesce(string_agg(category || ' x' || c, ', ' order by category), 'none') into found
-    from (select category, count(*) c from public.expenses group by category) x;
-  if not (n = 4 and leads = 3 and sw = 1) then
-    raise exception 'preflight failed: expected expenses = Leads x3 + Software x1 (4 rows); found % rows: %', n, found;
+  -- Exactly the 4 live rows read on 2026-10-31 (read-only GET): (date, amount, description, category), nothing else.
+  select count(*) into n from public.expenses;
+  select count(*) into leads from (
+      select date, amount, description, category from public.expenses
+      except all
+      select * from (values (date '2026-10-26', 200.00::numeric, 'FAKE seed: lead spend',   'Leads'),
+                            (date '2026-10-29', 175.00::numeric, 'FAKE seed: lead spend',   'Leads'),
+                            (date '2026-10-31', 150.00::numeric, 'FAKE seed: lead spend',   'Leads'),
+                            (date '2026-10-31',  49.00::numeric, 'FAKE seed: subscription', 'Software')) v) extra;
+  select count(*) into sw from (
+      select * from (values (date '2026-10-26', 200.00::numeric, 'FAKE seed: lead spend',   'Leads'),
+                            (date '2026-10-29', 175.00::numeric, 'FAKE seed: lead spend',   'Leads'),
+                            (date '2026-10-31', 150.00::numeric, 'FAKE seed: lead spend',   'Leads'),
+                            (date '2026-10-31',  49.00::numeric, 'FAKE seed: subscription', 'Software')) v
+      except all
+      select date, amount, description, category from public.expenses) missing;
+  select coalesce(string_agg(format('%s %s %s %s', date, amount, coalesce(description, 'NULL'), category), '; ' order by date, amount), 'none')
+    into found from public.expenses;
+  if not (n = 4 and leads = 0 and sw = 0) then
+    raise exception 'preflight failed: expenses must be exactly the 4 slice-one rows (2026-10-26 200.00 Leads, 2026-10-29 175.00 Leads, 2026-10-31 150.00 Leads, 2026-10-31 49.00 Software, with their FAKE seed descriptions); found % rows (% unexpected, % missing): %', n, leads, sw, found;
   end if;
   raise notice 'preflight OK: expenses = %', found;
 end $$;

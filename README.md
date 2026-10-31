@@ -6,7 +6,7 @@ This slice is a **skeleton with fake seed data only**: no GoHighLevel, Kimbo, Ri
 - Supabase project `aca-system`: `https://szkmzpquomcqgkvzpoez.supabase.co` (ref `szkmzpquomcqgkvzpoez`, us-east-1, Free). Keys are **never** in this repo.
 - Postgres schema + RLS + audited event log: `supabase/migrations/`
 - Fake seed data: `supabase/seed.sql`
-- Verification (24 checks, runs in a rolled-back transaction): `supabase/tests/verify.sql`
+- Verification (24 checks, runs in a rolled-back transaction): `supabase/tests/verify.sql` (10a/10b assert the P&L values and run before the checks that change a rate and a premium)
 - Dashboard (Next.js App Router, TypeScript): `web/`
 
 ## Schema (Premier-first)
@@ -34,9 +34,9 @@ Changing a rate is a row update, not a migration: `update commission_config set 
 Migrations `20261031200000..200200`, seed `supabase/seed_slice2.sql` (20 FAKE expense lines, Oct 1-24 2026), checks `supabase/tests/verify_slice2.sql` (29 checks, rolled back), rollback `supabase/rollback/slice2_rollback.sql`.
 
 **Live apply (SQL Editor paste, built by `scripts/build_slice2_paste.sh`):**
-- Paste file: `slice2_paste.sql`, sha256 `eff56e0bc52bc7c372bdaaebb2b4b8f450e4648717adbb1f0698c7f58f08e391`
+- Paste file: `slice2_paste.sql`, sha256 `6f9f741562c757e666d79cbc65c088b5a6a38187215921c08cf190cc7be2c090`
 - Applied to live: **pending**
-- Order inside ONE transaction: preflight (`supabase/deploy/slice2_preflight_block.sql`: aborts unless expenses are exactly Leads x3 + Software x1, or slice two is already applied and recorded) -> 3 migrations -> `seed_slice2.sql` -> migration history (`supabase/deploy/slice2_record_migrations.sql`: `supabase_migrations.schema_migrations`, CLI shape, slice-one versions backfilled, `on conflict do nothing`).
+- Order inside ONE transaction: preflight (`supabase/deploy/slice2_preflight_block.sql`: aborts unless expenses are exactly the 4 live slice-one rows by (date, amount, description, category), as read from live 10/31 in `supabase/deploy/live_expenses_preapply.json`, or slice two is already applied and recorded) -> 3 migrations -> `seed_slice2.sql` -> migration history (`supabase/deploy/slice2_record_migrations.sql`: `supabase_migrations.schema_migrations`, CLI shape, slice-one versions backfilled, `on conflict do nothing`).
 - Standalone read-only preflight: `supabase/deploy/slice2_preflight.sql`. Live check: `scripts/verify_live_slice2.py` (read-only by default; `--allow-writes` adds VERIFY-tagged user-level tests with cleanup in `finally`). Local suite: `scripts/local_test_slice2.sh`.
 
 | Object | What it is |
