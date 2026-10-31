@@ -36,8 +36,16 @@ alter table public.expenses add column if not exists external_ref text;   -- e.g
 alter table public.expenses add column if not exists created_by   uuid default auth.uid();
 alter table public.expenses add column if not exists updated_at   timestamptz not null default now();
 
--- Backfill source on existing rows (slice-one seed rows say "FAKE seed").
-update public.expenses set source = case when description ilike 'FAKE seed%' then 'seed' else 'manual' end
+-- Backfill source on existing rows (slice-one seed rows say "FAKE seed") and give the 4 slice-one seed rows
+-- a stable external_ref (seed-s1-01..04, same keys as seed.sql). One UPDATE, so one audit event per row.
+update public.expenses set
+  source = case when description ilike 'FAKE seed%' then 'seed' else 'manual' end,
+  external_ref = case when description ilike 'FAKE seed%' and external_ref is null then
+      case when date = '2026-10-26' and amount = 200.00 then 'seed-s1-01'
+           when date = '2026-10-29' and amount = 175.00 then 'seed-s1-02'
+           when date = '2026-10-31' and amount = 150.00 then 'seed-s1-03'
+           when date = '2026-10-31' and amount =  49.00 then 'seed-s1-04' end
+    else external_ref end
  where source is null;
 alter table public.expenses alter column source set default 'manual';
 alter table public.expenses alter column source set not null;
@@ -92,6 +100,14 @@ comment on table public.revenue_adjustments is
 create unique index if not exists revenue_adjustments_source_external_ref_key
   on public.revenue_adjustments(source, external_ref) where external_ref is not null;
 create index if not exists revenue_adjustments_date_idx on public.revenue_adjustments(date);
+-- A chargeback is always a negative revenue line.
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'revenue_adjustments_chargeback_negative'
+                  and conrelid = 'public.revenue_adjustments'::regclass) then
+    alter table public.revenue_adjustments add constraint revenue_adjustments_chargeback_negative
+      check (category <> 'chargeback' or amount < 0);
+  end if;
+end $$;
 
 -- updated_at maintenance
 create or replace function public.touch_updated_at() returns trigger

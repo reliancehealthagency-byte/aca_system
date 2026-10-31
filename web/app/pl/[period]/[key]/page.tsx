@@ -1,6 +1,6 @@
 import { notFound, redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
-import { PERIOD_VIEW, isPeriod, isIsoDate, periodTitle, usd, head, cell, num, type Line, type Summary } from '@/lib/pl';
+import { PERIOD_VIEW, PAGE_SIZE, MAX_LINES, isPeriod, isIsoDate, periodTitle, usd, head, cell, num, type Line, type Summary } from '@/lib/pl';
 
 export const dynamic = 'force-dynamic';
 
@@ -29,25 +29,55 @@ export default async function PLPeriod({ params }: { params: Promise<{ period: s
     );
   }
 
-  const [summary, lines] = await Promise.all([
+  const fetchLines = async () => {
+    const out: Line[] = [];
+    for (let from = 0; from < MAX_LINES; from += PAGE_SIZE) {
+      const { data, error } = await supabase
+        .from('pl_line_items')
+        .select('line_date, line_type, category, category_label, description, source, amount, signed_amount, ref_table, ref_id, agent_name')
+        .eq(cfg.keyCol, key)
+        .order('line_date', { ascending: true })
+        .order('line_type', { ascending: true })
+        .order('category', { ascending: true })
+        .order('ref_id', { ascending: true })
+        .range(from, from + PAGE_SIZE - 1)
+        .returns<Line[]>();
+      if (error) return { rows: out, error, truncated: false };
+      out.push(...(data ?? []));
+      if ((data ?? []).length < PAGE_SIZE) return { rows: out, error: null, truncated: false };
+    }
+    return { rows: out, error: null, truncated: true };
+  };
+  const [summary, lines, unpriced] = await Promise.all([
     supabase.from(cfg.view).select('*').eq(cfg.key, key).maybeSingle<Summary>(),
+    fetchLines(),
     supabase
-      .from('pl_line_items')
-      .select('line_date, line_type, category, category_label, description, source, amount, signed_amount, ref_table, ref_id, agent_name')
-      .eq(cfg.keyCol, key)
-      .order('line_date', { ascending: true })
-      .order('category', { ascending: true })
-      .limit(5000)
-      .returns<Line[]>(),
+      .from('pl_unpriced_sales')
+      .select('sale_id, sale_date, agent_name, carrier')
+      .eq(period === 'daily' ? 'sale_date' : cfg.keyCol, key)
+      .order('sale_date')
+      .returns<{ sale_id: string; sale_date: string; agent_name: string | null; carrier: string | null }[]>(),
   ]);
-  const all = lines.data ?? [];
+  const all = lines.rows;
   const s = summary.data;
 
   return (
     <main>
       <p><a href={`/pl?period=${period}`}>← {cfg.label} P&amp;L</a></p>
       <h1>P&amp;L: {periodTitle(period, key)}</h1>
-      {lines.error || summary.error ? <p style={{ color: '#b00' }}>Could not load the P&amp;L lines.</p> : null}
+      {lines.error || summary.error || unpriced.error ? <p style={{ color: '#b00' }}>Could not load the P&amp;L lines.</p> : null}
+      {lines.truncated ? (
+        <p style={{ color: '#b00', fontWeight: 600 }}>
+          Showing the first {MAX_LINES.toLocaleString()} lines only. Totals above the tables come from the summary view and are complete;
+          the per-category totals below cover only the lines shown.
+        </p>
+      ) : null}
+      {(unpriced.data ?? []).length > 0 ? (
+        <p style={{ color: '#b00' }}>
+          {(unpriced.data ?? []).length} unpriced sale(s) in this period (no Premier and no board premium) are not in these numbers:{' '}
+          {(unpriced.data ?? []).map((u) => `${u.sale_date} ${u.agent_name ?? ''}`.trim()).join('; ')}
+        </p>
+      ) : null}
       {s ? (
         <p>
           Revenue <strong>{usd(s.revenue)}</strong> − commission <strong>{usd(s.commission)}</strong> − expenses{' '}

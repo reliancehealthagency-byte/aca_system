@@ -2,6 +2,7 @@
 -- Requires slice one + slice two applied (migrations + seed.sql + seed_slice2.sql) and the two test users linked.
 -- Run as the project owner:  psql -v ON_ERROR_STOP=1 -f supabase/tests/verify_slice2.sql
 -- Expected values below are for the FAKE seed only (5 sales in week of Sun 10/25, 24 expense lines in Oct 2026).
+-- Writes made here (VERIFY chargeback, VERIFY unpriced sale, temp category) are all rolled back at the end.
 \set QUIET on
 \o /dev/null
 begin;
@@ -21,28 +22,35 @@ end $$;
 -- S1. objects exist
 select pg_temp.r('S1. new tables + views exist',
   (select count(*) from information_schema.tables where table_schema='public' and table_name in
-    ('expense_categories','revenue_adjustments','pl_line_items','pl_daily','pl_weekly','pl_monthly')) = 6);
+    ('expense_categories','revenue_adjustments','pl_line_items','pl_daily','pl_weekly','pl_monthly','pl_unpriced_sales')) = 7);
 -- S2. RLS on new tables; every P&L view is security_invoker
 select pg_temp.r('S2a. RLS enabled on expense_categories + revenue_adjustments',
   (select bool_and(relrowsecurity) from pg_class where oid in ('public.expense_categories'::regclass,'public.revenue_adjustments'::regclass)));
 select pg_temp.r('S2b. P&L views are security_invoker',
   (select bool_and(coalesce(reloptions @> array['security_invoker=true'], false)) from pg_class
-    where oid in ('public.pl_line_items'::regclass,'public.pl_daily'::regclass,'public.pl_weekly'::regclass,'public.pl_monthly'::regclass)));
+    where oid in ('public.pl_line_items'::regclass,'public.pl_daily'::regclass,'public.pl_weekly'::regclass,'public.pl_monthly'::regclass,'public.pl_unpriced_sales'::regclass)));
 -- S3. anon has nothing
 select pg_temp.r('S3. anon has no SELECT on new tables/views',
   not (has_table_privilege('anon','public.expense_categories','SELECT') or has_table_privilege('anon','public.revenue_adjustments','SELECT')
     or has_table_privilege('anon','public.pl_line_items','SELECT') or has_table_privilege('anon','public.pl_daily','SELECT')
-    or has_table_privilege('anon','public.pl_weekly','SELECT') or has_table_privilege('anon','public.pl_monthly','SELECT')));
+    or has_table_privilege('anon','public.pl_weekly','SELECT') or has_table_privilege('anon','public.pl_monthly','SELECT')
+    or has_table_privilege('anon','public.pl_unpriced_sales','SELECT')));
 -- S4. expenses extended non-destructively
 select pg_temp.r('S4a. expenses has category, amount, date, description, source, vendor, external_ref',
   (select count(*) from information_schema.columns where table_schema='public' and table_name='expenses'
     and column_name in ('category','amount','date','description','source','vendor','external_ref')) = 7);
-select pg_temp.r('S4b. slice-one expense rows kept, remapped (3 lead_spend = 525.00, 1 dialer_software = 49.00, source=seed)',
+select pg_temp.r('S4b. slice-one expense rows kept, remapped (3 lead_spend = 525.00, 1 dialer_software = 49.00, source=seed, seed-s1-01..04)',
   (select count(*) = 4 and sum(amount) = 574.00
           and count(*) filter (where category='lead_spend') = 3 and count(*) filter (where category='dialer_software') = 1
           and bool_and(source='seed')
-     from public.expenses where external_ref is null and description like 'FAKE seed:%' and date >= '2026-10-25'),
-  (select string_agg(category||' '||amount||' '||source, ', ') from public.expenses where external_ref is null));
+          and array_agg(external_ref order by external_ref) = array['seed-s1-01','seed-s1-02','seed-s1-03','seed-s1-04']
+          and count(*) filter (where external_ref='seed-s1-04' and category='dialer_software' and amount=49.00) = 1
+     from public.expenses where description like 'FAKE seed:%' and date >= '2026-10-25'),
+  (select string_agg(coalesce(external_ref,'NULL')||' '||category||' '||amount||' '||source, ', ' order by external_ref)
+     from public.expenses where date >= '2026-10-25'));
+select pg_temp.r('S4b2. no expense row without external_ref (all 24 are seed lines)',
+  (select count(*) from public.expenses where external_ref is null) = 0 and (select count(*) from public.expenses) = 24,
+  (select format('total=%s null_ref=%s', count(*), count(*) filter (where external_ref is null)) from public.expenses));
 select pg_temp.r('S4c. slice-two seed: 20 lines, total 4384.86, all source=seed',
   (select count(*) = 20 and sum(amount) = 4384.86 and bool_and(source='seed') from public.expenses where external_ref like 'seed-s2-%'),
   (select format('rows=%s total=%s', count(*), sum(amount)) from public.expenses where external_ref like 'seed-s2-%'));
@@ -55,6 +63,10 @@ do $$ begin
   insert into public.expenses (date, category, amount) values ('2026-10-31', 'not_a_category', 1);
   perform pg_temp.r('S4e. unknown category rejected by lookup FK', false, 'insert succeeded');
 exception when foreign_key_violation then perform pg_temp.r('S4e. unknown category rejected by lookup FK', true, sqlerrm); end $$;
+do $$ begin
+  insert into public.revenue_adjustments (date, category, amount, description) values ('2026-10-31', 'chargeback', 10.00, 'VERIFY positive chargeback');
+  perform pg_temp.r('S4g. positive chargeback rejected (check category <> chargeback or amount < 0)', false, 'insert succeeded');
+exception when check_violation then perform pg_temp.r('S4g. positive chargeback rejected (check category <> chargeback or amount < 0)', true, sqlerrm); end $$;
 select pg_temp.r('S4f. 6 expense categories',
   (select count(*) from public.expense_categories) = 6, (select string_agg(code, ',' order by sort_order) from public.expense_categories));
 
@@ -126,12 +138,29 @@ end $$;
 reset role;
 delete from public.revenue_adjustments where description = 'VERIFY fake chargeback';
 
+-- S6i. a sale with no Premier and no board premium is not dropped silently: it appears in pl_unpriced_sales
+insert into public.sales (id, contact_id, agent_of_record, sale_date, board_premium, premier_premium)
+  values ('00000000-0000-4000-8000-00000005a999', '00000000-0000-4000-8000-0000000c0006',
+          '00000000-0000-4000-8000-00000000a002', '2026-10-31', null, null);
+select pg_temp.act('authenticated','admin.test@example.com');
+do $$ declare u int; l int; u0 int; begin
+  select count(*) into u from public.pl_unpriced_sales where sale_id = '00000000-0000-4000-8000-00000005a999';
+  select count(*) into l from public.pl_line_items where ref_id = '00000000-0000-4000-8000-00000005a999';
+  select count(*) into u0 from public.pl_unpriced_sales where sale_id <> '00000000-0000-4000-8000-00000005a999';
+  reset role;
+  perform pg_temp.r('S6i. unpriced sale listed in pl_unpriced_sales (1), has no P&L line (0); seed has 0 unpriced',
+    u = 1 and l = 0 and u0 = 0, format('unpriced=%s lines=%s other_unpriced=%s', u, l, u0));
+end $$;
+reset role;
+delete from public.sales where id = '00000000-0000-4000-8000-00000005a999';
+
 -- S7. agent: nothing new is visible, own sales unchanged, no writes
 select pg_temp.act('authenticated','agent.test@example.com');
 do $$ declare n int; s int; begin
   select (select count(*) from public.expense_categories) + (select count(*) from public.revenue_adjustments)
        + (select count(*) from public.pl_line_items) + (select count(*) from public.pl_daily)
        + (select count(*) from public.pl_weekly) + (select count(*) from public.pl_monthly)
+       + (select count(*) from public.pl_unpriced_sales)
        + (select count(*) from public.expenses) into n;
   select count(*) into s from public.sales;
   reset role;

@@ -103,3 +103,15 @@ select month_start, (month_start + interval '1 month' - interval '1 day')::date 
 comment on view public.pl_daily   is 'Line-item P&L per day (sum of pl_line_items). Admin only.';
 comment on view public.pl_weekly  is 'Line-item P&L per Sun-Sat week (sum of pl_line_items). Admin only.';
 comment on view public.pl_monthly is 'Line-item P&L per calendar month (sum of pl_line_items). Admin only.';
+
+-- Sales with neither a Premier nor a board premium produce no P&L line. They are listed here instead of
+-- disappearing silently; /pl shows the count. Admin only.
+create or replace view public.pl_unpriced_sales with (security_invoker = true) as
+select c.id as sale_id, c.sale_date,
+       (c.sale_date - extract(dow from c.sale_date)::int) as week_start,
+       date_trunc('month', c.sale_date)::date             as month_start,
+       c.agent_name, c.carrier, c.plan_type, c.post_dated, c.application_status
+  from public.sales_commission c
+ where public.is_admin() and c.premier_premium is null and c.board_premium is null;
+comment on view public.pl_unpriced_sales is
+  'Sales with no Premier premium and no board premium: not in pl_line_items until one is recorded. Admin only.';

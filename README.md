@@ -31,13 +31,20 @@ Changing a rate is a row update, not a migration: `update commission_config set 
 **This is a placeholder.** The agency's real revenue per sale (the P&L prototype's 42% vs payroll's 38%/43%) is an open question, so the net figure is not the agency's real profit.
 
 ## Slice two: line-item P&L
-Migrations `20261031200000..200200`, seed `supabase/seed_slice2.sql` (20 FAKE expense lines, Oct 1-24 2026), checks `supabase/tests/verify_slice2.sql` (26 checks, rolled back), rollback `supabase/rollback/slice2_rollback.sql`.
+Migrations `20261031200000..200200`, seed `supabase/seed_slice2.sql` (20 FAKE expense lines, Oct 1-24 2026), checks `supabase/tests/verify_slice2.sql` (29 checks, rolled back), rollback `supabase/rollback/slice2_rollback.sql`.
+
+**Live apply (SQL Editor paste, built by `scripts/build_slice2_paste.sh`):**
+- Paste file: `slice2_paste.sql`, sha256 `eff56e0bc52bc7c372bdaaebb2b4b8f450e4648717adbb1f0698c7f58f08e391`
+- Applied to live: **pending**
+- Order inside ONE transaction: preflight (`supabase/deploy/slice2_preflight_block.sql`: aborts unless expenses are exactly Leads x3 + Software x1, or slice two is already applied and recorded) -> 3 migrations -> `seed_slice2.sql` -> migration history (`supabase/deploy/slice2_record_migrations.sql`: `supabase_migrations.schema_migrations`, CLI shape, slice-one versions backfilled, `on conflict do nothing`).
+- Standalone read-only preflight: `supabase/deploy/slice2_preflight.sql`. Live check: `scripts/verify_live_slice2.py` (read-only by default; `--allow-writes` adds VERIFY-tagged user-level tests with cleanup in `finally`). Local suite: `scripts/local_test_slice2.sh`.
 
 | Object | What it is |
 |---|---|
 | `expense_categories` | Lookup: lead_spend, dialer_software, payroll_spiffs, office, marketing, other. Admin only, audited |
-| `expenses` (extended) | Existing rows kept; old free-text categories remapped (Leads -> lead_spend, Software -> dialer_software; logged as row.update events) |
-| `revenue_adjustments` | Manual revenue lines not tied to one sale's premium: carrier_bonus, override, chargeback (negative), other_revenue. Admin only, audited, empty |
+| `expenses` (extended) | Existing rows kept; old free-text categories remapped (Leads -> lead_spend, Software -> dialer_software) and the 4 slice-one seed rows get external_ref seed-s1-01..04; logged as row.update events |
+| `revenue_adjustments` | Manual revenue lines not tied to one sale's premium: carrier_bonus, override, chargeback (must be negative: check constraint), other_revenue. Admin only, audited, empty |
+| `pl_unpriced_sales` (view) | Sales with no Premier and no board premium (they have no P&L line); count shown on `/pl`. Admin only |
 | `pl_line_items` (view) | Every P&L line: line_date, week_start (Sunday), month_start, line_type (revenue / commission / expense), category, category_label, description, source, amount, signed_amount, ref_table, ref_id, agent_name |
 | `pl_daily`, `pl_weekly`, `pl_monthly` (views) | Sums of `pl_line_items`: sales_count, line_count, revenue, commission, expenses, net. A drill-down always adds back to its summary row |
 

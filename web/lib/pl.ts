@@ -40,3 +40,7 @@ export type Line = {
 export const cell = { padding: '4px 8px', borderBottom: '1px solid #eee' } as const;
 export const head = { textAlign: 'left', padding: '4px 8px', borderBottom: '1px solid #999' } as const;
 export const num = { ...cell, textAlign: 'right' } as const;
+
+// PostgREST caps one response at 1,000 rows; drill-downs page through with range() up to MAX_LINES.
+export const PAGE_SIZE = 1000;
+export const MAX_LINES = 20000;

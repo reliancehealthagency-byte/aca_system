@@ -24,12 +24,16 @@ export default async function PLIndex({ searchParams }: { searchParams: Promise<
     );
   }
 
-  const { data, error } = await supabase
-    .from(cfg.view)
-    .select('*')
-    .order(cfg.key, { ascending: false })
-    .limit(period === 'daily' ? 62 : 60)
-    .returns<Summary[]>();
+  const [{ data, error }, unpriced] = await Promise.all([
+    supabase
+      .from(cfg.view)
+      .select('*')
+      .order(cfg.key, { ascending: false })
+      .limit(period === 'daily' ? 62 : 60)
+      .returns<Summary[]>(),
+    supabase.from('pl_unpriced_sales').select('sale_id', { count: 'exact', head: true }),
+  ]);
+  const unpricedCount = unpriced.count ?? 0;
 
   const rows = data ?? [];
   const totals = rows.reduce(
@@ -54,6 +58,9 @@ export default async function PLIndex({ searchParams }: { searchParams: Promise<
         board claim) until the revenue-rate question is settled. Click a period to see its lines.
       </p>
       {error ? <p style={{ color: '#b00' }}>Could not load the P&amp;L.</p> : null}
+      <p style={{ color: unpricedCount > 0 ? '#b00' : '#555' }}>
+        Unpriced sales (no Premier and no board premium, so not in the P&amp;L): <strong>{unpriced.error ? '?' : unpricedCount}</strong>
+      </p>
       <table style={{ borderCollapse: 'collapse', width: '100%' }}>
         <thead>
           <tr>
