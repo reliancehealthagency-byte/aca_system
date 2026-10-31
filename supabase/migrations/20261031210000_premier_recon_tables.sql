@@ -482,7 +482,7 @@ on conflict (agent_name) do nothing;
 -- commission_config itself is unchanged and still supplies the rates (base_rate, addon_bonus_rate).
 create table if not exists public.premier_addon_map (
   id               bigint generated always as identity primary key,
-  source           text not null check (source in ('premier_label', 'premier_benefit', 'board_answer')),
+  source           text not null check (source in ('premier_label_exclude', 'premier_label', 'premier_benefit', 'board_answer')),
   pattern          text not null,             -- POSIX regex, matched case-insensitively (~*)
   addon_key        text not null check (addon_key in ('consultcare', 'wellness', 'add_type', 'champion')),
   tier             text check (tier in ('asset', 'edge', 'ultra')),
@@ -735,7 +735,13 @@ insert into public.premier_addon_map (source, pattern, addon_key, tier, qualifie
   ('premier_benefit', '^\s*ultra',                      'consultcare', 'ultra', true, 'Product Benefit "Ultra - Member" -> $75', 'approved'),
   ('premier_label',   'wellness\s*4\s*(you|u)\M',       'wellness',    null,    true, 'WELLNESS_KEYWORDS Wellness4You;Wellness4U -> $20', 'approved'),
   ('premier_label',   'ad\s*&\s*d',                     'add_type',    null,    true, 'INCREASED_KEYWORDS AD&D; real labels "AWA SecureElite AME-AD&D", "HD SecureShield CI-AME-AD&D"', 'approved'),
-  ('premier_label',   '(^|[^a-z])add([^a-z]|$)',        'add_type',    null,    true, 'Whole word ADD, e.g. "HD ProtectLife ADD": APPROVED (Kyle 10/31 relayed via Orchestrator; payroll-breakdown §6.3 Q13)', 'approved'),
+  -- Kyle 7:13 PM ET 10/31 (relayed via Orchestrator): the ADD match is narrowed to the exact HD ProtectLife ADD label plus
+  -- true AD&D variants; a bare whole-word ADD ("Add-On Dental", "ADD Plus") does NOT qualify.
+  -- EXCLUDED labels (payroll-breakdown §7.1, 07c71b89): checked BEFORE any qualifying pattern; a match = no add-on at all.
+  ('premier_label_exclude', 'add[[:space:]-]*on[[:space:]]+dental', 'add_type', null, false, 'EXCLUDED: "Add-On Dental" (Kyle 7:13 PM ET 10/31, relayed via Orchestrator; PB §7.1)', 'approved'),
+  ('premier_label_exclude', '\madd[[:space:]]+plus\M',  'add_type',    null,    false, 'EXCLUDED: "ADD Plus" (Kyle 7:13 PM ET 10/31, relayed via Orchestrator; PB §7.1)', 'approved'),
+  ('premier_label',   '^\s*hd\s+protect\s*life\s+add\s*$', 'add_type',  null,    true, 'Exactly "HD ProtectLife ADD" (Kyle 10/31 approval; narrowed 7:13 PM ET, relayed via Orchestrator)', 'approved'),
+  ('premier_label',   'accidental\s+death\s*(&|and)\s*dismemberment', 'add_type', null, true, 'AD&D spelled out "Accidental Death & Dismemberment" (Kyle 7:13 PM ET 10/31, relayed via Orchestrator)', 'approved'),
   ('premier_label',   'champion\s*care',                'champion',    null,    true, 'ChampionCare / Champion Care kept as trigger (Kyle 10/29); no spiff', 'approved'),
   ('board_answer',    'consult\s*care.*asset',          'consultcare', 'asset', true, 'AO "Consult Care - Asset"', 'approved'),
   ('board_answer',    'consult\s*care.*edge',           'consultcare', 'edge',  true, 'AO "Consult Care - Edge"', 'approved'),

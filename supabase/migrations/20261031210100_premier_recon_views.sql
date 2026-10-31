@@ -49,6 +49,10 @@ language sql stable set search_path = public, pg_temp as $$
     from public.premier_addon_map m
    where m.active and m.source = 'premier_label' and (m.status = 'approved' or include_proposed)
      and coalesce(label, '') ~* m.pattern
+     -- exclusions first (PB §7.1): an excluded label ("Add-On Dental", "ADD Plus") never maps to an add-on
+     and not exists (select 1 from public.premier_addon_map x
+                      where x.active and x.source = 'premier_label_exclude' and (x.status = 'approved' or include_proposed)
+                        and coalesce(label, '') ~* x.pattern)
    order by case m.addon_key when 'consultcare' then 1 when 'wellness' then 2 when 'add_type' then 3 else 4 end, m.id
    limit 1
 $$;

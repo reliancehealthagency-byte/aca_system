@@ -33,25 +33,31 @@ select pg_temp.r('T0. claim CONFIRMED: slice-one case-sensitive LIKE list matche
       and not exists (select 1 from unnest((select qualifying_addon_patterns from public.commission_config where id)) pat where p.product_label like pat)));
 
 -- T1. objects + security
-select pg_temp.r('T1. slice-three tables + views exist (16 tables, 11 views)',
+select pg_temp.r('T1. slice-three tables + views exist (19 tables, 19 views)',
   (select count(*) from information_schema.tables where table_schema='public' and table_name in
     ('recon_pay_config','agent_pay_rules','payroll_cutoffs','recon_imports','premier_member_products','board_submissions',
      'premier_recon_event_state','premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments',
-     'missed_spiff_anchors','board_week_freezes','hub_paid_lock','hub_cutover','agent_name_aliases')) = 16
+     'missed_spiff_anchors','board_week_freezes','hub_paid_lock','hub_cutover','agent_name_aliases',
+     'manual_entry_sources','manual_entries','overhead_entries')) = 19
   and (select count(*) from information_schema.views where table_schema='public' and table_name in
     ('premier_products_current','premier_member_status','premier_recon_lines','premier_recon_unmatched_board',
      'premier_recon_unmatched_premier','premier_recon_open_items','premier_policy_count_check','premier_recon_trueup',
-     'sales_missing_member_id','board_submissions_current','board_export_diffs')) = 11);
+     'sales_missing_member_id','board_submissions_current','board_export_diffs',
+     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
+     'pl_daily_walk','pl_weekly_walk','pl_monthly_walk')) = 19);
 select pg_temp.r('T2. RLS on every slice-three table; every slice-three view is security_invoker',
   (select bool_and(relrowsecurity) from pg_class where relnamespace='public'::regnamespace and relname in
     ('recon_pay_config','agent_pay_rules','payroll_cutoffs','recon_imports','premier_member_products','board_submissions',
      'premier_recon_event_state','premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments',
-     'missed_spiff_anchors','board_week_freezes','hub_paid_lock','hub_cutover','agent_name_aliases'))
-  and (select bool_and(coalesce(reloptions @> array['security_invoker=true'], false)) from pg_class
+     'missed_spiff_anchors','board_week_freezes','hub_paid_lock','hub_cutover','agent_name_aliases',
+     'manual_entry_sources','manual_entries','overhead_entries'))
+  and (select count(*) = 19 and bool_and(coalesce(reloptions @> array['security_invoker=true'], false)) from pg_class
         where relnamespace='public'::regnamespace and relkind='v' and relname in
     ('premier_products_current','premier_member_status','premier_recon_lines','premier_recon_unmatched_board',
      'premier_recon_unmatched_premier','premier_recon_open_items','premier_policy_count_check','premier_recon_trueup','sales_missing_member_id',
-     'board_submissions_current','board_export_diffs')));
+     'board_submissions_current','board_export_diffs',
+     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
+     'pl_daily_walk','pl_weekly_walk','pl_monthly_walk')));
 select pg_temp.r('T3. anon has no SELECT on any slice-three table/view and cannot run the logger',
   not exists (select 1 from pg_class where relnamespace='public'::regnamespace and relname in
     ('recon_pay_config','agent_pay_rules','payroll_cutoffs','recon_imports','premier_member_products','board_submissions',
@@ -59,7 +65,10 @@ select pg_temp.r('T3. anon has no SELECT on any slice-three table/view and canno
      'missed_spiff_anchors','board_week_freezes','hub_paid_lock','hub_cutover','agent_name_aliases',
      'premier_products_current','premier_member_status','premier_recon_lines','premier_recon_unmatched_board',
      'premier_recon_unmatched_premier','premier_recon_open_items','premier_policy_count_check','premier_recon_trueup','sales_missing_member_id',
-     'board_submissions_current','board_export_diffs')
+     'board_submissions_current','board_export_diffs',
+     'manual_entry_sources','manual_entries','overhead_entries',
+     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
+     'pl_daily_walk','pl_weekly_walk','pl_monthly_walk')
     and has_table_privilege('anon', oid, 'SELECT'))
   and not has_function_privilege('anon', 'public.premier_log_recon_events()', 'EXECUTE'));
 select pg_temp.r('T4. commission_config intact (single row 0.38 / 0.05)',
@@ -293,12 +302,39 @@ select pg_temp.r('Unmatched board list empty for the mock (every board member is
 -- Configurability (all inside this transaction)
 select pg_temp.r('C2. HD ProtectLife ADD approved (Kyle 10/31): S05 pays 119.54 at 43%; setting that ONE map row back to proposed re-opens it (105.64 / 119.54)',
   (select actual_commission = 119.54 and commission_rate = 0.43 and open_item is null from L where member_id='687990135')
-  and (select status = 'approved' from public.premier_addon_map where pattern = '(^|[^a-z])add([^a-z]|$)'));
-update public.premier_addon_map set status = 'proposed' where pattern = '(^|[^a-z])add([^a-z]|$)';
+  and (select status = 'approved' from public.premier_addon_map where strpos(pattern, 'protect') > 0));
+update public.premier_addon_map set status = 'proposed' where strpos(pattern, 'protect') > 0;
 select pg_temp.r('C2b. (config check) proposed -> OPEN, readings 105.64 / 119.54, no code change',
   (select open_item = 'proposed_addon_mapping' and actual_commission is null and open_alt_a_total = 105.64 and open_alt_b_total = 119.54
      from public.premier_recon_lines where member_id='687990135'));
-update public.premier_addon_map set status = 'approved' where pattern = '(^|[^a-z])add([^a-z]|$)';
+update public.premier_addon_map set status = 'approved' where strpos(pattern, 'protect') > 0;
+select pg_temp.r('C2c. (Kyle 7:13 PM) the ADD match is narrow: "HD ProtectLife ADD", "AD&D", "AME-AD&D", "Accidental Death & Dismemberment" qualify; "Add-On Dental", "ADD Plus" get no +5%',
+  (select bool_and((public.premier_product_addon(l, null)).addon_key = 'add_type')
+     from unnest(array['HD ProtectLife ADD', 'AWA SecureElite AME-AD&D', 'AD&D', 'HD SecureShield CI-AME-AD&D', 'Accidental Death & Dismemberment']) l)
+  and (select bool_and((public.premier_product_addon(l, null, true)).addon_key is null)
+     from unnest(array['Add-On Dental', 'ADD Plus', 'Dental ADD-On', 'Vision Add Plus', 'ADD', 'Add-On Dental AD&D Rider']) l)
+  and (select count(*) = 2 from public.premier_addon_map where source = 'premier_label_exclude' and active),
+  (select string_agg(l || '=' || coalesce((public.premier_product_addon(l, null, true)).addon_key, '-'), ', ')
+     from unnest(array['HD ProtectLife ADD', 'AD&D', 'Accidental Death & Dismemberment', 'Add-On Dental', 'ADD Plus']) l));
+do $$ declare r numeric; c numeric; begin
+  begin
+    insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count, is_mock, note)
+    select kind, 'VERIFY negative add-ons', repeat('b', 64), encoding, line_ending, header, 2, true, 'VERIFY' from public.recon_imports where kind='premier_member_products';
+    insert into public.premier_member_products (import_id, row_num, raw_fields)
+    select (select id from public.recon_imports where file_name='VERIFY negative add-ons'), g.n,
+           (select array_agg(case h when 'Product Label' then g.lbl when 'Product ID' then g.pid when 'Product Fee' then '10.00' when 'Product Benefit' then '' else p.raw ->> h end order by o)
+              from unnest(i.header) with ordinality u(h, o))
+      from public.premier_member_products p join public.recon_imports i on i.id = p.import_id,
+           (values (1, 'Add-On Dental', '99901'), (2, 'ADD Plus', '99902')) g(n, lbl, pid)
+     where p.member_id = '687990107' and p.product_label = 'VistaWell LP';
+    select commission_rate, actual_commission into r, c from public.premier_recon_lines where member_id = '687990107' and line_type = 'P';
+    raise exception 'undo';
+  exception when others then
+    if sqlerrm <> 'undo' then r := null; end if;
+  end;
+  perform pg_temp.r('C2d. end to end: S01 gains "Add-On Dental" + "ADD Plus" products on its booking day and still gets NO +5% (38%)',
+    r = 0.38, format('rate=%s commission=%s', r, c));
+end $$;
 select pg_temp.r('I1. no date-range filter: S37 board row booked 10/16 (outside the file''s 10/25-10/31) is ingested and paid',
   (select date_booked = '2026-10-16' and actual_commission = 119.32 from public.premier_recon_lines where member_id='687990338'),
   (select format('date_booked=%s', date_booked) from public.premier_recon_lines where member_id='687990338'));
@@ -850,6 +886,256 @@ reset role;
 select pg_temp.r('R4. admin user sees the same reconciliation lines as the owner role',
   (select n from seen) = (select count(*) from public.premier_recon_lines) and (select n from seen) > 0,
   (select format('admin=%s owner=%s', (select n from seen), count(*)) from public.premier_recon_lines));
+
+
+-- ======== rev 4: owner-only pay config (Kyle 7:14 PM ET) ========
+select pg_temp.srv();
+insert into public.agent_name_aliases (alias, agent_id) select 'VERIFY seed alias', id from public.agents where role = 'agent' limit 1;
+insert into public.payroll_cutoffs (payday, cutoff_at, source, note) values ('2026-12-04', '2026-12-03 14:00-05', 'provisional', 'VERIFY provisional');
+create temp table wstmts (t text, op text, sql text);
+insert into wstmts values
+ ('commission_config','insert','insert into public.commission_config (id) values (false)'),
+ ('commission_config','update','update public.commission_config set base_rate = 0.40 where id'),
+ ('commission_config','delete','delete from public.commission_config where id'),
+ ('premier_addon_map','insert','insert into public.premier_addon_map (source, pattern, addon_key) values (''premier_label'', ''vw'', ''add_type'')'),
+ ('premier_addon_map','update','update public.premier_addon_map set status = ''proposed'' where strpos(pattern, ''protect'') > 0'),
+ ('premier_addon_map','delete','delete from public.premier_addon_map where strpos(pattern, ''protect'') > 0'),
+ ('agent_pay_rules','insert','insert into public.agent_pay_rules (agent_name, base_rate_override) values (''VERIFY agent'', 0.5)'),
+ ('agent_pay_rules','update','update public.agent_pay_rules set base_rate_override = 0.5 where agent_name = ''Kaitlyn Romine'''),
+ ('agent_pay_rules','delete','delete from public.agent_pay_rules where agent_name = ''Kaitlyn Romine'''),
+ ('agent_name_aliases','insert','insert into public.agent_name_aliases (alias, agent_id) select ''VERIFY alias 2'', id from public.agents limit 1'),
+ ('agent_name_aliases','update','update public.agent_name_aliases set note = ''x'' where alias = ''VERIFY seed alias'''),
+ ('agent_name_aliases','delete','delete from public.agent_name_aliases where alias = ''VERIFY seed alias'''),
+ ('recon_pay_config','insert','insert into public.recon_pay_config (id) values (false)'),
+ ('recon_pay_config','update','update public.recon_pay_config set spiff_cc_edge = 99 where id'),
+ ('recon_pay_config','delete','delete from public.recon_pay_config where id'),
+ ('payroll_cutoffs','insert','insert into public.payroll_cutoffs (payday, cutoff_at, source) values (''2027-01-01'', ''2026-12-31 14:00-05'', ''provisional'')'),
+ ('payroll_cutoffs','update','update public.payroll_cutoffs set cutoff_at = cutoff_at + interval ''1 hour'' where payday = ''2026-12-04'''),
+ ('payroll_cutoffs','delete','delete from public.payroll_cutoffs where payday = ''2026-12-04'''),
+ ('manual_entry_sources','insert','insert into public.manual_entry_sources (kind, code, label, pl_line) values (''transfer'', ''vw'', ''VW'', ''transfers_ringba'')'),
+ ('manual_entry_sources','update','update public.manual_entry_sources set label = ''X'' where code = ''ringba'''),
+ ('manual_entry_sources','delete','delete from public.manual_entry_sources where code = ''ringba''');
+do $$ declare w record; who text; em text; ok int; bad text; msg text; begin
+  foreach who in array array['admin2', 'service_role'] loop
+    ok := 0; bad := null;
+    for w in select * from wstmts loop
+      perform pg_temp.act(case when who = 'service_role' then 'service_role' else 'authenticated' end, 'admin2.test@example.com');
+      begin
+        execute w.sql;
+        bad := concat_ws(', ', bad, w.t || ' ' || w.op);
+      exception when others then
+        msg := sqlerrm;
+        if msg ~ '(owner-only|permission denied|service_role)' then ok := ok + 1;
+        else bad := concat_ws(', ', bad, w.t || ' ' || w.op || ': ' || msg); end if;
+      end;
+      perform pg_temp.srv();
+    end loop;
+    perform pg_temp.r(case who when 'admin2' then 'W1. a second (non-owner) admin is refused on insert, update and delete of every pay-config table (7 tables x 3)'
+                      else 'W2. the admin key (service_role) is refused on insert, update and delete of every pay-config table' end,
+      ok = 21 and bad is null, format('refused=%s/21 not refused: %s', ok, coalesce(bad, 'none')));
+  end loop;
+end $$;
+select pg_temp.act('authenticated','admin2.test@example.com');
+do $$ begin
+  perform public.premier_lock_payday('2026-11-13');
+  reset role; perform pg_temp.r('W3. a second admin cannot lock a payday (owner only)', false, 'locked');
+exception when others then reset role; perform pg_temp.r('W3. a second admin cannot lock a payday (owner only)', sqlerrm like '%owner only%', sqlerrm); end $$;
+select pg_temp.act('service_role','admin2.test@example.com');
+do $$ begin
+  perform public.premier_lock_payday('2026-11-13');
+  reset role; perform pg_temp.r('W3b. the admin key (service_role) cannot lock a payday', false, 'locked');
+exception when others then reset role; perform pg_temp.r('W3b. the admin key (service_role) cannot lock a payday', sqlerrm like '%owner only%', sqlerrm); end $$;
+select pg_temp.srv();
+do $$ declare w record; n int := 0; bad text; ws text[][]; begin
+  select array_agg(array[t, op, sql]) into ws from wstmts where (op = 'insert' and t not in ('commission_config', 'recon_pay_config')) or op = 'update';
+  begin
+    perform pg_temp.act('authenticated', 'admin.test@example.com');   -- the payroll owner
+    for w in select ws[i][1] t, ws[i][2] op, ws[i][3] sql from generate_subscripts(ws, 1) i loop
+      begin execute w.sql; n := n + 1;
+      exception when others then bad := concat_ws(', ', bad, w.t || ' ' || w.op || ': ' || sqlerrm); end;
+    end loop;
+    perform public.premier_lock_payday('2026-11-13');
+    n := n + 1;
+    raise exception 'undo';
+  exception when others then
+    if sqlerrm <> 'undo' then bad := concat_ws(', ', bad, 'lock: ' || sqlerrm); end if;
+  end;
+  perform pg_temp.srv();
+  perform pg_temp.r('W4. the payroll owner can write every pay-config table and lock a payday (changes undone)',
+    bad is null and n = 13, format('ok=%s problems: %s', n, coalesce(bad, 'none')));
+end $$;
+select pg_temp.act('authenticated','admin2.test@example.com');
+create temp table wread as select
+  (select count(*) from public.commission_config) cc, (select count(*) from public.premier_addon_map) am,
+  (select count(*) from public.agent_pay_rules) apr, (select count(*) from public.agent_name_aliases) ali,
+  (select count(*) from public.recon_pay_config) rpc, (select count(*) from public.payroll_cutoffs) pc,
+  (select count(*) from public.manual_entry_sources) mes;
+reset role; select pg_temp.srv();
+select pg_temp.r('W5. a second admin still reads every pay-config table',
+  (select cc = 1 and am > 0 and apr > 0 and ali > 0 and rpc = 1 and pc > 0 and mes = 9 from wread),
+  (select format('commission_config=%s addon_map=%s pay_rules=%s aliases=%s recon_pay_config=%s cutoffs=%s entry_sources=%s', cc, am, apr, ali, rpc, pc, mes) from wread));
+
+-- ======== rev 4: manual entries + the P&L walk (Kyle 7:15 / 7:19 / 7:20 PM ET) ========
+select pg_temp.act('authenticated','admin2.test@example.com');
+insert into public.manual_entries (kind, source, entry_date, period, amount, note, entered_by) values
+  ('credit',      null,             '2026-10-30', 'day',  500,  'VERIFY credits', 'Kyle'),
+  ('debit',       null,             '2026-10-30', 'day',  120,  'VERIFY debits', 'Kyle'),
+  ('transfer',    'ringba',         '2026-10-30', 'day',  300,  'VERIFY ringba', null),
+  ('transfer',    'acme',           '2026-10-30', 'day',  200,  'VERIFY acme', null),
+  ('lead_spend',  'keystone_data',  '2026-10-30', 'day',  150,  'VERIFY spend', null),
+  ('lead_spend',  'ppc_data',       '2026-10-30', 'day',  50,   'VERIFY spend 2', null),
+  ('deposit_box', 'allstate_earned','2026-10-25', 'week', 1000, 'VERIFY allstate', null),
+  ('deposit_box', 'premier_book',   '2026-10-25', 'week', 400,  'VERIFY premier book', null),
+  ('deposit_box', 'neo_book',       '2026-10-25', 'week', 250,  'VERIFY neo (monthly, put in this week)', null),
+  ('deposit_box', 'oneil_aca',      '2026-10-25', 'week', 100,  'VERIFY oneil', null),
+  ('premier_premium', null,         '2026-10-30', 'day',  999,  'VERIFY premium entered', null),
+  ('policy_count', null,            '2026-10-30', 'day',  3.5,  'VERIFY count', null);
+reset role; select pg_temp.srv();
+select pg_temp.r('ME1. any admin (not the owner) enters every kind; entered_by comes from the login (spoofed "Kyle" ignored), audit rows written',
+  (select count(*) = 12 and bool_and(entered_by = 'Second Admin (fake)') and bool_and(entered_by_uid = (select id from auth.users where email = 'admin2.test@example.com'))
+     from public.manual_entries where note like 'VERIFY%')
+  and (select count(*) >= 12 from public.event_log where table_name = 'manual_entries' and action = 'INSERT'),
+  (select string_agg(distinct entered_by, ',') from public.manual_entries));
+select pg_temp.act('authenticated','agent.test@example.com');
+do $$ begin
+  insert into public.manual_entries (kind, entry_date, period, amount) values ('credit', '2026-10-30', 'day', 1);
+  reset role; perform pg_temp.r('ME2. an agent cannot enter', false, 'inserted');
+exception when others then reset role; perform pg_temp.r('ME2. an agent cannot enter', true, sqlerrm); end $$;
+select pg_temp.act('authenticated','agent.test@example.com');
+create temp table meag as select (select count(*) from public.manual_entries) + (select count(*) from public.manual_entries_current)
+  + (select count(*) from public.pl_daily_walk) + (select count(*) from public.pl_weekly_walk) + (select count(*) from public.pl_monthly_walk)
+  + (select count(*) from public.pl_projected_rep_pay_daily) + (select count(*) from public.manual_entry_sources)
+  + (select count(*) from public.overhead_entries) + (select count(*) from public.pl_overhead_weekly) n;
+reset role; select pg_temp.srv();
+select pg_temp.r('ME2b. an agent sees 0 rows of manual entries, sources and the P&L walk', (select n = 0 from meag), (select 'rows=' || n from meag));
+select pg_temp.act('service_role','admin2.test@example.com');
+do $$ begin
+  insert into public.manual_entries (kind, entry_date, period, amount) values ('credit', '2026-10-30', 'day', 1);
+  reset role; perform pg_temp.r('ME3. the admin key (service_role) cannot enter', false, 'inserted');
+exception when others then reset role; perform pg_temp.r('ME3. the admin key (service_role) cannot enter', sqlerrm like '%service_role%', sqlerrm); end $$;
+select pg_temp.act('authenticated','admin2.test@example.com');
+do $$ begin
+  insert into public.manual_entry_sources (kind, code, label, pl_line) values ('lead_spend', 'google', 'Google', 'lead_spend');
+  reset role; perform pg_temp.r('ME4. a non-owner admin cannot add a source / box name (config is owner-only)', false, 'inserted');
+exception when others then reset role; perform pg_temp.r('ME4. a non-owner admin cannot add a source / box name (config is owner-only)', sqlerrm like '%owner-only%', sqlerrm); end $$;
+do $$ declare st text; bad text; begin
+  perform pg_temp.act('authenticated','admin2.test@example.com');
+  foreach st in array array[
+    'insert into public.manual_entries (kind, entry_date, period, amount) values (''credit'', ''2026-10-25'', ''week'', 1)',
+    'insert into public.manual_entries (kind, source, entry_date, period, amount) values (''deposit_box'', ''neo_book'', ''2026-10-30'', ''day'', 1)',
+    'insert into public.manual_entries (kind, source, entry_date, period, amount) values (''deposit_box'', ''neo_book'', ''2026-10-27'', ''week'', 1)',
+    'insert into public.manual_entries (kind, source, entry_date, period, amount) values (''transfer'', ''google'', ''2026-10-30'', ''day'', 1)',
+    'insert into public.manual_entries (kind, entry_date, period, amount) values (''transfer'', ''2026-10-30'', ''day'', 1)'] loop
+    begin execute st; bad := concat_ws(' | ', bad, st); exception when others then null; end;
+  end loop;
+  perform pg_temp.srv();
+  perform pg_temp.r('ME5. granularity and sources enforced: credits/transfers/spend daily, earned lines weekly on a Sunday, transfer source must be Ringba/Acme',
+    bad is null, coalesce(bad, 'all 5 refused'));
+end $$;
+select pg_temp.act('authenticated','admin2.test@example.com');
+insert into public.manual_entries (kind, entry_date, period, amount, note, correction_of, correction_kind)
+  select 'debit', '2026-10-30', 'day', 130, 'VERIFY debit corrected', id, 'supersede' from public.manual_entries where note = 'VERIFY debits';
+insert into public.manual_entries (kind, source, entry_date, period, amount, note, correction_of, correction_kind)
+  select 'lead_spend', 'ppc_data', '2026-10-30', 'day', -50, 'VERIFY spend 2 reversed', id, 'reverse' from public.manual_entries where note = 'VERIFY spend 2';
+do $$ declare bad text; st text; ok boolean; begin
+  foreach st in array array[
+    'insert into public.manual_entries (kind, source, entry_date, period, amount, correction_of, correction_kind) select ''transfer'', ''acme'', ''2026-10-30'', ''day'', -10, id, ''reverse'' from public.manual_entries where note = ''VERIFY acme''',
+    'update public.manual_entries set amount = 1 where note = ''VERIFY ringba''',
+    'delete from public.manual_entries where note = ''VERIFY ringba'''] loop
+    begin execute st; bad := concat_ws(' | ', bad, st); exception when others then null; end;
+  end loop;
+  perform pg_temp.srv();
+  begin update public.manual_entries set amount = 1 where note = 'VERIFY ringba'; bad := concat_ws(' | ', bad, 'postgres update');
+  exception when others then null; end;
+  perform pg_temp.act('authenticated', 'admin.test@example.com');
+  ok := (select count(*) = 0 from public.manual_entries_current where note = 'VERIFY debits')
+        and exists (select 1 from public.manual_entries_current where note = 'VERIFY debit corrected' and amount = 130);
+  perform pg_temp.srv();
+  perform pg_temp.r('ME6. corrections are new rows: supersede replaces, reverse must be exactly the negative; no edits or deletes (not even postgres)',
+    bad is null and ok, coalesce(bad, 'refusals ok') || ' current_ok=' || ok);
+end $$;
+-- monthly overhead (Kyle directly 7:24 PM ET)
+select pg_temp.act('authenticated','admin2.test@example.com');
+insert into public.overhead_entries (month, source_name, amount, note, entered_by) values
+  ('2026-10-01', 'Rent', 3100, 'VERIFY rent', 'Kyle'), ('2026-10-01', 'Software', 300, 'VERIFY software', null),
+  ('2026-11-01', 'Rent', 3000, 'VERIFY rent nov', null);
+insert into public.overhead_entries (month, source_name, amount, note, correction_of, correction_kind)
+  select '2026-10-01', 'Software', 310.10, 'VERIFY software corrected', id, 'supersede' from public.overhead_entries where note = 'VERIFY software';
+reset role; select pg_temp.srv();
+select pg_temp.r('OH1. any admin enters monthly overhead by source name; entered_by from the login; supersede corrects',
+  (select count(*) = 4 and bool_and(entered_by = 'Second Admin (fake)') from public.overhead_entries where note like 'VERIFY%')
+  and (select count(*) >= 4 from public.event_log where table_name = 'overhead_entries' and action = 'INSERT'),
+  (select string_agg(source_name || '=' || amount, ', ' order by id) from public.overhead_entries));
+do $$ declare bad text; who text; begin
+  foreach who in array array['agent', 'service_role', 'admin-edit'] loop
+    if who = 'agent' then perform pg_temp.act('authenticated', 'agent.test@example.com');
+    elsif who = 'service_role' then perform pg_temp.act('service_role', 'admin2.test@example.com');
+    else perform pg_temp.act('authenticated', 'admin2.test@example.com'); end if;
+    begin
+      if who = 'admin-edit' then update public.overhead_entries set amount = 1 where note = 'VERIFY rent';
+      else insert into public.overhead_entries (month, source_name, amount) values ('2026-10-01', 'X', 1); end if;
+      bad := concat_ws(', ', bad, who);
+    exception when others then null; end;
+    perform pg_temp.srv();
+  end loop;
+  perform pg_temp.r('OH2. overhead: agents and the admin key are refused; no edits (corrections are new rows)', bad is null, coalesce(bad, 'all refused'));
+end $$;
+select pg_temp.act('authenticated','admin.test@example.com');
+create temp table oh as select
+  (select sum(amount) from public.pl_overhead_weekly where month_start = '2026-10-01' and source_name = 'Rent') oct_rent,
+  (select sum(amount) from public.pl_overhead_weekly where month_start = '2026-10-01' and source_name = 'Software') oct_sw,
+  (select sum(amount) from public.pl_overhead_weekly where month_start = '2026-11-01') nov,
+  (select string_agg(format('%s %s %s/%s=%s', week_start, source_name, days_in_month, days_of_month, amount), '; ' order by week_start, source_name)
+     from public.pl_overhead_weekly where month_start = '2026-10-01') detail,
+  (select amount from public.pl_overhead_weekly where week_start = '2026-09-27' and source_name = 'Rent') w0927_rent,
+  (select days_in_month from public.pl_overhead_weekly where week_start = '2026-09-27' and source_name = 'Rent') w0927_days,
+  (select amount from public.pl_overhead_monthly where month_start = '2026-10-01' and source_name = 'Software') m_sw,
+  (select string_agg(column_name, ',') from information_schema.columns where table_schema = 'public' and table_name = 'pl_daily_walk'
+      and column_name ~ '(allstate|premier_book|neo|oneil|earned|overhead)') daily_bad_cols;
+reset role; select pg_temp.srv();
+select pg_temp.r('OH3. overhead prorated by days (DEFAULT): the 9/27 week gets 3/31 of October, and October''s weekly shares add up exactly to the monthly amounts (3100.00 / 310.10)',
+  (select oct_rent = 3100 and oct_sw = 310.10 and nov = 3000 and w0927_days = 3 and w0927_rent = 300 and m_sw = 310.10 from oh),
+  (select detail from oh));
+select pg_temp.r('OH4. earned sources and overhead are absent from the daily view (Kyle 7:24 PM: weekly only)',
+  (select daily_bad_cols is null from oh), (select coalesce(daily_bad_cols, 'none') from oh));
+select pg_temp.act('authenticated','admin.test@example.com');
+create temp table walk as
+  select (select row(d.*)::text from public.pl_daily_walk d where day = '2026-10-30') dtxt,
+         d.credits, d.debits, d.credit_revenue, d.transfers_ringba, d.transfers_acme, d.transfer_revenue, d.total_spend,
+         d.deal_commission, d.spiffs, d.abs_pay, d.projected_commission, d.net,
+         (select sum(net) from public.pl_daily_walk where week_start = '2026-10-25') wk_daily_sum,
+         (select sum(net) from public.pl_daily_walk where month_start = '2026-10-01') mo_daily_sum,
+         w.daily_net w_daily_net, w.overhead w_oh, w.earned_total w_earned, w.neo_book w_neo, w.allstate_earned w_allstate, w.net w_net,
+         m.daily_net m_daily_net, m.overhead m_oh, m.earned_total m_earned, m.net m_net, m.projected_commission m_pc,
+         (select sum(projected_commission) from public.pl_daily_walk where month_start = '2026-10-01') mo_pc_sum,
+         (select (sum(projected_commission) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30') eng_comm,
+         (select (sum(projected_spiffs) filter (where line_type = 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30') eng_abs,
+         (select (sum(projected_spiffs) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30') eng_sp,
+         (select revenue from public.pl_weekly where week_start = '2026-10-25') s2_rev,
+         (select count(*) from public.pl_manual_entry_lines where description in ('VERIFY premium entered', 'VERIFY count')) ml
+    from public.pl_daily_walk d, public.pl_weekly_walk w, public.pl_monthly_walk m
+   where d.day = '2026-10-30' and w.week_start = '2026-10-25' and m.month_start = '2026-10-01';
+reset role; select pg_temp.srv();
+select pg_temp.r('PL1. daily walk 10/30: credit revenue = credits 500 - debits 130 (superseded 120) = 370; transfers Ringba 300 + Acme 200 = 500; spend 150 (PPC reversed)',
+  (select credits = 500 and debits = 130 and credit_revenue = 370 and transfers_ringba = 300 and transfers_acme = 200 and transfer_revenue = 500 and total_spend = 150 from walk),
+  (select dtxt from walk));
+select pg_temp.r('PL2. projected commission is a COST: deal commission + spiffs + ABS pay (engine, by Date Booked), and the daily net subtracts all three',
+  (select deal_commission = eng_comm and abs_pay = eng_abs and spiffs = eng_sp
+          and projected_commission = deal_commission + spiffs + abs_pay
+          and deal_commission > 0 and spiffs > 0 and abs_pay > 0
+          and net = 370 + 500 - 150 - (deal_commission + spiffs + abs_pay) from walk),
+  (select format('deal=%s spiffs=%s abs=%s projected=%s net=%s', deal_commission, spiffs, abs_pay, projected_commission, net) from walk));
+select pg_temp.r('PL3. weekly net = sum of daily nets + four earned lines (Allstate 1000, Premier Book 400, Neo 250 in the admin''s week, O''Neil 100) - overhead (7 Oct days: 700.00 rent + 70.02 software)',
+  (select w_daily_net = wk_daily_sum and w_earned = 1750 and w_neo = 250 and w_allstate = 1000 and w_oh = 770.02
+          and w_net = wk_daily_sum + 1750 - 770.02 from walk),
+  (select format('daily_net=%s earned=%s overhead=%s net=%s', w_daily_net, w_earned, w_oh, w_net) from walk));
+select pg_temp.r('PL4. monthly rollup: October = every October daily net + earned lines of weeks starting in October - the full October overhead (3410.10)',
+  (select m_daily_net = mo_daily_sum and m_earned = 1750 and m_oh = 3410.10 and m_net = mo_daily_sum + 1750 - 3410.10 and m_pc = mo_pc_sum from walk),
+  (select format('daily_net=%s earned=%s overhead=%s net=%s projected_commission=%s', m_daily_net, m_earned, m_oh, m_net, m_pc) from walk));
+select pg_temp.r('PL5. slice two P&L views untouched: pl_weekly still has its own revenue line; entered Premier premium / policy counts are visible lines, not in the walk net',
+  (select s2_rev is not null from walk)
+  and (select ml = 2 from walk),
+  (select 'slice-two pl_weekly revenue (week 10/25)=' || coalesce(s2_rev::text, 'null') from walk));
 
 reset role;
 \o

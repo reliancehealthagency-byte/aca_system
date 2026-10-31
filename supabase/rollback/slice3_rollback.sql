@@ -9,11 +9,15 @@
 --      or payroll_cutoffs holds a row that is not a MOCK seed row (real submit times).
 --      rev 3: also refuses once the hub cutover was recorded (hub_cutover / hub_paid_lock rows: the clock started) or
 --      agent_name_aliases holds rows (Kyle's agent links).
---   2. Drops the 11 slice-three views, the slice-three functions, the 16 slice-three tables (their triggers and policies go
+--      rev 4: also refuses when manual_entries / overhead_entries hold rows (admins' entries) or manual_entry_sources
+--      differs from its seed (owner edits).
+--   2. Drops the 19 slice-three views, the slice-three functions, the 19 slice-three tables (their triggers and policies go
 --      with them) and the sales columns premier_member_id + lead_source.
---   3. Deletes the 3 slice-three versions from supabase_migrations.schema_migrations (slice one + two rows stay).
--- Not touched: slice-one / slice-two tables, views and data, commission_config, event_log (append-only: the slice-three
--- audit / premier.* / payroll.adjustment.recorded rows stay as history).
+--      rev 4: removes the owner-only write trigger from slice one's commission_config (commission_config_owner_write);
+--      its slice-one policies were never changed, so it is back to the slice-one state (any admin may update).
+--   3. Deletes the 4 slice-three versions from supabase_migrations.schema_migrations (slice one + two rows stay).
+-- Not touched: slice-one / slice-two tables, views and data, commission_config rows, event_log (append-only: the
+-- slice-three audit / premier.* / payroll.adjustment.recorded rows stay as history).
 begin;
 
 do $$ declare n bigint; fp text; begin
@@ -59,11 +63,20 @@ do $$ declare n bigint; fp text; begin
     if n > 0 then raise exception 'slice-three rollback refused: agent_pay_rules differ from the seed; export them first'; end if;
   end if;
   if to_regclass('public.premier_addon_map') is not null then
-    -- fingerprint of the 13 seeded mapping rows (Payroll's list as shipped; rev 3: ProtectLife ADD 'approved', Kyle 10/31)
+    -- fingerprint of the seeded mapping rows (Payroll's list as shipped; rev 4: ADD narrowed + 2 exclusions, Kyle 7:13 PM)
     execute $q$select md5(string_agg(concat_ws('|', source, pattern, addon_key, tier, qualifies_bonus, status, active, owner), E'\n' order by source, pattern))
                  from public.premier_addon_map$q$ into fp;
-    if fp is distinct from '5024317934ad56f2705667df8447ac65' then
+    if fp is distinct from '6a13c04a6a6c7e4e0e62724bcfbf181a' then
       raise exception 'slice-three rollback refused: premier_addon_map differs from the seeded list (Payroll / Kyle edits); export it first';
+    end if;
+  end if;
+  if to_regclass('public.manual_entries') is not null then
+    execute 'select (select count(*) from public.manual_entries) + (select count(*) from public.overhead_entries)' into n;
+    if n > 0 then raise exception 'slice-three rollback refused: % manual / overhead entr(ies) (admins'' P&L inputs); export them first', n; end if;
+    execute $q$select md5(string_agg(concat_ws('|', kind, code, label, pl_line, active), E'\n' order by kind, code))
+                 from public.manual_entry_sources$q$ into fp;
+    if fp is distinct from '96301a55b8c11d2c89b2c4f06f8291bd' then
+      raise exception 'slice-three rollback refused: manual_entry_sources differs from the seed (owner edits); export it first';
     end if;
   end if;
   if to_regclass('public.payroll_cutoffs') is not null then
@@ -80,6 +93,14 @@ do $$ declare n bigint; fp text; begin
   end if;
 end $$;
 
+drop view if exists public.pl_monthly_walk;
+drop view if exists public.pl_weekly_walk;
+drop view if exists public.pl_daily_walk;
+drop view if exists public.pl_overhead_weekly;
+drop view if exists public.pl_overhead_monthly;
+drop view if exists public.pl_projected_rep_pay_daily;
+drop view if exists public.pl_manual_entry_lines;
+drop view if exists public.manual_entries_current;
 drop view if exists public.sales_missing_member_id;
 drop view if exists public.premier_recon_trueup;
 drop view if exists public.premier_policy_count_check;
@@ -97,6 +118,10 @@ drop function if exists public.premier_lock_payday(date);
 drop function if exists public.my_pay_adjustments();
 drop function if exists public.recon_finalize_board_import(bigint, boolean);
 
+drop trigger if exists commission_config_owner_write on public.commission_config;
+drop table if exists public.overhead_entries;
+drop table if exists public.manual_entries;
+drop table if exists public.manual_entry_sources;
 drop table if exists public.hub_cutover;
 drop table if exists public.hub_paid_lock;
 drop table if exists public.board_week_freezes;
@@ -114,6 +139,11 @@ drop table if exists public.agent_pay_rules;
 drop table if exists public.agent_name_aliases;
 drop table if exists public.recon_pay_config;
 
+drop function if exists public.overhead_entry_before_insert();
+drop function if exists public.manual_entry_before_insert();
+drop function if exists public.manual_entry_immutable();
+drop function if exists public.recon_owner_write_guard();
+drop function if exists public.recon_owner_or_break_glass();
 drop function if exists public.log_pay_adjustment();
 drop function if exists public.hub_cutover_guard();
 drop function if exists public.hub_cutover_recorded();
@@ -157,7 +187,7 @@ alter table public.sales drop column if exists lead_source;
 do $$ begin
   if to_regclass('supabase_migrations.schema_migrations') is not null then
     execute $q$delete from supabase_migrations.schema_migrations
-                where version in ('20261031210000','20261031210100','20261031210200')$q$;
+                where version in ('20261031210000','20261031210100','20261031210200','20261031210300')$q$;
   end if;
 end $$;
 

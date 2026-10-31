@@ -9,7 +9,7 @@ with m as (
          case when to_regclass('supabase_migrations.schema_migrations') is null then 0
               else (xpath('/row/c/text()', query_to_xml(
                      'select count(*) as c from supabase_migrations.schema_migrations
-                       where version in (''20261031210000'',''20261031210100'',''20261031210200'')', false, true, '')))[1]::text::int end as s3_versions,
+                       where version in (''20261031210000'',''20261031210100'',''20261031210200'',''20261031210300'')', false, true, '')))[1]::text::int end as s3_versions,
          case when to_regclass('supabase_migrations.schema_migrations') is null then 0
               else (xpath('/row/c/text()', query_to_xml(
                      'select count(*) as c from supabase_migrations.schema_migrations
@@ -19,7 +19,7 @@ with m as (
          to_regprocedure('public.is_admin()') is not null and to_regprocedure('public.audit_row_change()') is not null as has_security,
          (select string_agg(format('%s/%s', base_rate, addon_bonus_rate), ',') from public.commission_config) as commission_config
 )
-select case when has_s3 and s3_versions = 3 then 'ALREADY APPLIED'
+select case when has_s3 and s3_versions = 4 then 'ALREADY APPLIED'
             when has_s3 or s3_versions > 0 or sales_cols > 0 then 'FAIL'
             when prior_versions = 7 and has_s2 and has_security and commission_config in ('0.3800/0.0500', '0.38/0.05') then 'PASS'
             else 'FAIL' end as preflight,

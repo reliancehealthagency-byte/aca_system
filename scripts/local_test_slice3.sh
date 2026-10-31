@@ -45,7 +45,7 @@ psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/tmp/s3a3.out 2>&1; rc=$?
 EV2=$(q $D -c "select count(*) from event_log")
 res "A3 paste run 2 (no-op)" "$([ $rc = 0 ] && [ "$EV1" = "$EV2" ] && grep -q 'already applied' /tmp/s3a3.out && echo PASS || echo FAIL)" "exit=$rc event_log $EV1->$EV2"
 res "A4 standalone preflight after apply" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = 'ALREADY APPLIED' ] && echo PASS || echo FAIL)" "$(q $D -f $PF | cut -d'|' -f1)"
-res "A5 schema_migrations has 4 + 3 + 3 = 10 versions" "$([ "$(q $D -c 'select count(*) from supabase_migrations.schema_migrations')" = 10 ] && echo PASS || echo FAIL)" "$(q $D -c "select string_agg(version, ',' order by version) from supabase_migrations.schema_migrations where version like '2026103121%'")"
+res "A5 schema_migrations has 4 + 3 + 4 = 11 versions" "$([ "$(q $D -c 'select count(*) from supabase_migrations.schema_migrations')" = 11 ] && echo PASS || echo FAIL)" "$(q $D -c "select string_agg(version, ',' order by version) from supabase_migrations.schema_migrations where version like '2026103121%'")"
 AFTER=$(q $D -c "$SNAP")
 res "A6 existing data unchanged by the paste (sales/agents/contacts/applications/call_metrics/commission_config/expenses/categories/revenue_adjustments)" "$([ "$BEFORE" = "$AFTER" ] && echo PASS || echo FAIL)" "$BEFORE"
 res "A7 paste loads no Premier/board/mock data (config rows only)" "$([ "$(q $D -c 'select (select count(*) from recon_imports)+(select count(*) from premier_member_products)+(select count(*) from board_submissions)+(select count(*) from pay_adjustments)+(select count(*) from payroll_cutoffs)')" = 0 ] && echo PASS || echo FAIL)" "config: $(q $D -c "select (select count(*) from recon_pay_config)||' pay config, '||(select count(*) from agent_pay_rules)||' agent rules, '||(select count(*) from premier_addon_map)||' add-on map rows ('||(select count(*) from premier_addon_map where status='proposed')||' proposed)'")"
@@ -68,7 +68,10 @@ for g in "update sales set lead_source='web' where ctid=(select ctid from sales 
          "update recon_pay_config set payroll_owner_user_id=gen_random_uuid() where id|payroll owner set" \
          "insert into payroll_cutoffs(payday,cutoff_at,source,note) values ('2026-11-06','2026-11-05 14:10 America/New_York','submit','Kyle submit')|real payroll cutoff" \
          "update premier_addon_map set active=false where ctid=(select ctid from premier_addon_map order by pattern limit 1)|edited add-on map" \
-         "update agent_pay_rules set no_spiff=false where agent_name='Loreidy Martinez'|edited agent_pay_rules"; do
+         "update agent_pay_rules set no_spiff=false where agent_name='Loreidy Martinez'|edited agent_pay_rules" \
+         "insert into manual_entries(kind,entry_date,period,amount) values ('credit','2026-10-30','day',5)|a manual entry" \
+         "insert into overhead_entries(month,source_name,amount) values ('2026-10-01','Rent',5)|an overhead entry" \
+         "update manual_entry_sources set label='Ringba (renamed)' where code='ringba'|edited manual_entry_sources"; do
   G=t3_guard; psql -q -d postgres -c "drop database if exists $G" -c "create database $G template $D" >/dev/null 2>&1
   q $G -c "${g%%|*}" >/dev/null
   psql -X -q -v ON_ERROR_STOP=1 -d $G -f $RB >/tmp/rb.out 2>&1; rc=$?

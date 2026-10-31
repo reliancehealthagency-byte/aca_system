@@ -167,6 +167,14 @@ create trigger payroll_cutoffs_guard before insert or update or delete on public
 -- The hub "Paid Lock" export (scripts/csv_to_recon_sql.py --hub) inserts its rows into hub_paid_lock, then ONE hub_cutover
 -- row. Same protection as payroll ownership: the current owner, or the SQL Editor while no owner is set; service_role and
 -- other admins are refused. Once recorded it can't be reset, edited or moved (immutable); no more hub rows are accepted.
+-- rev 4 (Kyle 7:14 PM ET 10/31): owner-only check. True for the payroll owner (signed in) or the SQL Editor (postgres / supabase_admin, no signed-in user); never for
+-- service_role. SECURITY INVOKER on purpose: inside the guard trigger current_user is the caller.
+create or replace function public.recon_owner_or_break_glass() returns boolean
+language sql stable set search_path = public, pg_temp as $$
+  select current_user <> 'service_role' and coalesce(public.audit_actor_role(), '') <> 'service_role'
+     and ((auth.uid() is null and public.audit_actor_role() in ('postgres', 'supabase_admin'))
+          or (auth.uid() is not null and auth.uid() = public.recon_payroll_owner()))
+$$;
 create or replace function public.recon_owner_or_sql_editor(what text) returns void
 language plpgsql set search_path = public, pg_temp as $$
 declare owner uuid := public.recon_payroll_owner();
@@ -452,8 +460,9 @@ create or replace function public.premier_lock_payday(p_payday date) returns int
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare n int; cf record;
 begin
-  if not (public.is_admin() or public.audit_actor_role() in ('service_role', 'postgres', 'supabase_admin')) then
-    raise exception 'premier_lock_payday: admin only';
+  -- rev 4 (Kyle 7:14 PM ET 10/31): locking is owner-only (payroll owner or SQL Editor break-glass); service_role refused.
+  if not public.recon_owner_or_break_glass() then
+    raise exception 'premier_lock_payday: owner only (the payroll owner or the SQL Editor; caller %)', coalesce(public.audit_actor_role(), current_user);
   end if;
   if extract(dow from p_payday) <> 5 then raise exception 'payday must be a Friday'; end if;
   select (select h.last_hub_payday from public.hub_cutover h) as cutover_date into cf;
