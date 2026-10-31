@@ -84,7 +84,7 @@ begin
       raise exception 'recon_pay_config: the service_role (admin key) can''t change the payroll owner / adjustment_server_path';
     elsif old.payroll_owner_user_id is null and not sql_editor then
       raise exception 'recon_pay_config: payroll owner not set: only the project owner in the SQL Editor (postgres) can set payroll_owner_user_id / adjustment_server_path (caller %)', who;
-    elsif old.payroll_owner_user_id is not null and not (sql_editor or uid = old.payroll_owner_user_id) then
+    elsif old.payroll_owner_user_id is not null and not coalesce(sql_editor or uid = old.payroll_owner_user_id, false) then
       raise exception 'recon_pay_config: only the current payroll owner (or the SQL Editor) can change payroll_owner_user_id / adjustment_server_path';
     end if;
   end if;
@@ -121,8 +121,10 @@ language plpgsql security definer set search_path = public, pg_temp as $$
 declare n int; owner uuid := public.recon_payroll_owner();
 begin
   -- only the payroll owner or the SQL Editor (they are the ones who record submits / the hub cutover)
-  if not ((owner is not null and auth.uid() = owner and public.audit_actor_role() <> 'service_role')
-          or (auth.uid() is null and public.audit_actor_role() in ('postgres', 'supabase_admin'))) then
+  if coalesce((owner is not null and auth.uid() = owner and public.audit_actor_role() <> 'service_role'), false)
+     or coalesce((auth.uid() is null and public.audit_actor_role() in ('postgres', 'supabase_admin')), false) then
+    null;   -- allowed (fails closed: any NULL term counts as false, rev 4 B1)
+  else
     raise exception 'recon_freeze_closed_weeks: payroll owner or SQL Editor only';
   end if;
   if extract(dow from p_payday) <> 5 then raise exception 'payday must be a Friday'; end if;
@@ -142,9 +144,9 @@ create or replace function public.payroll_cutoffs_guard() returns trigger
 language plpgsql set search_path = public, pg_temp as $$
 declare owner uuid := public.recon_payroll_owner();
         sql_editor boolean := current_user in ('postgres', 'supabase_admin');
-        allowed boolean := current_user in ('postgres', 'supabase_admin')
+        allowed boolean := coalesce(current_user in ('postgres', 'supabase_admin')
                            or (owner is not null and auth.uid() = owner and current_user <> 'service_role'
-                               and public.audit_actor_role() <> 'service_role');
+                               and public.audit_actor_role() <> 'service_role'), false);   -- fails closed (rev 4 B1)
 begin
   if tg_op in ('UPDATE', 'DELETE') and old.source = 'submit' and not sql_editor then
     raise exception 'payroll_cutoffs: the submit for payday % is recorded and final (only the SQL Editor can correct it)', old.payday;
@@ -169,11 +171,16 @@ create trigger payroll_cutoffs_guard before insert or update or delete on public
 -- other admins are refused. Once recorded it can't be reset, edited or moved (immutable); no more hub rows are accepted.
 -- rev 4 (Kyle 7:14 PM ET 10/31): owner-only check. True for the payroll owner (signed in) or the SQL Editor (postgres / supabase_admin, no signed-in user); never for
 -- service_role. SECURITY INVOKER on purpose: inside the guard trigger current_user is the caller.
+-- FAILS CLOSED (Orchestrator review of 2b5187d, B1): with payroll_owner_user_id NULL, "auth.uid() = owner" is NULL, so
+-- every term is wrapped in coalesce(..., false) and callers test "is not true". NULL owner = only the SQL Editor.
 create or replace function public.recon_owner_or_break_glass() returns boolean
 language sql stable set search_path = public, pg_temp as $$
-  select current_user <> 'service_role' and coalesce(public.audit_actor_role(), '') <> 'service_role'
-     and ((auth.uid() is null and public.audit_actor_role() in ('postgres', 'supabase_admin'))
-          or (auth.uid() is not null and auth.uid() = public.recon_payroll_owner()))
+  select coalesce(
+           current_user <> 'service_role' and coalesce(public.audit_actor_role(), '') <> 'service_role'
+           and (coalesce(auth.uid() is null and public.audit_actor_role() in ('postgres', 'supabase_admin'), false)
+                or coalesce(auth.uid() is not null and public.recon_payroll_owner() is not null
+                            and auth.uid() = public.recon_payroll_owner(), false)),
+         false)
 $$;
 create or replace function public.recon_owner_or_sql_editor(what text) returns void
 language plpgsql set search_path = public, pg_temp as $$
@@ -461,7 +468,7 @@ language plpgsql security definer set search_path = public, pg_temp as $$
 declare n int; cf record;
 begin
   -- rev 4 (Kyle 7:14 PM ET 10/31): locking is owner-only (payroll owner or SQL Editor break-glass); service_role refused.
-  if not public.recon_owner_or_break_glass() then
+  if public.recon_owner_or_break_glass() is not true then
     raise exception 'premier_lock_payday: owner only (the payroll owner or the SQL Editor; caller %)', coalesce(public.audit_actor_role(), current_user);
   end if;
   if extract(dow from p_payday) <> 5 then raise exception 'payday must be a Friday'; end if;
@@ -483,8 +490,7 @@ begin
                                ('claimed_spiffs', l.spiff_pay_friday, coalesce(l.actual_spiffs, 0) - coalesce(l.missed_spiffs, 0)),
                                ('missed_spiffs', l.missed_spiff_pay_friday, coalesce(l.missed_spiffs, 0))) v(component, due, amount)
    where l.agent_name is not null and l.actual_commission is not null and l.actual_spiffs is not null
-     and l.line_status <> 'duplicate_board_row'
-     and not coalesce(l.added_to_closed_week, false)
+     and public.recon_line_pays(l.line_status, l.added_to_closed_week)   -- same predicate as the P&L rep pay (rev 4)
      and v.due = p_payday
   on conflict (line_key, component) do nothing;
   get diagnostics n = row_count;

@@ -21,6 +21,15 @@ language sql stable set search_path = public, pg_temp as $$
   select public.is_admin() or current_user in ('postgres', 'service_role', 'supabase_admin')
 $$;
 
+-- rev 4 (Orchestrator review of 2b5187d, B2): the ONE "does this line pay" predicate. Payroll (premier_lock_payday) and
+-- the P&L projected rep pay (pl_projected_rep_pay_lines) both use it, so they can't drift: a duplicate board row never
+-- pays, and a row first seen in a closed week is held for Kyle (not payable until he decides). Superseded board versions
+-- never reach premier_recon_lines (board_submissions_current keeps only the newest version).
+create or replace function public.recon_line_pays(p_line_status text, p_added_to_closed_week boolean) returns boolean
+language sql immutable as $$
+  select coalesce(p_line_status, '') <> 'duplicate_board_row' and not coalesce(p_added_to_closed_week, false)
+$$;
+
 create or replace function public.recon_friday_after_week(d date) returns date
 language sql immutable as $$ select d - extract(dow from d)::int + 12 $$;
 

@@ -1,11 +1,11 @@
-// Shared helpers for the line-item P&L pages.
+// Shared helpers for the P&L pages (data loading for both database states lives in plmodel.ts).
 export type Period = 'daily' | 'weekly' | 'monthly';
 export const PERIODS: Period[] = ['daily', 'weekly', 'monthly'];
 
 export const PERIOD_VIEW: Record<Period, { view: string; key: string; keyCol: string; label: string }> = {
-  daily:   { view: 'pl_daily',   key: 'day',         keyCol: 'line_date',   label: 'Daily' },
-  weekly:  { view: 'pl_weekly',  key: 'week_start',  keyCol: 'week_start',  label: 'Weekly (Sun-Sat)' },
-  monthly: { view: 'pl_monthly', key: 'month_start', keyCol: 'month_start', label: 'Monthly' },
+  daily:   { view: 'pl_daily_walk',   key: 'day',         keyCol: 'line_date',   label: 'Daily' },
+  weekly:  { view: 'pl_weekly_walk',  key: 'week_start',  keyCol: 'week_start',  label: 'Weekly (Sun-Sat)' },
+  monthly: { view: 'pl_monthly_walk', key: 'month_start', keyCol: 'month_start', label: 'Monthly' },
 };
 
 export const isPeriod = (p: string | undefined): p is Period => !!p && (PERIODS as string[]).includes(p);
@@ -27,20 +27,7 @@ export function periodTitle(period: Period, key: string): string {
   return d.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
 }
 
-export type Summary = {
-  sales_count: number; line_count: number; revenue: string; commission: string; expenses: string; net: string;
-  day?: string; week_start?: string; month_start?: string;
-};
-export type Line = {
-  line_date: string; line_type: 'revenue' | 'commission' | 'expense'; category: string; category_label: string;
-  description: string | null; source: string; amount: string; signed_amount: string;
-  ref_table: string; ref_id: string; agent_name: string | null;
-};
-
 export const cell = { padding: '4px 8px', borderBottom: '1px solid #eee' } as const;
 export const head = { textAlign: 'left', padding: '4px 8px', borderBottom: '1px solid #999' } as const;
 export const num = { ...cell, textAlign: 'right' } as const;
 
-// PostgREST caps one response at 1,000 rows; drill-downs page through with range() up to MAX_LINES.
-export const PAGE_SIZE = 1000;
-export const MAX_LINES = 20000;

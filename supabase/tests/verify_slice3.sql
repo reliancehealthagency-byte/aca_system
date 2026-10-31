@@ -33,7 +33,7 @@ select pg_temp.r('T0. claim CONFIRMED: slice-one case-sensitive LIKE list matche
       and not exists (select 1 from unnest((select qualifying_addon_patterns from public.commission_config where id)) pat where p.product_label like pat)));
 
 -- T1. objects + security
-select pg_temp.r('T1. slice-three tables + views exist (19 tables, 19 views)',
+select pg_temp.r('T1. slice-three tables + views exist (19 tables, 20 views)',
   (select count(*) from information_schema.tables where table_schema='public' and table_name in
     ('recon_pay_config','agent_pay_rules','payroll_cutoffs','recon_imports','premier_member_products','board_submissions',
      'premier_recon_event_state','premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments',
@@ -43,20 +43,20 @@ select pg_temp.r('T1. slice-three tables + views exist (19 tables, 19 views)',
     ('premier_products_current','premier_member_status','premier_recon_lines','premier_recon_unmatched_board',
      'premier_recon_unmatched_premier','premier_recon_open_items','premier_policy_count_check','premier_recon_trueup',
      'sales_missing_member_id','board_submissions_current','board_export_diffs',
-     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
-     'pl_daily_walk','pl_weekly_walk','pl_monthly_walk')) = 19);
+     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
+     'pl_daily_walk','pl_weekly_walk','pl_monthly_walk')) = 20);
 select pg_temp.r('T2. RLS on every slice-three table; every slice-three view is security_invoker',
   (select bool_and(relrowsecurity) from pg_class where relnamespace='public'::regnamespace and relname in
     ('recon_pay_config','agent_pay_rules','payroll_cutoffs','recon_imports','premier_member_products','board_submissions',
      'premier_recon_event_state','premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments',
      'missed_spiff_anchors','board_week_freezes','hub_paid_lock','hub_cutover','agent_name_aliases',
      'manual_entry_sources','manual_entries','overhead_entries'))
-  and (select count(*) = 19 and bool_and(coalesce(reloptions @> array['security_invoker=true'], false)) from pg_class
+  and (select count(*) = 20 and bool_and(coalesce(reloptions @> array['security_invoker=true'], false)) from pg_class
         where relnamespace='public'::regnamespace and relkind='v' and relname in
     ('premier_products_current','premier_member_status','premier_recon_lines','premier_recon_unmatched_board',
      'premier_recon_unmatched_premier','premier_recon_open_items','premier_policy_count_check','premier_recon_trueup','sales_missing_member_id',
      'board_submissions_current','board_export_diffs',
-     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
+     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
      'pl_daily_walk','pl_weekly_walk','pl_monthly_walk')));
 select pg_temp.r('T3. anon has no SELECT on any slice-three table/view and cannot run the logger',
   not exists (select 1 from pg_class where relnamespace='public'::regnamespace and relname in
@@ -67,7 +67,7 @@ select pg_temp.r('T3. anon has no SELECT on any slice-three table/view and canno
      'premier_recon_unmatched_premier','premier_recon_open_items','premier_policy_count_check','premier_recon_trueup','sales_missing_member_id',
      'board_submissions_current','board_export_diffs',
      'manual_entry_sources','manual_entries','overhead_entries',
-     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
+     'manual_entries_current','pl_manual_entry_lines','pl_projected_rep_pay_lines','pl_projected_rep_pay_daily','pl_overhead_monthly','pl_overhead_weekly',
      'pl_daily_walk','pl_weekly_walk','pl_monthly_walk')
     and has_table_privilege('anon', oid, 'SELECT'))
   and not has_function_privilege('anon', 'public.premier_log_recon_events()', 'EXECUTE'));
@@ -610,6 +610,12 @@ select pg_temp.r('Q12d. recording the 11/06 submit anchors every missed spiff du
      where a.payday = '2026-11-06' and l.member_id in ('687990310', '687990121', '687990247')) = 3
   and exists (select 1 from public.board_week_freezes where reason = 'payroll_submit' and week_payday = '2026-11-06'),
   (select string_agg(line_key || '@' || payday, ', ') from public.missed_spiff_anchors));
+select pg_temp.act('authenticated','admin2.test@example.com');
+do $$ declare n int; begin
+  n := public.premier_lock_payday('2026-11-06');
+  reset role; perform pg_temp.r('W0f. (Orchestrator repro) owner UNSET, after the postgres cutover + submit: an admin cannot lock 11/06', false, 'locked ' || n || ' rows');
+exception when others then reset role; perform pg_temp.r('W0f. (Orchestrator repro) owner UNSET, after the postgres cutover + submit: an admin cannot lock 11/06', sqlerrm like '%owner only%', sqlerrm); end $$;
+select pg_temp.srv();
 select pg_temp.act('authenticated','admin.test@example.com');
 do $$ begin
   update public.payroll_cutoffs set cutoff_at = cutoff_at + interval '1 day' where payday = '2026-11-06';
@@ -753,6 +759,105 @@ do $$ begin
   reset role; perform pg_temp.r('O8. owner NULL: the admin key (service_role) cannot set the owner either', false, 'updated');
 exception when others then reset role; perform pg_temp.r('O8. owner NULL: the admin key (service_role) cannot set the owner either', sqlerrm like '%payroll owner%', sqlerrm); end $$;
 select pg_temp.srv();
+-- ======== rev 4: owner-only actions with the payroll owner UNSET (Orchestrator review of 2b5187d, B1: must fail CLOSED) ========
+select pg_temp.srv();
+insert into public.agent_name_aliases (alias, agent_id) select 'VERIFY seed alias', id from public.agents where role = 'agent' limit 1;
+insert into public.payroll_cutoffs (payday, cutoff_at, source, note) values ('2026-12-04', '2026-12-03 14:00-05', 'provisional', 'VERIFY provisional');
+create temp table wstmts (t text, op text, sql text);
+insert into wstmts values
+ ('commission_config','insert','insert into public.commission_config (id) values (false)'),
+ ('commission_config','update','update public.commission_config set base_rate = 0.40 where id'),
+ ('commission_config','delete','delete from public.commission_config where id'),
+ ('premier_addon_map','insert','insert into public.premier_addon_map (source, pattern, addon_key) values (''premier_label'', ''vw'', ''add_type'')'),
+ ('premier_addon_map','update','update public.premier_addon_map set status = ''proposed'' where strpos(pattern, ''protect'') > 0'),
+ ('premier_addon_map','delete','delete from public.premier_addon_map where strpos(pattern, ''protect'') > 0'),
+ ('agent_pay_rules','insert','insert into public.agent_pay_rules (agent_name, base_rate_override) values (''VERIFY agent'', 0.5)'),
+ ('agent_pay_rules','update','update public.agent_pay_rules set base_rate_override = 0.5 where agent_name = ''Kaitlyn Romine'''),
+ ('agent_pay_rules','delete','delete from public.agent_pay_rules where agent_name = ''Kaitlyn Romine'''),
+ ('agent_name_aliases','insert','insert into public.agent_name_aliases (alias, agent_id) select ''VERIFY alias 2'', id from public.agents limit 1'),
+ ('agent_name_aliases','update','update public.agent_name_aliases set note = ''x'' where alias = ''VERIFY seed alias'''),
+ ('agent_name_aliases','delete','delete from public.agent_name_aliases where alias = ''VERIFY seed alias'''),
+ ('recon_pay_config','insert','insert into public.recon_pay_config (id) values (false)'),
+ ('recon_pay_config','update','update public.recon_pay_config set spiff_cc_edge = 99 where id'),
+ ('recon_pay_config','delete','delete from public.recon_pay_config where id'),
+ ('payroll_cutoffs','insert','insert into public.payroll_cutoffs (payday, cutoff_at, source) values (''2027-01-01'', ''2026-12-31 14:00-05'', ''provisional'')'),
+ ('payroll_cutoffs','update','update public.payroll_cutoffs set cutoff_at = cutoff_at + interval ''1 hour'' where payday = ''2026-12-04'''),
+ ('payroll_cutoffs','delete','delete from public.payroll_cutoffs where payday = ''2026-12-04'''),
+ ('manual_entry_sources','insert','insert into public.manual_entry_sources (kind, code, label, pl_line) values (''transfer'', ''vw'', ''VW'', ''transfers_ringba'')'),
+ ('manual_entry_sources','update','update public.manual_entry_sources set label = ''X'' where code = ''ringba'''),
+ ('manual_entry_sources','delete','delete from public.manual_entry_sources where code = ''ringba''');
+select pg_temp.r('W0. (precondition) payroll owner is NULL here', (select payroll_owner_user_id is null from public.recon_pay_config where id));
+do $$ declare w record; who text; ok int; bad text; msg text; begin
+  foreach who in array array['admin.test@example.com', 'admin2.test@example.com'] loop
+    ok := 0; bad := null;
+    for w in select * from wstmts loop
+      perform pg_temp.act('authenticated', who);
+      begin
+        execute w.sql;
+        bad := concat_ws(', ', bad, w.t || ' ' || w.op);
+      exception when others then
+        msg := sqlerrm;
+        if msg ~ '(owner-only|permission denied)' then ok := ok + 1;
+        else bad := concat_ws(', ', bad, w.t || ' ' || w.op || ': ' || msg); end if;
+      end;
+      perform pg_temp.srv();
+    end loop;
+    perform pg_temp.r('W0a. owner UNSET: admin ' || who || ' is refused on insert, update and delete of every pay-config table (7 x 3)',
+      ok = 21 and bad is null, format('refused=%s/21 not refused: %s', ok, coalesce(bad, 'none')));
+  end loop;
+end $$;
+do $$ declare st text; who text; bad text; msg text; n int := 0; begin
+  foreach who in array array['admin.test@example.com', 'admin2.test@example.com'] loop
+    foreach st in array array[
+      'select public.premier_lock_payday(''2026-11-06'')',
+      'update public.payroll_cutoffs set source = ''submit'', cutoff_at = ''2026-11-05 14:30-05'' where payday = ''2026-11-06''',
+      'insert into public.payroll_cutoffs (payday, cutoff_at, source) values (''2026-12-11'', ''2026-12-10 14:00-05'', ''submit'')',
+      'insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, locked_at) values (repeat(''d'', 64), 1, ''2026-10-30'', ''Chris Wilfong'', 1, now())',
+      'insert into public.hub_cutover (file_name, file_sha256, note) values (''VERIFY'', repeat(''d'', 64), ''VERIFY'')',
+      'select public.recon_freeze_closed_weeks(''2026-11-06'', ''payroll_submit'')',
+      'update public.recon_pay_config set payroll_owner_user_id = auth.uid() where id'] loop
+      perform pg_temp.act('authenticated', who);
+      begin
+        execute st;
+        bad := concat_ws(' | ', bad, who || ': ' || st);
+      exception when others then
+        msg := sqlerrm;
+        if msg ~* '(owner|SQL Editor|permission denied)' then n := n + 1;
+        else bad := concat_ws(' | ', bad, who || ': ' || left(st, 40) || ' -> ' || msg); end if;
+      end;
+      perform pg_temp.srv();
+    end loop;
+  end loop;
+  perform pg_temp.r('W0b. owner UNSET: lock, submit (update + insert), hub cutover (rows + record), freeze and taking ownership are refused for both admins',
+    n = 14 and bad is null, format('refused=%s/14 not refused: %s', n, coalesce(bad, 'none')));
+end $$;
+select pg_temp.srv();
+do $$ declare w record; n int := 0; bad text; ws text[][]; begin
+  select array_agg(array[t, op, sql]) into ws from wstmts where (op = 'insert' and t not in ('commission_config', 'recon_pay_config')) or op = 'update';
+  begin
+    for w in select ws[i][1] t, ws[i][2] op, ws[i][3] sql from generate_subscripts(ws, 1) i loop
+      begin execute w.sql; n := n + 1;
+      exception when others then bad := concat_ws(', ', bad, w.t || ' ' || w.op || ': ' || sqlerrm); end;
+    end loop;
+    raise exception 'undo';
+  exception when others then
+    if sqlerrm <> 'undo' then bad := concat_ws(', ', bad, sqlerrm); end if;
+  end;
+  perform pg_temp.r('W0c. owner UNSET: postgres in the SQL Editor (break-glass) can still write every pay-config table (changes undone)',
+    bad is null and n = 12, format('ok=%s problems: %s', n, coalesce(bad, 'none')));
+end $$;
+select pg_temp.act('service_role', 'admin2.test@example.com');
+do $$ begin
+  update public.commission_config set base_rate = 0.50 where id;
+  reset role; perform pg_temp.r('W0d. owner UNSET: the admin key (service_role) cannot change commission_config either', false, 'updated');
+exception when others then reset role; perform pg_temp.r('W0d. owner UNSET: the admin key (service_role) cannot change commission_config either', sqlerrm like '%owner-only%', sqlerrm); end $$;
+select pg_temp.srv();
+select pg_temp.r('W0e. owner UNSET: nothing the admins tried changed (rate 0.38, both ADD exclusions active, Kaitlyn rule, no owner)',
+  (select base_rate = 0.38 from public.commission_config where id)
+  and (select count(*) = 2 from public.premier_addon_map where source = 'premier_label_exclude' and active)
+  and exists (select 1 from public.agent_pay_rules where agent_name = 'Kaitlyn Romine')
+  and (select payroll_owner_user_id is null from public.recon_pay_config where id));
+
 -- the apply step does this in the SQL Editor (from /workspace/secrets/payroll_owner_user_id.txt once Kyle has an account)
 update public.recon_pay_config set payroll_owner_user_id = (select id from auth.users where email = 'admin.test@example.com') where id;
 select pg_temp.act('authenticated','admin2.test@example.com');
@@ -888,33 +993,7 @@ select pg_temp.r('R4. admin user sees the same reconciliation lines as the owner
   (select format('admin=%s owner=%s', (select n from seen), count(*)) from public.premier_recon_lines));
 
 
--- ======== rev 4: owner-only pay config (Kyle 7:14 PM ET) ========
-select pg_temp.srv();
-insert into public.agent_name_aliases (alias, agent_id) select 'VERIFY seed alias', id from public.agents where role = 'agent' limit 1;
-insert into public.payroll_cutoffs (payday, cutoff_at, source, note) values ('2026-12-04', '2026-12-03 14:00-05', 'provisional', 'VERIFY provisional');
-create temp table wstmts (t text, op text, sql text);
-insert into wstmts values
- ('commission_config','insert','insert into public.commission_config (id) values (false)'),
- ('commission_config','update','update public.commission_config set base_rate = 0.40 where id'),
- ('commission_config','delete','delete from public.commission_config where id'),
- ('premier_addon_map','insert','insert into public.premier_addon_map (source, pattern, addon_key) values (''premier_label'', ''vw'', ''add_type'')'),
- ('premier_addon_map','update','update public.premier_addon_map set status = ''proposed'' where strpos(pattern, ''protect'') > 0'),
- ('premier_addon_map','delete','delete from public.premier_addon_map where strpos(pattern, ''protect'') > 0'),
- ('agent_pay_rules','insert','insert into public.agent_pay_rules (agent_name, base_rate_override) values (''VERIFY agent'', 0.5)'),
- ('agent_pay_rules','update','update public.agent_pay_rules set base_rate_override = 0.5 where agent_name = ''Kaitlyn Romine'''),
- ('agent_pay_rules','delete','delete from public.agent_pay_rules where agent_name = ''Kaitlyn Romine'''),
- ('agent_name_aliases','insert','insert into public.agent_name_aliases (alias, agent_id) select ''VERIFY alias 2'', id from public.agents limit 1'),
- ('agent_name_aliases','update','update public.agent_name_aliases set note = ''x'' where alias = ''VERIFY seed alias'''),
- ('agent_name_aliases','delete','delete from public.agent_name_aliases where alias = ''VERIFY seed alias'''),
- ('recon_pay_config','insert','insert into public.recon_pay_config (id) values (false)'),
- ('recon_pay_config','update','update public.recon_pay_config set spiff_cc_edge = 99 where id'),
- ('recon_pay_config','delete','delete from public.recon_pay_config where id'),
- ('payroll_cutoffs','insert','insert into public.payroll_cutoffs (payday, cutoff_at, source) values (''2027-01-01'', ''2026-12-31 14:00-05'', ''provisional'')'),
- ('payroll_cutoffs','update','update public.payroll_cutoffs set cutoff_at = cutoff_at + interval ''1 hour'' where payday = ''2026-12-04'''),
- ('payroll_cutoffs','delete','delete from public.payroll_cutoffs where payday = ''2026-12-04'''),
- ('manual_entry_sources','insert','insert into public.manual_entry_sources (kind, code, label, pl_line) values (''transfer'', ''vw'', ''VW'', ''transfers_ringba'')'),
- ('manual_entry_sources','update','update public.manual_entry_sources set label = ''X'' where code = ''ringba'''),
- ('manual_entry_sources','delete','delete from public.manual_entry_sources where code = ''ringba''');
+-- ======== rev 4: owner-only pay config (Kyle 7:14 PM ET), owner SET ========
 do $$ declare w record; who text; em text; ok int; bad text; msg text; begin
   foreach who in array array['admin2', 'service_role'] loop
     ok := 0; bad := null;
@@ -1108,11 +1187,50 @@ create temp table walk as
          w.daily_net w_daily_net, w.overhead w_oh, w.earned_total w_earned, w.neo_book w_neo, w.allstate_earned w_allstate, w.net w_net,
          m.daily_net m_daily_net, m.overhead m_oh, m.earned_total m_earned, m.net m_net, m.projected_commission m_pc,
          (select sum(projected_commission) from public.pl_daily_walk where month_start = '2026-10-01') mo_pc_sum,
-         (select (sum(projected_commission) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30') eng_comm,
-         (select (sum(projected_spiffs) filter (where line_type = 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30') eng_abs,
-         (select (sum(projected_spiffs) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30') eng_sp,
-         (select revenue from public.pl_weekly where week_start = '2026-10-25') s2_rev,
-         (select count(*) from public.pl_manual_entry_lines where description in ('VERIFY premium entered', 'VERIFY count')) ml
+         (select (sum(projected_commission) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_pays(line_status, added_to_closed_week)) eng_comm,
+         (select (sum(projected_spiffs) filter (where line_type = 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_pays(line_status, added_to_closed_week)) eng_abs,
+         (select (sum(projected_spiffs) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_pays(line_status, added_to_closed_week)) eng_sp,
+         (select count(*) from public.pl_manual_entry_lines where description in ('VERIFY premium entered', 'VERIFY count')) ml,
+         -- rev 4 B2: rep pay with NO pay predicate (what 2b5187d summed), for the 10/29 day, the 10/25 week and October
+         (select sum(coalesce(projected_commission, 0) + coalesce(projected_spiffs, 0)) from public.premier_recon_lines
+           where coalesce(date_booked, (submitted_at at time zone 'America/New_York')::date) = '2026-10-29') raw_1029,
+         (select sum(coalesce(projected_commission, 0) + coalesce(projected_spiffs, 0)) from public.premier_recon_lines
+           where coalesce(date_booked, (submitted_at at time zone 'America/New_York')::date) between '2026-10-25' and '2026-10-31') raw_wk,
+         (select sum(coalesce(projected_commission, 0) + coalesce(projected_spiffs, 0)) from public.premier_recon_lines
+           where coalesce(date_booked, (submitted_at at time zone 'America/New_York')::date) between '2026-10-01' and '2026-10-31') raw_oct,
+         (select projected_commission from public.pl_daily_walk where day = '2026-10-29') pc_1029,
+         (select sum(projected_commission) from public.pl_daily_walk where week_start = '2026-10-25') pc_wk,
+         (select (projected_commission + projected_spiffs)::numeric(12,2) from public.premier_recon_lines where line_key = '20261029114007-P') dup_amt,
+         (select line_status from public.premier_recon_lines where line_key = '20261029114007-P') dup_status,
+         (select count(*) from public.pl_projected_rep_pay_lines where line_key = '20261029114007-P') dup_in_pl,
+         (select count(*) from public.pl_projected_rep_pay_lines p join public.premier_recon_lines l using (line_key)
+           where not public.recon_line_pays(l.line_status, l.added_to_closed_week)) pl_nonpay,
+         (select count(*) from public.premier_recon_lines l
+           where public.recon_line_pays(l.line_status, l.added_to_closed_week)
+             and coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) is not null
+             and not exists (select 1 from public.pl_projected_rep_pay_lines p where p.line_key = l.line_key)) pay_missing,
+         -- parity with payroll pay: every line payroll has a corrected pay figure for (Premier collected), P&L rep pay = that pay
+         (select count(*) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
+            join public.premier_recon_lines l using (line_key)
+           where l.actual_commission is not null and t.stage2_premier_corrected is not null
+             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')) par_n,
+         (select sum(coalesce(projected_commission, 0) + coalesce(projected_spiffs, 0)) from public.premier_recon_lines
+           where not public.recon_line_pays(line_status, added_to_closed_week) and line_status <> 'duplicate_board_row'
+             and coalesce(date_booked, (submitted_at at time zone 'America/New_York')::date) between '2026-10-25' and '2026-10-31') held_wk,
+         (select sum(p.deal_commission + p.spiffs + p.abs_pay) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
+            join public.premier_recon_lines l using (line_key)
+           where l.actual_commission is not null and t.stage2_premier_corrected is not null
+             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')) par_pl,
+         (select sum(t.stage2_premier_corrected) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
+            join public.premier_recon_lines l using (line_key)
+           where l.actual_commission is not null and t.stage2_premier_corrected is not null
+             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')) par_pay,
+         (select count(*) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
+            join public.premier_recon_lines l using (line_key)
+           where l.actual_commission is not null and t.stage2_premier_corrected is not null
+             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')
+             and p.deal_commission + p.spiffs + p.abs_pay <> t.stage2_premier_corrected) par_bad,
+         (select coalesce(t.stage2_premier_corrected, 0) from public.premier_recon_trueup t where t.line_key = '20261029114007-P') dup_payroll
     from public.pl_daily_walk d, public.pl_weekly_walk w, public.pl_monthly_walk m
    where d.day = '2026-10-30' and w.week_start = '2026-10-25' and m.month_start = '2026-10-01';
 reset role; select pg_temp.srv();
@@ -1132,10 +1250,28 @@ select pg_temp.r('PL3. weekly net = sum of daily nets + four earned lines (Allst
 select pg_temp.r('PL4. monthly rollup: October = every October daily net + earned lines of weeks starting in October - the full October overhead (3410.10)',
   (select m_daily_net = mo_daily_sum and m_earned = 1750 and m_oh = 3410.10 and m_net = mo_daily_sum + 1750 - 3410.10 and m_pc = mo_pc_sum from walk),
   (select format('daily_net=%s earned=%s overhead=%s net=%s projected_commission=%s', m_daily_net, m_earned, m_oh, m_net, m_pc) from walk));
-select pg_temp.r('PL5. slice two P&L views untouched: pl_weekly still has its own revenue line; entered Premier premium / policy counts are visible lines, not in the walk net',
-  (select s2_rev is not null from walk)
-  and (select ml = 2 from walk),
-  (select 'slice-two pl_weekly revenue (week 10/25)=' || coalesce(s2_rev::text, 'null') from walk));
+select pg_temp.r('PL5. entered Premier premium / policy counts are visible lines, not in the walk net',
+  (select ml = 2 from walk), (select 'lines=' || ml from walk));
+select pg_temp.r('PL6. (B2) P&L rep pay counts exactly the lines payroll pays: the duplicate board row 20261029114007-P (98.47 + 50.00 spiff) is out, no non-paying line is in, no paying line is missing; lock and P&L share recon_line_pays()',
+  (select dup_status = 'duplicate_board_row' and dup_amt = 148.47 and dup_in_pl = 0 and pl_nonpay = 0 and pay_missing = 0 and dup_payroll = 0 from walk)
+  and (select prosrc ~ 'recon_line_pays' from pg_proc where proname = 'premier_lock_payday')
+  and (select pg_get_viewdef('public.pl_projected_rep_pay_lines'::regclass) ~ 'recon_line_pays'),
+  (select format('dup=%s %s in_pl=%s nonpay_in_pl=%s paying_missing=%s payroll_pays_dup=%s', dup_status, dup_amt, dup_in_pl, pl_nonpay, pay_missing, dup_payroll) from walk));
+select pg_temp.r('PL7. (B2) parity: for every line Premier has collected, P&L rep pay = payroll pay (uncollected lines: the P&L carries the projected cost by Date Booked, payroll pays 0 until collected) (premier_recon_trueup.stage2_premier_corrected), line by line and in total',
+  (select par_n > 20 and par_bad = 0 and par_pl = par_pay from walk),
+  (select format('lines=%s pl=%s payroll=%s mismatched=%s', par_n, par_pl, par_pay, par_bad) from walk));
+select pg_temp.r('PL8. (B2) corrected figures: 10/29 rep pay is 148.47 lower than the unfiltered sum 2b5187d used (the duplicate row); the 10/25 week and October are 148.47 lower plus, in this test only, the row verify adds to a closed week (held, so payroll does not pay it either); mock-only figures: local suite D4',
+  (select raw_1029 - pc_1029 = 148.47 and raw_wk - pc_wk = 148.47 + held_wk and raw_oct - m_pc = 148.47 + held_wk from walk),
+  (select format('10/29 %s (unfiltered %s); week rep pay %s (unfiltered %s; held closed-week row %s); week net %s; October rep pay %s (unfiltered %s), net %s',
+          pc_1029, raw_1029, pc_wk, raw_wk, held_wk, w_net, m_pc, raw_oct, m_net) from walk));
+select pg_temp.r('RV1. slice-two P&L views retired (Kyle directly 7:35 PM): pl_line_items / pl_daily / pl_weekly / pl_monthly / pl_unpriced_sales are gone',
+  to_regclass('public.pl_line_items') is null and to_regclass('public.pl_daily') is null and to_regclass('public.pl_weekly') is null
+  and to_regclass('public.pl_monthly') is null and to_regclass('public.pl_unpriced_sales') is null);
+select pg_temp.r('RV2. kept: slice-two tables expense_categories / revenue_adjustments (data), touch_updated_at(), slice-one sales_commission / commission_rates() / daily_pl / weekly_pl / monthly_pl',
+  to_regclass('public.expense_categories') is not null and to_regclass('public.revenue_adjustments') is not null
+  and to_regprocedure('public.touch_updated_at()') is not null and to_regclass('public.sales_commission') is not null
+  and to_regprocedure('public.commission_rates()') is not null and to_regclass('public.daily_pl') is not null
+  and to_regclass('public.weekly_pl') is not null and to_regclass('public.monthly_pl') is not null);
 
 reset role;
 \o

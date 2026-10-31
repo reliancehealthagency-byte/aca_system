@@ -27,6 +27,13 @@ SNAP="select md5(string_agg(t,'|' order by t)) from (
   union all select 'm'||row(m.*)::text from call_metrics m union all select 'k'||row(k.*)::text from commission_config k
   union all select 'e'||row(e.*)::text from expenses e union all select 'x'||row(x.*)::text from expense_categories x
   union all select 'r'||row(r.*)::text from revenue_adjustments r) x"
+# rev 4: exact identity of slice two's five P&L views (retired by slice three, recreated by its rollback)
+V5="select string_agg(format('%s|%s|%s|%s|%s|%s', c.relname, md5(pg_get_viewdef(c.oid, true)), coalesce(array_to_string(c.relacl, ' '), '-'),
+  pg_get_userbyid(c.relowner), coalesce(array_to_string(c.reloptions, ','), '-'), md5(coalesce(obj_description(c.oid, 'pg_class'), ''))), E'\n' order by c.relname)
+  from pg_class c where c.relnamespace = 'public'::regnamespace and c.relname in ('pl_line_items','pl_daily','pl_weekly','pl_monthly','pl_unpriced_sales')"
+V5FN="select md5(string_agg(pg_get_functiondef(p.oid), E'\n' order by p.oid::regprocedure::text)) from pg_proc p
+  where p.pronamespace = 'public'::regnamespace and p.prokind = 'f' and p.oid::regprocedure::text not like '%recon%' and p.proname in
+  ('touch_updated_at','commission_rates','is_admin','current_agent_id','sale_qualifies_for_addon','log_premium_mismatch')"
 SCHEMA="select md5(string_agg(x, '|' order by x)) from (
   select 'rel:'||c.relname||':'||c.relkind::text as x from pg_class c where c.relnamespace='public'::regnamespace
   union all select 'col:'||table_name||'.'||column_name||':'||data_type from information_schema.columns where table_schema='public'
@@ -34,24 +41,51 @@ SCHEMA="select md5(string_agg(x, '|' order by x)) from (
   union all select 'pol:'||tablename||'.'||policyname from pg_policies where schemaname='public'
   union all select 'trg:'||tgrelid::regclass||'.'||tgname from pg_trigger t join pg_class c on c.oid=t.tgrelid where not t.tgisinternal and c.relnamespace='public'::regnamespace) z"
 
+# P. the deploy package is the one built from this tree (rev 4: package copies were stale in rev 3)
+PKG=$(dirname "$PASTE"); T0=$(mktemp -d); bash scripts/build_slice3_paste.sh "$T0/paste.sql" >/dev/null
+res "P0 package paste == paste rebuilt from this tree" "$(cmp -s "$T0/paste.sql" "$PASTE" && echo PASS || echo FAIL)" "$(sha256sum < "$PASTE" | cut -c1-16)"
+pk=""; for f in $RB $PF supabase/deploy/slice3_retire_depcheck.sql; do cmp -s "$f" "$PKG/$(basename $f)" || pk="$pk $(basename $f)"; done
+res "P1 package rollback / preflight / depcheck == repo files" "$([ -z "$pk" ] && echo PASS || echo FAIL)" "${pk:-all equal}"
+dirty=$(git status --porcelain -- supabase scripts web | grep -v '^??' | head -3 | tr '\n' ' ')
+mf="$PKG/slice3_package_manifest.txt"; mh=$(sed -n 's/^head //p' "$mf" 2>/dev/null)
+mok=PASS; [ "$mh" = "$(git rev-parse HEAD)" ] || mok=FAIL
+while read -r sha name; do [ "$(sha256sum < "$PKG/$name" | cut -d' ' -f1)" = "$sha" ] || mok=FAIL; done < <(sed -n 's/^sha256 //p' "$mf" 2>/dev/null)
+res "P2 package manifest: head = HEAD, every package sha matches, tree clean" "$([ $mok = PASS ] && [ -z "$dirty" ] && echo PASS || echo FAIL)" "manifest head=${mh:0:7} HEAD=$(git rev-parse --short HEAD) dirty=${dirty:-no}"
+rm -rf "$T0"
+
+# G. repo hygiene (rev 4): scratch SQL ignored, migrations/seeds not; no secret in tracked files or the package
+gi=""; for f in supabase/owner.sql supabase/x.sql supabase/scratch.sql owner.sql x.sql; do git check-ignore -q "$f" || gi="$gi $f"; done
+for f in supabase/migrations/20261031210400_retire_slice2_pl_views.sql supabase/seed.sql supabase/seed_slice2.sql supabase/seed_slice3_mock.sql supabase/tests/verify_slice3.sql; do git check-ignore -q "$f" && gi="$gi !$f"; done
+tr=$(git ls-files | grep -E '(^|/)(owner|x)\.sql$' | paste -sd' ')
+res "G1 .gitignore: supabase/*.sql scratch (owner.sql, x.sql) ignored; migrations + seeds still tracked; owner.sql / x.sql not tracked" "$([ -z "$gi$tr" ] && echo PASS || echo FAIL)" "${gi:-ok} ${tr:+tracked:$tr}"
+hits=0; for sf in /workspace/secrets/payroll_owner_user_id.txt /workspace/secrets/recon_hash_salt.txt; do
+  [ -s "$sf" ] || continue; v=$(tr -d '[:space:]' < "$sf")
+  n=$(git ls-files -z | xargs -0 grep -lF -- "$v" 2>/dev/null | wc -l); n2=$(grep -rlF -- "$v" "$(dirname "$PASTE")" --include='slice3*' 2>/dev/null | wc -l)
+  hits=$((hits + n + n2)); done
+jw=$(git ls-files -z | xargs -0 grep -lE 'eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}|sb_secret_[A-Za-z0-9]{10,}|SUPABASE_SERVICE_ROLE_KEY *= *[^ <]{20,}' 2>/dev/null | paste -sd' ')
+res "G2 secrets scan: owner id + salt in no tracked file or package file; no JWT / service key in tracked files (values not printed)" "$([ $hits = 0 ] && [ -z "$jw" ] && echo PASS || echo FAIL)" "secret hits=$hits jwt/key files=${jw:-none}"
+
 # A. live-like upgrade (slice one + slice-one seed + slice-two paste, as live is today)
 D=t3_live; liveish $D
-res "A1 standalone preflight before apply" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF)"
-BEFORE=$(q $D -c "$SNAP"); SCH0=$(q $D -c "$SCHEMA"); EV0=$(q $D -c "select count(*) from event_log"); EVMAX0=$(q $D -c "select coalesce(max(id),0) from event_log")
+res "A1 standalone preflight before apply" "$( [ "$(q $D -f $PF | head -1 | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF | head -1)"
+BEFORE=$(q $D -c "$SNAP"); SCH0=$(q $D -c "$SCHEMA"); V50=$(q $D -c "$V5"); V5FN0=$(q $D -c "$V5FN"); DEP0=$(q $D -f supabase/deploy/slice3_retire_depcheck.sql) EV0=$(q $D -c "select count(*) from event_log"); EVMAX0=$(q $D -c "select coalesce(max(id),0) from event_log")
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/tmp/s3a2.out 2>&1; rc=$?
 EV1=$(q $D -c "select count(*) from event_log")
 res "A2 paste run 1" "$([ $rc = 0 ] && echo PASS || echo FAIL)" "exit=$rc event_log $EV0->$EV1 $(grep -o 'preflight OK.*' /tmp/s3a2.out | head -1)"
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/tmp/s3a3.out 2>&1; rc=$?
 EV2=$(q $D -c "select count(*) from event_log")
 res "A3 paste run 2 (no-op)" "$([ $rc = 0 ] && [ "$EV1" = "$EV2" ] && grep -q 'already applied' /tmp/s3a3.out && echo PASS || echo FAIL)" "exit=$rc event_log $EV1->$EV2"
-res "A4 standalone preflight after apply" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = 'ALREADY APPLIED' ] && echo PASS || echo FAIL)" "$(q $D -f $PF | cut -d'|' -f1)"
-res "A5 schema_migrations has 4 + 3 + 4 = 11 versions" "$([ "$(q $D -c 'select count(*) from supabase_migrations.schema_migrations')" = 11 ] && echo PASS || echo FAIL)" "$(q $D -c "select string_agg(version, ',' order by version) from supabase_migrations.schema_migrations where version like '2026103121%'")"
+res "A4 standalone preflight after apply" "$( [ "$(q $D -f $PF | head -1 | cut -d'|' -f1)" = 'ALREADY APPLIED' ] && echo PASS || echo FAIL)" "$(q $D -f $PF | head -1 | cut -d'|' -f1)"
+res "A5 schema_migrations has 4 + 3 + 5 = 12 versions" "$([ "$(q $D -c 'select count(*) from supabase_migrations.schema_migrations')" = 12 ] && echo PASS || echo FAIL)" "$(q $D -c "select string_agg(version, ',' order by version) from supabase_migrations.schema_migrations where version like '2026103121%'")"
 AFTER=$(q $D -c "$SNAP")
 res "A6 existing data unchanged by the paste (sales/agents/contacts/applications/call_metrics/commission_config/expenses/categories/revenue_adjustments)" "$([ "$BEFORE" = "$AFTER" ] && echo PASS || echo FAIL)" "$BEFORE"
 res "A7 paste loads no Premier/board/mock data (config rows only)" "$([ "$(q $D -c 'select (select count(*) from recon_imports)+(select count(*) from premier_member_products)+(select count(*) from board_submissions)+(select count(*) from pay_adjustments)+(select count(*) from payroll_cutoffs)')" = 0 ] && echo PASS || echo FAIL)" "config: $(q $D -c "select (select count(*) from recon_pay_config)||' pay config, '||(select count(*) from agent_pay_rules)||' agent rules, '||(select count(*) from premier_addon_map)||' add-on map rows ('||(select count(*) from premier_addon_map where status='proposed')||' proposed)'")"
 n=$(passes $D supabase/tests/verify.sql); res "A8 verify.sql (slice one) after upgrade" "$([ $n = 24 ] && echo PASS || echo FAIL)" "$n/24 $(fails $D supabase/tests/verify.sql)"
-n=$(passes $D supabase/tests/verify_slice2.sql); T2=$(total $D supabase/tests/verify_slice2.sql)
-res "A9 verify_slice2.sql after upgrade" "$([ $T2 -gt 0 ] && [ $n = $T2 ] && echo PASS || echo FAIL)" "$n/$T2 $(fails $D supabase/tests/verify_slice2.sql)"
+res "A0b retire dependency check before apply: only the five views' own grants / internal rows" "$(echo "$DEP0" | grep -qvE '^(grant|internal)\|' && echo FAIL || echo PASS)" "$(echo "$DEP0" | cut -d'|' -f1 | sort | uniq -c | tr -s ' ' | paste -sd',')"
+T2=29; n=$(passes $D supabase/tests/verify_slice2_slice3era.sql); T2X=$(total $D supabase/tests/verify_slice2_slice3era.sql)
+res "A9 verify_slice2_slice3era.sql after upgrade (slice two's 29 minus the 10 retired-view checks)" "$([ $T2X = 19 ] && [ $n = $T2X ] && echo PASS || echo FAIL)" "$n/$T2X $(fails $D supabase/tests/verify_slice2_slice3era.sql)"
+res "A9b original verify_slice2.sql can no longer run after upgrade (it reads the retired views)" "$([ "$(passes $D supabase/tests/verify_slice2.sql)" = 0 ] && echo PASS || echo FAIL)" "passes=$(passes $D supabase/tests/verify_slice2.sql)"
+res "A13 the five slice-two P&L views are gone after upgrade" "$([ -z "$(q $D -c "$V5")" ] && echo PASS || echo FAIL)" ""
 n=$(passes $D supabase/tests/verify_slice3.sql); T3=$(total $D supabase/tests/verify_slice3.sql)
 res "A10 verify_slice3.sql (all scenarios + structure) after upgrade" "$([ $T3 -gt 0 ] && [ $n = $T3 ] && echo PASS || echo FAIL)" "$n/$T3 $(fails $D supabase/tests/verify_slice3.sql)"
 res "A11 verify_slice3 left nothing behind (rolled back)" "$([ "$(q $D -c 'select count(*) from recon_imports')" = 0 ] && [ "$(q $D -c 'select count(*) from event_log')" = "$EV2" ] && echo PASS || echo FAIL)" "event_log=$(q $D -c 'select count(*) from event_log')"
@@ -83,26 +117,27 @@ res "B2 rollback runs" "$([ $rc = 0 ] && echo PASS || echo FAIL)" "exit=$rc"
 res "B3 data md5 after rollback == before apply" "$([ "$(q $D -c "$SNAP")" = "$BEFORE" ] && echo PASS || echo FAIL)" "$(q $D -c "$SNAP")"
 [ -n "$SCH0" ] || echo "SCHEMA query failed"
 res "B4 schema md5 (tables, columns, functions, policies, triggers) after rollback == before apply" "$([ -n "$SCH0" ] && [ "$(q $D -c "$SCHEMA")" = "$SCH0" ] && echo PASS || echo FAIL)" "$(q $D -c "$SCHEMA")"
+res "B9 rollback restores the five slice-two P&L views EXACTLY (view definition, grants, owner, options, comment) and the kept functions' definitions" "$([ -n "$V50" ] && [ "$(q $D -c "$V5")" = "$V50" ] && [ "$(q $D -c "$V5FN")" = "$V5FN0" ] && echo PASS || echo FAIL)" "$(q $D -c "$V5" | cut -d'|' -f1,2 | paste -sd' ')"
 res "B5 schema_migrations back to 7" "$([ "$(q $D -c 'select count(*) from supabase_migrations.schema_migrations')" = 7 ] && echo PASS || echo FAIL)" ""
 n1=$(passes $D supabase/tests/verify.sql); n2=$(passes $D supabase/tests/verify_slice2.sql)
-res "B6 verify.sql + verify_slice2.sql after rollback" "$([ $n1 = 24 ] && [ $n2 = $T2 ] && echo PASS || echo FAIL)" "$n1/24, $n2/$T2"
+res "B6 verify.sql + the ORIGINAL verify_slice2.sql after rollback (retired views back)" "$([ $n1 = 24 ] && [ $n2 = $T2 ] && echo PASS || echo FAIL)" "$n1/24, $n2/$T2"
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f $RB >/dev/null 2>&1; rc=$?; res "B7 rollback re-run is a no-op" "$([ $rc = 0 ] && echo PASS || echo FAIL)" "exit=$rc"
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1; rc=$?
-n=$(passes $D supabase/tests/verify_slice3.sql); res "B8 re-apply after rollback" "$([ $rc = 0 ] && [ $n = $T3 ] && echo PASS || echo FAIL)" "exit=$rc verify_slice3 $n/$T3"
+n=$(passes $D supabase/tests/verify_slice3.sql); res "B8 re-apply after rollback" "$([ $rc = 0 ] && [ $T3 -gt 0 ] && [ $n = $T3 ] && echo PASS || echo FAIL)" "exit=$rc verify_slice3 $n/$T3"
 
 # C. preflight aborts change nothing
 abort_case(){ # $1 name, $2 db, $3 mutate SQL
   local D=$2; [ -n "$3" ] && q $D -c "$3" >/dev/null
   local ea=$(q $D -c "select count(*) from event_log") ha=$(q $D -c "$SCHEMA"); [ -n "$ha" ] || echo "SCHEMA query failed"
   psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/tmp/pf.out 2>&1; local rc=$?
-  local eb=$(q $D -c "select count(*) from event_log") hb=$(q $D -c "$SCHEMA") pf=$(q $D -f $PF | cut -d'|' -f1)
+  local eb=$(q $D -c "select count(*) from event_log") hb=$(q $D -c "$SCHEMA") pf=$(q $D -f $PF | head -1 | cut -d'|' -f1)
   res "$1" "$([ $rc != 0 ] && grep -q 'preflight failed' /tmp/pf.out && [ "$ea" = "$eb" ] && [ "$ha" = "$hb" ] && [ "$pf" = FAIL ] && echo PASS || echo FAIL)" "standalone=$pf; $(grep -o 'ERROR: .*' /tmp/pf.out | head -1 | cut -c1-120)"; }
 D=t3_mut; liveish $D
 abort_case "C1 paste aborts when commission_config is not 0.38/0.05" $D "update commission_config set addon_bonus_rate=0.06 where id"
 q $D -c "update commission_config set addon_bonus_rate=0.05 where id" >/dev/null
 abort_case "C2 paste aborts when sales already has a slice-three column" $D "alter table sales add column lead_source text"
 q $D -c "alter table sales drop column lead_source" >/dev/null
-res "C3 after undoing, standalone preflight is PASS again" "$( [ "$(q $D -f $PF | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF | cut -d'|' -f1)"
+res "C3 after undoing, standalone preflight is PASS again" "$( [ "$(q $D -f $PF | head -1 | cut -d'|' -f1)" = PASS ] && echo PASS || echo FAIL)" "$(q $D -f $PF | head -1 | cut -d'|' -f1)"
 D=t3_noslice2; liveish $D noslice2
 abort_case "C4 paste aborts when slice two is not applied" $D ""
 
@@ -208,10 +243,16 @@ res "F2 slice-two paste rebuilt from this branch is byte-identical to the applie
 # D. fresh build from the repo
 D=t3_fresh; newdb $D
 for f in supabase/migrations/*.sql supabase/seed.sql supabase/seed_slice2.sql; do psql -q -v ON_ERROR_STOP=1 -d $D -f $f >/dev/null 2>&1 || echo "FAIL $f"; done
-n1=$(passes $D supabase/tests/verify.sql); n2=$(passes $D supabase/tests/verify_slice2.sql); n3=$(passes $D supabase/tests/verify_slice3.sql)
-res "D1 fresh build: verify.sql + verify_slice2.sql + verify_slice3.sql" "$([ $n1 = 24 ] && [ $n2 = $T2 ] && [ $n3 = $T3 ] && echo PASS || echo FAIL)" "$n1/24, $n2/$T2, $n3/$T3 $(fails $D supabase/tests/verify_slice3.sql)"
+n1=$(passes $D supabase/tests/verify.sql); n2=$(passes $D supabase/tests/verify_slice2_slice3era.sql); n3=$(passes $D supabase/tests/verify_slice3.sql)
+res "D1 fresh build: verify.sql + verify_slice2_slice3era.sql + verify_slice3.sql" "$([ $n1 = 24 ] && [ $n2 = $T2X ] && [ $T3 -gt 0 ] && [ $n3 = $T3 ] && echo PASS || echo FAIL)" "$n1/24, $n2/$T2X, $n3/$T3 $(fails $D supabase/tests/verify_slice3.sql)"
 psql -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed_slice3_mock.sql >/dev/null 2>&1; psql -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed_slice3_mock.sql >/dev/null 2>&1; rc=$?
 res "D2 mock seed loads and re-runs without duplicates" "$([ $rc = 0 ] && [ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select count(*) from board_submissions')" = 35 ] && echo PASS || echo FAIL)" "premier=$(q $D -c 'select count(*) from premier_member_products') board=$(q $D -c 'select count(*) from board_submissions')"
+ADM=$(q $D -c "select id from auth.users where email='admin.test@example.com'")
+PLQ="select set_config('request.jwt.claims', json_build_object('sub','$ADM','role','authenticated')::text, true); set local role authenticated;
+ select concat_ws('|', (select projected_commission from pl_daily_walk where day='2026-10-29'), (select net from pl_weekly_walk where week_start='2026-10-25'),
+   (select projected_commission from pl_monthly_walk where month_start='2026-10-01'), (select net from pl_monthly_walk where month_start='2026-10-01'))"
+fig=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -c "begin" -c "$PLQ" -c "rollback" 2>/dev/null | grep '|' | tail -1)
+res "D4 (B2) mock-only P&L figures with the duplicate row excluded: 10/29 rep pay 1020.33 (was 1168.80), week 10/25 net -4336.15 (was -4484.62), October rep pay 4455.47 / net -4455.47 (were 4603.94 / -4603.94)" "$([ "$fig" = '1020.33|-4336.15|4455.47|-4455.47' ] && echo PASS || echo FAIL)" "$fig"
 for m in supabase/migrations/2026103121*.sql; do psql -q -v ON_ERROR_STOP=1 -d $D -f $m >/dev/null 2>&1 || echo "FAIL rerun $m"; done
 res "D3 slice-three migrations re-run on a loaded DB (idempotent, data kept)" "$([ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select count(*) from premier_addon_map')" = "$(q t3_live -c 'select count(*) from premier_addon_map')" ] && echo PASS || echo FAIL)" ""
 

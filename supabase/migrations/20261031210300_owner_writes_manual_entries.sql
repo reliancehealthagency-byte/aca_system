@@ -18,7 +18,13 @@
 create or replace function public.recon_owner_write_guard() returns trigger
 language plpgsql set search_path = public, pg_temp as $$
 begin
-  if not public.recon_owner_or_break_glass() then
+  -- Break-glass = the caller's role is postgres / supabase_admin (the SQL Editor), the same rule payroll_cutoffs_guard and
+  -- recon_owner_or_sql_editor use: this trigger is SECURITY INVOKER, so current_user is the caller's role (anon /
+  -- authenticated / service_role for every API request), and no SECURITY DEFINER function writes these tables.
+  if current_user in ('postgres', 'supabase_admin') then
+    return case when tg_op = 'DELETE' then old else new end;
+  end if;
+  if public.recon_owner_or_break_glass() is not true then   -- fails closed (rev 4 B1): a NULL owner refuses everyone else
     raise exception '%: pay settings are owner-only (Kyle 10/31 7:14 PM): only the payroll owner or the SQL Editor may % (caller %)',
       tg_table_name, lower(tg_op), coalesce(public.audit_actor_role(), current_user);
   end if;
@@ -207,14 +213,23 @@ comment on view public.pl_manual_entry_lines is
 -- Monthly: the same rolled up: daily nets + earned lines of the weeks whose Sunday falls in the month - full monthly overhead.
 -- These views sit ALONGSIDE slice two's pl_daily / pl_weekly / pl_monthly, which are not changed (they still show
 -- premium as revenue and the 38/43% figure as commission; see slice3_review.md "slice two impact").
-create or replace view public.pl_projected_rep_pay_daily with (security_invoker = true) as
-select coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) as day,
-       coalesce(sum(l.projected_commission) filter (where l.line_type <> 'ABS'), 0)::numeric(12,2) as deal_commission,
-       coalesce(sum(l.projected_spiffs) filter (where l.line_type <> 'ABS'), 0)::numeric(12,2)     as spiffs,
-       coalesce(sum(l.projected_spiffs) filter (where l.line_type = 'ABS'), 0)::numeric(12,2)      as abs_pay,
-       count(*) as line_count
+-- Per line first (rev 4 B2): only lines payroll pays, by the SAME predicate premier_lock_payday uses
+-- (recon_line_pays: no duplicate board rows, no rows held as added to a closed week).
+create or replace view public.pl_projected_rep_pay_lines with (security_invoker = true) as
+select l.line_key, l.line_type, l.agent_name, l.line_status,
+       coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) as day,
+       (case when l.line_type <> 'ABS' then coalesce(l.projected_commission, 0) else 0 end)::numeric(12,2) as deal_commission,
+       (case when l.line_type <> 'ABS' then coalesce(l.projected_spiffs, 0) else 0 end)::numeric(12,2)     as spiffs,
+       (case when l.line_type = 'ABS' then coalesce(l.projected_spiffs, 0) else 0 end)::numeric(12,2)      as abs_pay
   from public.premier_recon_lines l
- where public.is_admin() and coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) is not null
+ where public.is_admin() and public.recon_line_pays(l.line_status, l.added_to_closed_week)
+   and coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) is not null;
+comment on view public.pl_projected_rep_pay_lines is
+  'Projected rep pay per line (deal commission / spiffs / ABS pay), only lines payroll pays (recon_line_pays). Admin only.';
+create or replace view public.pl_projected_rep_pay_daily with (security_invoker = true) as
+select day, sum(deal_commission)::numeric(12,2) as deal_commission, sum(spiffs)::numeric(12,2) as spiffs,
+       sum(abs_pay)::numeric(12,2) as abs_pay, count(*) as line_count
+  from public.pl_projected_rep_pay_lines
  group by 1;
 comment on view public.pl_projected_rep_pay_daily is
   'Projected commission = expected rep pay per Date Booked: deal commission (38/43% + agent_pay_rules), spiffs, ABS pay ($20/item). From premier_recon_lines. Admin only.';
@@ -437,7 +452,7 @@ select month_start, (month_start + interval '1 month' - interval '1 day')::date 
   from xo where public.is_admin();
 comment on view public.pl_monthly_walk is
   'Monthly P&L: sum of the daily nets + earned lines of the weeks whose Sunday is in the month - the full monthly overhead (by source: pl_overhead_monthly). Admin only.';
-grant select on public.manual_entries_current, public.pl_manual_entry_lines, public.pl_projected_rep_pay_daily,
+grant select on public.manual_entries_current, public.pl_manual_entry_lines, public.pl_projected_rep_pay_lines, public.pl_projected_rep_pay_daily,
                 public.pl_overhead_monthly, public.pl_overhead_weekly, public.pl_daily_walk, public.pl_weekly_walk, public.pl_monthly_walk to authenticated;
-revoke all on public.manual_entries_current, public.pl_manual_entry_lines, public.pl_projected_rep_pay_daily,
+revoke all on public.manual_entries_current, public.pl_manual_entry_lines, public.pl_projected_rep_pay_lines, public.pl_projected_rep_pay_daily,
               public.pl_overhead_monthly, public.pl_overhead_weekly, public.pl_daily_walk, public.pl_weekly_walk, public.pl_monthly_walk from anon;

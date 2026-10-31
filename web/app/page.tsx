@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
+import { loadDashboard, type Db, type Row, type Column } from '@/lib/plmodel';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,26 +17,28 @@ function weekStartSunday(isoDay: string): string {
   return d.toISOString().slice(0, 10);
 }
 
-type PL = { sales_count: number; premium_total: string; agent_commission: string; expenses: string; net_placeholder: string };
 type SaleRow = {
   id: string; sale_date: string; agent_name: string | null; carrier: string | null; board_premium: string | null;
   premier_premium: string | null; premium_source: string | null; commission_rate: string; commission: string | null;
   commission_estimate: string | null; commission_pay_friday: string;
 };
 
-function PLCard({ title, pl, admin }: { title: string; pl: PL | null; admin: boolean }) {
+function PLCard({ title, row, cols, admin }: { title: string; row: Row | null; cols: Column[]; admin: boolean }) {
   return (
     <section style={{ border: '1px solid #ccc', borderRadius: 8, padding: 16, minWidth: 260 }}>
       <h2 style={{ marginTop: 0, fontSize: 18 }}>{title}</h2>
       {!admin ? (
         <p>P&amp;L is admin-only.</p>
+      ) : cols.length === 0 ? (
+        <p>No P&amp;L installed yet.</p>
       ) : (
         <dl style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '4px 16px', margin: 0 }}>
-          <dt>Sales</dt><dd style={{ margin: 0 }}>{pl?.sales_count ?? 0}</dd>
-          <dt>Premium</dt><dd style={{ margin: 0 }}>{usd(pl?.premium_total ?? 0)}</dd>
-          <dt>Agent commission</dt><dd style={{ margin: 0 }}>{usd(pl?.agent_commission ?? 0)}</dd>
-          <dt>Expenses</dt><dd style={{ margin: 0 }}>{usd(pl?.expenses ?? 0)}</dd>
-          <dt><strong>Net (placeholder)</strong></dt><dd style={{ margin: 0 }}><strong>{usd(pl?.net_placeholder ?? 0)}</strong></dd>
+          {cols.map((c) => (
+            <div key={c.key} style={{ display: 'contents' }}>
+              <dt>{c.strong ? <strong>{c.label}</strong> : c.label}</dt>
+              <dd style={{ margin: 0 }}>{c.money ? usd(row?.[c.key] ?? 0) : String(row?.[c.key] ?? 0)}</dd>
+            </div>
+          ))}
         </dl>
       )}
     </section>
@@ -50,10 +53,8 @@ export default async function Dashboard() {
   const today = todayET();
   const weekStart = weekStartSunday(today);
 
-  const [{ data: isAdmin }, daily, weekly, sales] = await Promise.all([
+  const [{ data: isAdmin }, sales] = await Promise.all([
     supabase.rpc('is_admin'),
-    supabase.from('daily_pl').select('*').eq('day', today).maybeSingle<PL>(),
-    supabase.from('weekly_pl').select('*').eq('week_start', weekStart).maybeSingle<PL>(),
     supabase
       .from('sales_commission')
       .select('id, sale_date, agent_name, carrier, board_premium, premier_premium, premium_source, commission_rate, commission, commission_estimate, commission_pay_friday')
@@ -62,6 +63,7 @@ export default async function Dashboard() {
       .limit(10)
       .returns<SaleRow[]>(),
   ]);
+  const pl = isAdmin === true ? await loadDashboard(supabase as unknown as Db, today, weekStart) : null;
   const admin = isAdmin === true;
 
   return (
@@ -76,17 +78,18 @@ export default async function Dashboard() {
         </form>
       </header>
       <p style={{ color: '#555' }}>
-        Today {today} (ET). Week starts Sunday {weekStart}. Net is a placeholder: premium minus agent commission minus
-        expenses, pending the 42% vs 38%/43% revenue question.
+        Today {today} (ET). Week starts Sunday {weekStart}.{' '}
+        {pl?.model === 'walk' ? 'Daily net = (credits − debits) + transfers − lead spend − projected rep pay; the week adds the four earned sources and subtracts overhead.' : null}
+        {pl?.model === 'legacy' ? 'Older P&L (premium as revenue) until the new P&L is installed.' : null}
       </p>
 
       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-        <PLCard title={`Today's P&L (${today})`} pl={daily.data ?? null} admin={admin} />
-        <PLCard title={`This week (from ${weekStart})`} pl={weekly.data ?? null} admin={admin} />
+        <PLCard title={`Today's P&L (${today})`} row={pl?.daily ?? null} cols={pl?.dailyCols ?? []} admin={admin} />
+        <PLCard title={`This week (from ${weekStart})`} row={pl?.weekly ?? null} cols={pl?.weeklyCols ?? []} admin={admin} />
       </div>
       {admin ? (
         <p>
-          Line items: <a href={`/pl/daily/${today}`}>today</a> · <a href={`/pl/weekly/${weekStart}`}>this week</a> ·{' '}
+          Lines: <a href={`/pl/daily/${today}`}>today</a> · <a href={`/pl/weekly/${weekStart}`}>this week</a> ·{' '}
           <a href={`/pl/monthly/${today.slice(0, 8)}01`}>this month</a> · <a href="/pl">all periods</a>
         </p>
       ) : null}
