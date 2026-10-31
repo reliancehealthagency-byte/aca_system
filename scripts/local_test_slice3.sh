@@ -61,11 +61,13 @@ res "A12 event_log delta from paste (config-row audit only)" "$([ $((EV1-EV0)) -
 # B. rollback: guards, then exact revert
 for g in "update sales set lead_source='web' where ctid=(select ctid from sales limit 1)|lead_source" \
          "insert into pay_adjustments(agent_name,payday,kind,amount,reason,entered_by) values ('Test Agent','2026-11-06','manual',5,'real adj','Kyle')|non-mock pay adjustment" \
-         "insert into recon_imports(kind,file_name,file_sha256,encoding,line_ending,header,row_count,is_mock) select kind,'real.csv',repeat('b',64),encoding,line_ending,header,0,false from (values ('sales_board','utf-8','CRLF',(select header from (select array['Timestamp','Member ID','Date Booked','x','Active Date','Agent','Premium','Customer Name','Customer Email','Customer Phone','x','x','Post Date','Email','x','ABS Addon?','x','Deal Type','Agent','x','FFM','Client Name','x','x','Date Booked','x','x','x','Income','x','x','Premier/Neo Addon?','Premier/Neo Member ID','Premier/Neo Premium','ABS Addon?','ABS Member ID','ABS Premium','x','Phone Number','x','Increased Comm/Spiff Product?','Agent']::text[] header) h))) v(kind,encoding,line_ending,header)|non-mock import" \
-         "update recon_pay_config set cutover_date='2026-10-30' where id|changed recon_pay_config (Kyle's cutover)" \
+         "insert into recon_imports(kind,file_name,file_sha256,encoding,line_ending,header,row_count,is_mock,hash_scheme) select kind,'real.csv',repeat('b',64),encoding,line_ending,header,0,false,'hmac-sha256' from (values ('sales_board','utf-8','CRLF',(select header from (select array['Timestamp','Member ID','Date Booked','x','Active Date','Agent','Premium','Customer Name','Customer Email','Customer Phone','x','x','Post Date','Email','x','ABS Addon?','x','Deal Type','Agent','x','FFM','Client Name','x','x','Date Booked','x','x','x','Income','x','x','Premier/Neo Addon?','Premier/Neo Member ID','Premier/Neo Premium','ABS Addon?','ABS Member ID','ABS Premium','x','Phone Number','x','Increased Comm/Spiff Product?','Agent']::text[] header) h))) v(kind,encoding,line_ending,header)|non-mock import" \
+         "insert into hub_paid_lock(file_sha256,row_num,payday,agent_name,paid_total) values (repeat('c',64),1,'2026-10-30','Test Agent',10); insert into hub_cutover(file_name,file_sha256,note) values ('hub.csv',repeat('c',64),'hub')|hub cutover recorded (clock started)" \
+         "update recon_pay_config set adjustment_server_path='off' where id|changed recon_pay_config (break-glass setting)" \
+         "insert into agent_name_aliases(alias,agent_id) select 'Alias Test',id from agents limit 1|agent alias rows" \
          "update recon_pay_config set payroll_owner_user_id=gen_random_uuid() where id|payroll owner set" \
          "insert into payroll_cutoffs(payday,cutoff_at,source,note) values ('2026-11-06','2026-11-05 14:10 America/New_York','submit','Kyle submit')|real payroll cutoff" \
-         "update premier_addon_map set status='approved' where status='proposed'|edited add-on map" \
+         "update premier_addon_map set active=false where ctid=(select ctid from premier_addon_map order by pattern limit 1)|edited add-on map" \
          "update agent_pay_rules set no_spiff=false where agent_name='Loreidy Martinez'|edited agent_pay_rules"; do
   G=t3_guard; psql -q -d postgres -c "drop database if exists $G" -c "create database $G template $D" >/dev/null 2>&1
   q $G -c "${g%%|*}" >/dev/null
@@ -101,9 +103,10 @@ res "C3 after undoing, standalone preflight is PASS again" "$( [ "$(q $D -f $PF 
 D=t3_noslice2; liveish $D noslice2
 abort_case "C4 paste aborts when slice two is not applied" $D ""
 
-# E. import script: header contract, minimization, output handling (local files only; mock data)
+# E. import script: header contract, salted hashes, output handling, hub cutover (local files only; mock data)
 M=/workspace/artifacts/premier_mock; T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 PH=$M/MOCK_PHS_Member_Products_2026-10-31.csv; BD=$M/MOCK_Sales_Board_Form_Responses_1_slice_2026-10-25_to_10-31.csv
+SALT="$T/salt.txt"; ( umask 077; head -c 48 /dev/urandom | base64 > "$SALT" )   # throwaway test salt (never the real one)
 python3 - "$PH" "$T/no_lp.csv" <<'PY'
 import csv, sys
 rows = list(csv.reader(open(sys.argv[1], encoding='cp1252', newline='')))
@@ -121,36 +124,55 @@ csv.writer(open(sys.argv[2], 'w', encoding='utf-8', newline=''), lineterminator=
 PY
 python3 scripts/csv_to_recon_sql.py --mock --board "$T/moved.csv" >/dev/null 2>"$T/e2"; rc=$?
 res "E2 script refuses a board file whose AO column moved" "$([ $rc != 0 ] && grep -q "required board column(s) missing or moved" "$T/e2" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e2")"
-head -c 0 /dev/null; python3 - "$BD" "$T/41.csv" <<'PY'
+python3 - "$BD" "$T/41.csv" <<'PY'
 import csv, sys
 rows = list(csv.reader(open(sys.argv[1], encoding='utf-8', newline='')))
 csv.writer(open(sys.argv[2], 'w', encoding='utf-8', newline=''), lineterminator='\r\n').writerows([r[:41] for r in rows])
 PY
 python3 scripts/csv_to_recon_sql.py --mock --board "$T/41.csv" >/dev/null 2>"$T/e3"; rc=$?
 res "E3 script refuses a stale 41-column board layout (board_live.csv shape)" "$([ $rc != 0 ] && grep -q "expected the live Sales Board columns" "$T/e3" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e3")"
-python3 scripts/csv_to_recon_sql.py --premier "$PH" >/dev/null 2>"$T/e4"; rc=$?
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --salt-file "$SALT" >/dev/null 2>"$T/e4"; rc=$?
 res "E4 real (non-mock) import refuses stdout (must use --psql or --out)" "$([ $rc != 0 ] && grep -q "must use --psql" "$T/e4" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e4")"
-python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --out "$T/real.sql" 2>"$T/e5"; rc=$?
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --salt-file "$SALT" --out "$T/real.sql" 2>"$T/e5"; rc=$?
 res "E5 --out writes a 0600 file and prints the delete reminder" "$([ $rc = 0 ] && [ "$(stat -c %a "$T/real.sql")" = 600 ] && grep -q "shred -u" "$T/e5" && echo PASS || echo FAIL)" "mode=$(stat -c %a "$T/real.sql" 2>/dev/null)"
-PII=$(python3 - "$PH" "$BD" <<'PY'
-import csv, sys
+E6=$(python3 - "$PH" "$T/real.sql" "$SALT" <<'PY'
+import csv, sys, re, hashlib, hmac
 p = list(csv.DictReader(open(sys.argv[1], encoding='cp1252', newline='')))
-b = list(csv.reader(open(sys.argv[2], encoding='utf-8', newline='')))[1:]
-vals = set()
+sql = open(sys.argv[2]).read(); salt = open(sys.argv[3], 'rb').read().strip()
+plain = salted = 0
 for r in p:
-    for c in ('First Name', 'Last Name', 'Phone 1', 'Email', 'City'):
-        if len(r[c].strip()) > 3: vals.add(r[c].strip())
-for r in b:
-    for j in (7, 8, 9, 13, 21, 38):
-        if len(r[j].strip()) > 3: vals.add(r[j].strip())
-print('\n'.join(sorted(vals)))
+    d = re.sub(r'\D', '', r['Phone 1'] or '')[-10:]
+    e = (r['Email'] or '').strip().lower()
+    for v in [x for x in (d if len(d) == 10 else '', e if '@' in e else '') if x]:
+        plain += hashlib.sha256(v.encode()).hexdigest() in sql
+        salted += hmac.new(salt, v.encode(), hashlib.sha256).hexdigest() in sql
+bad = [c for c in ('Gender', 'Ethnicity', 'Height', 'Weight', 'Disability', 'Company Name') if f'"{c}"' in sql or f"'{c}'" in sql]
+print(f"plain={plain} salted={salted} scheme={'hmac-sha256' in sql} excluded_headers={bad}")
 PY
 )
-NPII=$(printf '%s\n' "$PII" | grep -c .); HIT=$(printf '%s\n' "$PII" | grep -v '^$' | grep -F -f - "$T/real.sql" supabase/seed_slice3_mock.sql | wc -l)
-res "E6 generated SQL (real mode + the committed mock seed) contains none of the $NPII client name/phone/email/city values" "$([ "$NPII" -gt 0 ] && [ "$HIT" = 0 ] && echo PASS || echo FAIL)" "hits=$HIT"
+res "E6 real-mode SQL: phone/email hashes are salted HMACs only (no plain sha256), excluded columns absent" "$(echo "$E6" | grep -qE '^plain=0 salted=[1-9][0-9]* scheme=True excluded_headers=\[\]$' && echo PASS || echo FAIL)" "$E6"
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --salt-file "$T/missing_salt" --out "$T/x.sql" >/dev/null 2>"$T/e8"; rc=$?
+res "E8 real mode with no salt file is refused (unsalted hashes are reversible)" "$([ $rc != 0 ] && grep -q "need the hash salt file" "$T/e8" && [ ! -e "$T/x.sql" ] && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e8")"
+cp "$SALT" "$T/open_salt"; chmod 644 "$T/open_salt"
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --salt-file "$T/open_salt" --out "$T/x.sql" >/dev/null 2>"$T/e9"; rc=$?
+res "E9 a salt file readable by others (0644) is refused" "$([ $rc != 0 ] && grep -q "must be mode 0600" "$T/e9" && echo PASS || echo FAIL)" "$(cut -c1-120 "$T/e9")"
+printf 'Agent,Payday,Amount,Reason/Note,Member ID,Entered By,Date Entered\r\nTest Agent,11/13/2026,"5); delete from public.agents; --",x,,Kyle,11/01/2026\r\n' > "$T/madj_bad.csv"
+python3 scripts/csv_to_recon_sql.py --mock --madj "$T/madj_bad.csv" > "$T/madj_bad.sql" 2>"$T/e10"; rc=$?
+printf 'Agent,Payday,Amount,Reason/Note,Member ID,Entered By,Date Entered\r\nTest Agent,11/13/2026,"($1,234.50)",x,,Kyle,11/01/2026\r\n' > "$T/madj_ok.csv"
+python3 scripts/csv_to_recon_sql.py --mock --madj "$T/madj_ok.csv" > "$T/madj_ok.sql" 2>/dev/null; rc2=$?
+res "E10 madj Amount is validated: SQL injection text refused; (\$1,234.50) becomes the literal -1234.50" "$([ $rc != 0 ] && grep -q "is not a money value" "$T/e10" && ! grep -q "delete from" "$T/madj_bad.sql" && [ $rc2 = 0 ] && grep -q -- "-1234.50" "$T/madj_ok.sql" && echo PASS || echo FAIL)" "$(cut -c1-100 "$T/e10")"
+printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\r\n10/23/2026,Test Agent,100.00,100.00,10/22/2026 14:46,mock\r\n10/30/2026,Test Agent,120.50,118.00,10/29/2026 14:07,mock\r\n' > "$T/hub.csv"
+printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\r\n10/29/2026,Test Agent,100.00,100.00,,mock\r\n' > "$T/hub_bad.csv"
+python3 scripts/csv_to_recon_sql.py --mock --hub "$T/hub_bad.csv" >/dev/null 2>"$T/e11"; rc=$?
+res "E11 hub file with a non-Friday Pay Friday is refused" "$([ $rc != 0 ] && grep -q "is not a Friday" "$T/e11" && echo PASS || echo FAIL)" "$(cut -c1-100 "$T/e11")"
 D=t3_imp; liveish $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1
-python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --psql "-d $D" >/dev/null 2>&1; rc=$?
-res "E7 --psql streams a real-mode import straight into the DB (no file); minimized rows land" "$([ $rc = 0 ] && [ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select max(cardinality(raw_fields)) from premier_member_products')" = 51 ] && echo PASS || echo FAIL)" "exit=$rc rows=$(q $D -c 'select count(*) from premier_member_products')"
+touch "$T/marker"; GS0=$(git status --porcelain | md5sum)
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --hub "$T/hub.csv" --salt-file "$SALT" --psql "-d $D" >/dev/null 2>&1; rc=$?
+NEWF=$( (find "$T" /tmp /workspace/aca_system -maxdepth 2 -newer "$T/marker" -type f \( -name '*.sql' -o -name '*recon*' \) 2>/dev/null) | grep -v "^$T/marker$" | wc -l)
+res "E7 --psql streams a real-mode import (Premier + board + hub cutover) straight into the DB: ops rows land, export finalized, clock started" "$([ $rc = 0 ] && [ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select max(cardinality(raw_fields)) from premier_member_products')" = 68 ] && [ "$(q $D -c "select count(*) from recon_imports where finalized_at is not null and hash_scheme='hmac-sha256'")" = 1 ] && [ "$(q $D -c 'select last_hub_payday from hub_cutover')" = 2026-10-30 ] && echo PASS || echo FAIL)" "exit=$rc rows=$(q $D -c 'select count(*) from premier_member_products') hub=$(q $D -c 'select last_hub_payday from hub_cutover')"
+res "E12 no generated SQL lingers: the --psql run wrote no file (box /tmp, repo, temp dir) and the repo is unchanged" "$([ "$NEWF" = 0 ] && [ "$(git status --porcelain | md5sum)" = "$GS0" ] && echo PASS || echo FAIL)" "new files=$NEWF"
+python3 scripts/csv_to_recon_sql.py --hub "$T/hub.csv" --salt-file "$SALT" --psql "-d $D" >/dev/null 2>"$T/e13"; rc=$?
+res "E13 importing the hub file a second time is refused (one-time clock start)" "$([ $rc != 0 ] && [ "$(q $D -c 'select count(*) from hub_paid_lock')" = 2 ] && echo PASS || echo FAIL)" "$(grep -o 'ERROR: .*' "$T/e13" | head -1 | cut -c1-110)"
 psql -q -d postgres -c "drop database if exists t3_imp" >/dev/null 2>&1
 
 # F. slices one and two untouched in the repo (only the slice-two paste builder glob changed, output byte-identical)

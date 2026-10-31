@@ -18,3 +18,8 @@ supabase/.temp/
 supabase/.branches/
 dist/
 .DS_Store
+
+# recon hash salt (lives in /workspace/secrets, never in the repo)
+*salt*
+# payroll owner id (lives in /workspace/secrets, never in the repo)
+*payroll_owner_user_id*

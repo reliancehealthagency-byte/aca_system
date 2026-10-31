@@ -1,12 +1,14 @@
 -- Slice three, part 1 of 3: Premier reconciliation staging + config tables.
--- Premier "Member Products" rows and Sales Board "Form Responses 1" rows are stored as MINIMIZED raw rows (rev 2):
---   * Premier: only the allow-listed reconciliation columns are kept (IDs, dates, product, fees, paid/refund status, agent
---     label/code for reference). Name, phone, email, gender, city, address-type and empty ethnicity/height/weight/disability
---     columns are dropped BEFORE the data reaches the database (scripts/csv_to_recon_sql.py) and the import trigger refuses
---     any header outside the allow-list.
---   * Board: all 42 positions A..AP are kept so column letters stay stable, but customer name/email/phone (H, I, J), the
---     form Email (N), ACA client name (V), income (AC) and ACA phone (AM) arrive blank; the row trigger refuses non-blank values.
---   * Matching hashes only: sha256 (or HMAC-sha256 with a salt) of the normalized phone / email, computed by the script.
+-- Premier "Member Products" rows and Sales Board "Form Responses 1" rows (rev 3, Kyle 10/31 relayed via Orchestrator):
+--   * Client contact details MAY stay (ops is admin-only: Kyle + his co-owner brother). Premier keeps the reconciliation
+--     columns plus contact columns (name, phones, emails, city/state/county); gender, company/position and the empty
+--     ethnicity/height/weight/disability columns are still dropped by the import script and refused here.
+--   * Board: all 42 positions A..AP; only AC (Income, not contact and not needed) arrives blank.
+--   * Free text people type (Premier Hold Reason, board K Source): the raw text stays untouched in raw / raw_fields (the
+--     raw layer); the typed ops columns (hold_reason, lead_source) carry a normalized copy with phone numbers, emails and
+--     the row's client name replaced (recon_scrub_text).
+--   * Matching still uses hashes: HMAC-sha256 (salted) of the normalized phone / email; real imports must be salted.
+--   * RLS stays admin-only on every table and view; agents see none of it.
 -- raw_fields = the kept CSV row in file order, raw = the same keyed by header / column letter; typed columns are parsed
 -- from raw by a trigger so the parse rules live in the database and can be re-checked.
 -- Attribution is the board / form submitter and is locked once written. Premier's Agent Label is reference only.
@@ -117,6 +119,13 @@ create table if not exists public.recon_imports (
   unique (kind, file_sha256)
 );
 comment on table public.recon_imports is 'One row per ingested file (sha256 of the raw bytes). Re-importing the same file is refused by the unique key.';
+-- rev 3: a board export only counts once it is FINALIZED (recon_finalize_board_import, called by the import script in the
+-- same transaction). Finalizing records the export's Timestamp range and refuses a stale export (older max Timestamp
+-- than the latest finalized export, or rows that revert a submission to a superseded version). Rows can't be added to a
+-- finalized import. Every finalized export is an immutable snapshot (week-to-week diffs: board_export_diffs).
+alter table public.recon_imports add column if not exists finalized_at timestamptz;
+alter table public.recon_imports add column if not exists min_submitted_at timestamptz;
+alter table public.recon_imports add column if not exists max_submitted_at timestamptz;
 
 create table if not exists public.premier_member_products (
   id                    bigint generated always as identity primary key,
@@ -130,7 +139,7 @@ create table if not exists public.premier_member_products (
   product_benefit       text,
   period_label          text,
   agent_label           text,                 -- REFERENCE ONLY, never used for attribution
-  phone_sha256          text check (phone_sha256 is null or phone_sha256 ~ '^[0-9a-f]{64}$'),   -- matching only (no plain phone kept)
+  phone_sha256          text check (phone_sha256 is null or phone_sha256 ~ '^[0-9a-f]{64}$'),   -- matching (salted hash)
   email_sha256          text check (email_sha256 is null or email_sha256 ~ '^[0-9a-f]{64}$'),
   member_created_date   date,
   product_created_date  date,
@@ -149,6 +158,10 @@ create table if not exists public.premier_member_products (
   unique (import_id, row_num)
 );
 create index if not exists premier_member_products_member_idx on public.premier_member_products(member_id);
+alter table public.premier_member_products add column if not exists first_name text;   -- rev 3: ops contact (admin-only)
+alter table public.premier_member_products add column if not exists last_name text;
+alter table public.premier_member_products add column if not exists phone1 text;
+alter table public.premier_member_products add column if not exists email text;
 comment on table public.premier_member_products is
   'Premier Member Products rows, raw fields preserved. Typed columns parsed by trigger. Agent Label is reference only.';
 
@@ -176,6 +189,11 @@ create table if not exists public.board_submissions (
   wrap_member_id     text,                    -- col AG
   wrap_premium       numeric(12,2),           -- col AH (claim)
   increased_answer   text,                    -- col AO
+  customer_name      text,                    -- rev 3: ops contact (admin-only): H, else V (ACA client)
+  customer_email     text,                    -- I
+  customer_phone     text,                    -- J, else AM
+  lead_source        text,                    -- K, normalized (recon_scrub_text); raw text in raw->'K'
+  agent_id           uuid,                    -- rev 3: roster link for agent_name (agents.id via display name / alias)
   submission_key     text not null,           -- board row identity = col A Timestamp (ET, to the second): YYYYMMDDHH24MISS
   phone_sha256       text check (phone_sha256 is null or phone_sha256 ~ '^[0-9a-f]{64}$'),   -- customer phone (J / AM), hash only
   email_sha256       text check (email_sha256 is null or email_sha256 ~ '^[0-9a-f]{64}$'),   -- customer email (I), hash only
@@ -184,6 +202,24 @@ create table if not exists public.board_submissions (
   unique (import_id, submission_key)          -- two rows with one Timestamp in one file = ambiguous: the import is refused
 );
 create index if not exists board_submissions_key_idx on public.board_submissions(submission_key);
+alter table public.board_submissions add column if not exists customer_name text;
+alter table public.board_submissions add column if not exists customer_email text;
+alter table public.board_submissions add column if not exists customer_phone text;
+alter table public.board_submissions add column if not exists lead_source text;
+alter table public.board_submissions add column if not exists agent_id uuid;
+
+-- Board name -> roster agent (rev 3, Kyle 10/31: agents are matched on an agent id, not the display name). The board's
+-- first + last name resolves to agents.id by agents.display_name, else by an alias row here (hub "Agent Aliases" tab).
+create table if not exists public.agent_name_aliases (
+  alias       text primary key,                 -- name as typed on the Sales Board
+  agent_id    uuid not null references public.agents(id),
+  note        text,
+  created_at  timestamptz not null default now()
+);
+create or replace function public.recon_agent_id(name text) returns uuid
+language sql stable security definer set search_path = public, pg_temp as $$
+  select coalesce((select a.id from public.agents a where lower(a.display_name) = lower(btrim(name))),
+                  (select x.agent_id from public.agent_name_aliases x where lower(x.alias) = lower(btrim(name)))) $$;
 comment on column public.board_submissions.submission_key is
   'Identity of a form submission across exports (col A Timestamp). Supersede rule: for each submission_key the row from the most recent import (imported_at, then id) is the current version; older versions are kept as evidence and never paid.';
 create index if not exists board_submissions_member_idx on public.board_submissions(member_id);
@@ -209,7 +245,10 @@ language sql immutable as $$
 create or replace function public.recon_premier_allowed_cols() returns text[]
 language sql immutable as $$
   select public.recon_premier_required_cols() || array['Agent ID', 'Agent Code', 'Inactive Reason', 'Product Status',
-         'Paytype', 'Refund Requested Date', 'Next Billing Amount', 'Inactive Date Set'] $$;
+         'Paytype', 'Refund Requested Date', 'Next Billing Amount', 'Inactive Date Set',
+         -- rev 3 (Kyle 10/31): client contact details may stay in ops (admin-only)
+         'First Name', 'Last Name', 'Phone 1', 'Phone 1 Ext', 'Phone 2', 'Phone 2 Ext', 'Phone 3', 'Phone 3 Ext',
+         'Email', 'Email2', 'Email 3', 'City', 'State', 'Country', 'County', 'Other City', 'Other State'] $$;
 create or replace function public.recon_board_expected_cols() returns text[]
 language sql immutable as $$   -- live Sales Board A..AP (42); only the named positions are checked, '' = not checked
   select array['Timestamp', 'Member ID', 'Date Booked', '', 'Active Date', 'Agent', 'Premium', 'Customer Name',
@@ -217,10 +256,33 @@ language sql immutable as $$   -- live Sales Board A..AP (42); only the named po
                '', 'FFM', 'Client Name', '', '', 'Date Booked', '', '', '', 'Income', '', '', 'Premier/Neo Addon?',
                'Premier/Neo Member ID', 'Premier/Neo Premium', 'ABS Addon?', 'ABS Member ID', 'ABS Premium', '',
                'Phone Number', '', 'Increased Comm/Spiff Product?', 'Agent'] $$;
+-- Normalized ("ops") copy of a free-text field (rev 3, Kyle 10/31): emails, phone-like digit runs and the row's own client
+-- name parts (when known) are replaced. The raw text is kept untouched in raw / raw_fields.
+create or replace function public.recon_scrub_text(t text, names text[] default '{}') returns text
+language plpgsql immutable as $$
+declare r text; n text;
+begin
+  if t is null or btrim(t) = '' then return null; end if;
+  r := regexp_replace(t, '[^[:space:]@<>(),;]+@[^[:space:]@<>(),;]+[.][A-Za-z]{2,}', '[email]', 'g');
+  r := regexp_replace(r, '[+(]?[0-9][0-9 ().-]{5,}[0-9]', '[phone]', 'g');
+  foreach n in array coalesce(names, '{}') loop
+    if n ~ '^[A-Za-z][A-Za-z''-]{2,}$' then
+      r := regexp_replace(r, '\m' || n || '\M', '[name]', 'gi');
+    end if;
+  end loop;
+  return r;
+end $$;
+
 create or replace function public.recon_import_check() returns trigger
 language plpgsql set search_path = public, pg_temp as $$
 declare missing text[]; extra text[]; exp text[]; bad text[];
 begin
+  -- finalize fields are written only by recon_finalize_board_import
+  new.finalized_at := null; new.min_submitted_at := null; new.max_submitted_at := null;
+  -- real data must be matched on SALTED hashes (an unsalted phone hash is reversed in under a second)
+  if not new.is_mock and new.hash_scheme <> 'hmac-sha256' then
+    raise exception 'import %: real (non-mock) imports must use salted hashes (hash_scheme hmac-sha256, salt in /workspace/secrets/recon_hash_salt.txt); got %', new.file_name, new.hash_scheme;
+  end if;
   if new.kind = 'premier_member_products' then
     select array_agg(c) into missing from unnest(public.recon_premier_required_cols()) c where not (c = any (new.header));
     if missing is not null then
@@ -229,7 +291,7 @@ begin
     select array_agg(c) into extra from unnest(new.header) c
      where not (c = any (public.recon_premier_allowed_cols())) and c not like '% Fee';
     if extra is not null then
-      raise exception 'Premier import %: column(s) outside the reconciliation allow-list (drop client data before import): %', new.file_name, array_to_string(extra, ', ');
+      raise exception 'Premier import %: column(s) outside the ops allow-list (gender / company / ethnicity / height / weight / disability etc. are never stored): %', new.file_name, array_to_string(extra, ', ');
     end if;
   elsif new.kind = 'sales_board' then
     exp := public.recon_board_expected_cols();
@@ -273,7 +335,12 @@ begin
   new.next_billing_date    := public.recon_parse_date(r->>'Next Billing Date');
   new.inactive_date        := public.recon_parse_date(r->>'Inactive Date');
   new.hold_date            := public.recon_parse_date(r->>'Hold Date');
-  new.hold_reason          := nullif(r->>'Hold Reason', '');
+  new.first_name           := nullif(btrim(r->>'First Name'), '');
+  new.last_name            := nullif(btrim(r->>'Last Name'), '');
+  new.phone1               := nullif(btrim(r->>'Phone 1'), '');
+  new.email                := nullif(btrim(r->>'Email'), '');
+  -- ops copy is normalized; the raw Hold Reason stays untouched in raw / raw_fields
+  new.hold_reason          := public.recon_scrub_text(r->>'Hold Reason', array[new.first_name, new.last_name]);
   new.paid                 := public.recon_yes(r->>'Paid');
   new.last_payment         := coalesce(public.recon_parse_money(r->>'Last Payment'), 0)::int;
   new.refund_requested     := public.recon_yes(r->>'Refund Requested');
@@ -291,6 +358,9 @@ declare h text[]; r jsonb; keys text[]; i int; f text; s text; ap text; aca bool
 begin
   select header into h from public.recon_imports where id = new.import_id and kind = 'sales_board';
   if h is null then raise exception 'import % is not a sales_board import', new.import_id; end if;
+  if exists (select 1 from public.recon_imports where id = new.import_id and finalized_at is not null) then
+    raise exception 'board import % is finalized: rows can''t be added to it (import the new export as a new file)', new.import_id;
+  end if;
   if cardinality(new.raw_fields) <> cardinality(h) then
     raise exception 'Board row % has % fields, header has %', new.row_num, cardinality(new.raw_fields), cardinality(h);
   end if;
@@ -302,12 +372,14 @@ begin
     raise exception 'board row %: Timestamp (col A) % is missing or not MM/DD/YYYY HH:MI:SS; a row without it cannot be identified across exports', new.row_num, coalesce(r->>'A', 'NULL');
   end if;
   new.submission_key    := to_char(new.submitted_at at time zone 'America/New_York', 'YYYYMMDDHH24MISS');
-  -- data minimization: client name / email / phone / income must arrive blank (the import script blanks them)
-  foreach k in array array['H', 'I', 'J', 'N', 'V', 'AC', 'AM'] loop
-    if coalesce(btrim(r->>k), '') <> '' then
-      raise exception 'board row %: column % holds client data; blank it before import (scripts/csv_to_recon_sql.py does)', new.row_num, k;
-    end if;
-  end loop;
+  -- AC (Income) is not contact data and not needed: it must arrive blank (the import script blanks it)
+  if coalesce(btrim(r->>'AC'), '') <> '' then
+    raise exception 'board row %: column AC (Income) must be blank; the import script blanks it', new.row_num;
+  end if;
+  new.customer_name     := coalesce(nullif(btrim(r->>'H'), ''), nullif(btrim(r->>'V'), ''));
+  new.customer_email    := nullif(btrim(r->>'I'), '');
+  new.customer_phone    := coalesce(nullif(btrim(r->>'J'), ''), nullif(btrim(r->>'AM'), ''));
+  new.lead_source       := public.recon_scrub_text(r->>'K', regexp_split_to_array(coalesce(new.customer_name, ''), '\s+'));
   new.deal_type         := nullif(btrim(r->>'R'), '');
   new.member_id         := public.recon_digits(r->>'B');
   new.date_booked       := public.recon_parse_date(r->>'C');
@@ -338,6 +410,7 @@ begin
     new.abs_addon := case when new.line_kind = 'abs_only' then true
                           else public.recon_yes(r->>'AI') or coalesce(new.abs_premium, 0) > 0 end;
   end if;
+  new.agent_id := public.recon_agent_id(new.agent_name);
   return new;
 end $$;
 drop trigger if exists board_submissions_parse on public.board_submissions;
@@ -348,7 +421,11 @@ create trigger board_submissions_parse before insert on public.board_submissions
 create or replace function public.recon_staging_immutable() returns trigger
 language plpgsql as $$
 begin
-  if tg_table_name = 'board_submissions' and (to_jsonb(new)->>'agent_name') is distinct from (to_jsonb(old)->>'agent_name') then
+  if tg_op = 'DELETE' then
+    raise exception '% rows are immutable snapshots (every export is kept for week-to-week diffs)', tg_table_name;
+  end if;
+  if tg_table_name = 'board_submissions' and ((to_jsonb(new)->>'agent_name') is distinct from (to_jsonb(old)->>'agent_name')
+                                              or (to_jsonb(new)->>'agent_id') is distinct from (to_jsonb(old)->>'agent_id')) then
     raise exception 'board_submissions.agent_name is locked (attribution = board / form submitter; Premier agent is reference only)';
   end if;
   if new.raw_fields is distinct from old.raw_fields or new.raw is distinct from old.raw then
@@ -357,11 +434,26 @@ begin
   return new;
 end $$;
 drop trigger if exists premier_member_products_immutable on public.premier_member_products;
-create trigger premier_member_products_immutable before update on public.premier_member_products
+create trigger premier_member_products_immutable before update or delete on public.premier_member_products
   for each row execute function public.recon_staging_immutable();
 drop trigger if exists board_submissions_immutable on public.board_submissions;
-create trigger board_submissions_immutable before update on public.board_submissions
+create trigger board_submissions_immutable before update or delete on public.board_submissions
   for each row execute function public.recon_staging_immutable();
+-- recon_imports: immutable, except that the finalize step fills finalized_at / min / max ONCE.
+create or replace function public.recon_imports_immutable() returns trigger
+language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then raise exception 'recon_imports rows are immutable (export snapshots)'; end if;
+  if old.finalized_at is not null
+     or (to_jsonb(new) - 'finalized_at' - 'min_submitted_at' - 'max_submitted_at')
+        is distinct from (to_jsonb(old) - 'finalized_at' - 'min_submitted_at' - 'max_submitted_at') then
+    raise exception 'recon_imports row % is immutable (only the one-time finalize step may complete it)', old.id;
+  end if;
+  return new;
+end $$;
+drop trigger if exists recon_imports_immutable on public.recon_imports;
+create trigger recon_imports_immutable before update or delete on public.recon_imports
+  for each row execute function public.recon_imports_immutable();
 
 -- Audit (event_log) on config + import header tables. Staging rows are covered by their import's audit row
 -- (one event per file, not one per CSV line) and are immutable.
@@ -422,22 +514,80 @@ comment on table public.policy_count_claims is 'Policy counts as typed by/for th
 -- Stages per pay line: board_estimate -> premier_corrected -> payroll_actual. Locks are written once (immutable) at payroll
 -- submit; adjustments (incl. Cancel Commission) are separate rows keyed by the stable line_key, so a re-run of the
 -- reconciliation never overwrites a locked or adjusted amount.
+-- rev 3: ONE lock row per (line_key, component), across ALL paydays (unique constraint). A component whose due payday
+-- moves later (a missed spiff, a Premier billing-date change, a late cutoff) can therefore never be locked / paid twice.
 create table if not exists public.pay_line_locks (
   id            bigint generated always as identity primary key,
   line_key      text not null,              -- stable: <submission_key = board Timestamp yyyymmddhh24miss>-<P|PADD|ACA|ABS>
+  component     text not null check (component in ('commission', 'claimed_spiffs', 'missed_spiffs')),
   payday        date not null check (extract(dow from payday) = 5),
   agent_name    text not null,
+  agent_id      uuid,                       -- roster link (rev 3)
   stage         text not null default 'payroll_actual' check (stage = 'payroll_actual'),
-  commission    numeric(12,2) not null,
-  spiffs        numeric(12,2) not null,     -- board-claimed spiffs due this payday
-  missed_spiffs numeric(12,2) not null default 0,   -- Premier-only (missed) spiffs due this payday (PB Q12)
-  board_estimate     numeric(12,2),         -- snapshot of the stage-1 amount at lock time
-  premier_corrected  numeric(12,2),         -- snapshot of the stage-2 amount at lock time
+  amount        numeric(12,2) not null,     -- what payroll paid for this component on this payday
+  board_estimate     numeric(12,2),         -- snapshot of the line's stage-1 amount at lock time
+  premier_corrected  numeric(12,2),         -- snapshot of the line's stage-2 amount at lock time
   locked_at     timestamptz not null default now(),
   locked_by     uuid default public.audit_actor_uid(),
   note          text,
-  unique (line_key, payday)
+  constraint pay_line_locks_once unique (line_key, component)
 );
+create index if not exists pay_line_locks_payday_idx on public.pay_line_locks(payday);
+
+-- PB Q12 (rev 3): the next-open-payday rule moves with every new submit, so a missed spiff's payday is ANCHORED the first
+-- time it is detected (before a submit is recorded, at every lock and every event-logger run) and never moves after that.
+create table if not exists public.missed_spiff_anchors (
+  line_key     text primary key,
+  payday       date not null check (extract(dow from payday) = 5),
+  amount       numeric(12,2) not null,     -- missed amount when first detected (reference)
+  mode         text not null check (mode = 'next_open_payday'),
+  detected_at  timestamptz not null default now(),
+  note         text
+);
+comment on table public.missed_spiff_anchors is
+  'First-detection payday of each missed (Premier-only) spiff under missed_spiff_payday = next_open_payday. Immutable.';
+
+-- Closed weeks (rev 3, Kyle 10/31 relayed via Orchestrator): once a week's payroll is submitted (or the hub cutover covers
+-- it), its board data is never revised. Each submission of that week is frozen to the version current at that moment;
+-- later exports that change or drop it only raise a flag (closed_week_change), never a pay change.
+-- Week of a submission = the Sun-Sat week of its Timestamp; its payday = the Friday after (recon_friday_after_week).
+create table if not exists public.board_week_freezes (
+  submission_key  text primary key,
+  board_id        bigint not null references public.board_submissions(id),
+  week_payday     date not null check (extract(dow from week_payday) = 5),
+  reason          text not null check (reason in ('payroll_submit', 'hub_cutover')),
+  frozen_at       timestamptz not null default now()
+);
+
+-- Hub cutover (rev 3, Kyle 10/31): importing the hub's export starts this system's clock. ONE row, ever: owner-only (or the
+-- SQL Editor while no owner is set), audited, immutable (no admin can reset or move it). Every payday in the file is
+-- paid_by_hub. Import shape = the hub "Paid Lock" tab: Pay Friday, Agent, Paid Total, System Total, Locked At (ET), Note.
+create table if not exists public.hub_paid_lock (
+  id            bigint generated always as identity primary key,
+  file_sha256   text not null check (file_sha256 ~ '^[0-9a-f]{64}$'),
+  row_num       int not null check (row_num >= 1),
+  payday        date not null check (extract(dow from payday) = 5),
+  agent_name    text not null,
+  paid_total    numeric(12,2) not null,
+  system_total  numeric(12,2),
+  locked_at     timestamptz,
+  note          text,
+  unique (file_sha256, row_num)
+);
+create table if not exists public.hub_cutover (
+  id              boolean primary key default true check (id),
+  file_name       text not null,
+  file_sha256     text not null check (file_sha256 ~ '^[0-9a-f]{64}$'),
+  last_hub_payday date,                      -- set by the trigger: max(Pay Friday) of the imported file
+  paydays         date[],                    -- every payday the file covers (all paid_by_hub)
+  row_count       int,
+  recorded_at     timestamptz not null default now(),
+  recorded_by     uuid default public.audit_actor_uid(),
+  recorded_role   text default public.audit_actor_role(),
+  note            text
+);
+comment on table public.hub_cutover is
+  'One-time hub cutover: the hub''s Paid Lock export. last_hub_payday and earlier = paid by the hub, never payable here. Immutable.';
 create table if not exists public.pay_adjustments (
   id            bigint generated always as identity primary key,
   line_key      text,                       -- null = agent-level adjustment
@@ -454,12 +604,14 @@ create table if not exists public.pay_adjustments (
   covers        text check (covers is null or covers ~* '^(pay|reverse|dup|claw) ((spiff|comm):\S+|xfer)$'),
                                             -- hub "Covers" (col H): this row stands in for a system item so it is never paid twice
   external_ref  text unique,                -- idempotent imports (e.g. 'mock-madj-<sha>-<row>')
+  agent_id      uuid references public.agents(id),   -- rev 3: stable link for the agent's own view (resolved server-side)
   constraint pay_adjustments_cancel_negative check (kind <> 'cancel_commission' or (amount < 0 and line_key is not null and component = 'commission'))
 );
 create index if not exists pay_adjustments_line_idx on public.pay_adjustments(line_key);
 -- PB §1.8 / §4.2 fields: agent-safe note = reason; Kyle-only internal_note (never broadcast); reason_code.
 -- entered_by / entered_by_uid are set SERVER-SIDE from auth.uid() (any value the client sends is overwritten);
 -- source_entered_by keeps the "Entered By" text of an imported hub row as reference only.
+alter table public.pay_adjustments add column if not exists agent_id uuid references public.agents(id);
 alter table public.pay_adjustments add column if not exists entered_by_uid uuid;
 alter table public.pay_adjustments add column if not exists source_entered_by text;
 alter table public.pay_adjustments add column if not exists internal_note text;
@@ -468,13 +620,23 @@ alter table public.pay_adjustments add column if not exists reason_code text
 -- PB §1.8 "Locked paydays": an adjustment on a submitted (locked) payday is refused; use the next open payday.
 create or replace function public.pay_adjustment_open_payday() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
-declare uid uuid := auth.uid(); rl text := public.audit_actor_role(); owner uuid;
+declare uid uuid := auth.uid(); rl text := public.audit_actor_role(); owner uuid; srv text;
 begin
   -- "Kyle-only": a signed-in user may record an adjustment only if they ARE recon_pay_config.payroll_owner_user_id.
   -- NULL owner = nobody can (Kyle's auth user id is set by Kyle; it is never guessed). Server roles (SQL Editor owner,
   -- service_role: imports run by Kyle) are stamped 'server:<role>'.
-  if uid is null and rl in ('postgres', 'service_role', 'supabase_admin') then
-    new.entered_by := 'server:' || rl;
+  -- Kyle 10/31: the admin key (service_role) never records adjustments, signed-in user claim or not.
+  if rl = 'service_role' or current_user = 'service_role' then
+    raise exception 'pay adjustments: the service_role (admin key) path is refused; the payroll owner records adjustments (postgres SQL Editor = audited break-glass)';
+  end if;
+  if uid is null and rl in ('postgres', 'supabase_admin') then
+    -- rev 3 (Kyle 10/31 default, still configurable): service_role is refused; the SQL Editor (postgres) is an audited
+    -- break-glass path (entered_by 'break-glass:postgres', event payroll.adjustment.break_glass); 'off' refuses both.
+    srv := (select adjustment_server_path from public.recon_pay_config where id);
+    if rl = 'service_role' or srv = 'off' then
+      raise exception 'pay adjustments: the % path is refused (recon_pay_config.adjustment_server_path = %); the payroll owner records adjustments', rl, srv;
+    end if;
+    new.entered_by := 'break-glass:' || rl;
   else
     select payroll_owner_user_id into owner from public.recon_pay_config where id;
     if owner is null or uid is distinct from owner then
@@ -485,6 +647,15 @@ begin
   end if;
   new.entered_by_uid := uid;
   new.created_by := uid;
+  -- agent link (rev 3): an explicit agent_id must exist and match agent_name; else resolved from the roster by name
+  -- (case-insensitive). Unresolved = NULL: the agent can't see it in my_pay_adjustments() until Kyle fixes the name.
+  if new.agent_id is not null then
+    if not exists (select 1 from public.agents a where a.id = new.agent_id and lower(a.display_name) = lower(new.agent_name)) then
+      raise exception 'pay adjustment: agent_id % does not match agent_name %', new.agent_id, new.agent_name;
+    end if;
+  else
+    new.agent_id := (select a.id from public.agents a where lower(a.display_name) = lower(btrim(new.agent_name)));
+  end if;
   if exists (select 1 from public.pay_line_locks where payday = new.payday) then
     raise exception 'payday % is locked (payroll submitted): enter the adjustment on the next open payday', new.payday;
   end if;
@@ -499,6 +670,18 @@ end $$;
 drop trigger if exists pay_line_locks_immutable on public.pay_line_locks;
 create trigger pay_line_locks_immutable before update or delete on public.pay_line_locks
   for each row execute function public.pay_lock_immutable();
+drop trigger if exists missed_spiff_anchors_immutable on public.missed_spiff_anchors;
+create trigger missed_spiff_anchors_immutable before update or delete on public.missed_spiff_anchors
+  for each row execute function public.pay_lock_immutable();
+drop trigger if exists board_week_freezes_immutable on public.board_week_freezes;
+create trigger board_week_freezes_immutable before update or delete on public.board_week_freezes
+  for each row execute function public.pay_lock_immutable();
+drop trigger if exists hub_paid_lock_immutable on public.hub_paid_lock;
+create trigger hub_paid_lock_immutable before update or delete on public.hub_paid_lock
+  for each row execute function public.pay_lock_immutable();
+drop trigger if exists hub_cutover_immutable on public.hub_cutover;
+create trigger hub_cutover_immutable before update or delete on public.hub_cutover
+  for each row execute function public.pay_lock_immutable();
 drop trigger if exists pay_adjustments_open_payday on public.pay_adjustments;
 create trigger pay_adjustments_open_payday before insert on public.pay_adjustments
   for each row execute function public.pay_adjustment_open_payday();
@@ -509,7 +692,8 @@ create trigger pay_adjustments_immutable before update or delete on public.pay_a
 do $$
 declare t text;
 begin
-  foreach t in array array['premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments'] loop
+  foreach t in array array['premier_addon_map','policy_count_claims','pay_line_locks','pay_adjustments','missed_spiff_anchors',
+                           'board_week_freezes','hub_paid_lock','hub_cutover','agent_name_aliases'] loop
     execute format('drop trigger if exists audit_%1$s on public.%1$I', t);
     execute format('create trigger audit_%1$s after insert or update or delete on public.%1$I
                     for each row execute function public.audit_row_change()', t);
@@ -529,21 +713,25 @@ alter table public.recon_pay_config add column if not exists one_time_fee_policy
   check (one_time_fee_policy in ('pending_kyle', 'exclude', 'include'));
 alter table public.recon_pay_config add column if not exists post_date_source text not null default 'premier_fbd_else_board_active'
   check (post_date_source in ('premier_fbd_else_board_active', 'board_active_only', 'premier_fbd_only'));
-alter table public.recon_pay_config add column if not exists post_date_source_status text not null default 'pending_kyle'
+-- Q11 RESOLVED (Kyle 10/31 relayed via Orchestrator): Premier First Billing Date, falling back to the board Active Date.
+alter table public.recon_pay_config add column if not exists post_date_source_status text not null default 'confirmed'
   check (post_date_source_status in ('pending_kyle', 'confirmed'));
 -- rev 2 (Orchestrator review):
 --   payroll_owner_user_id: the ONE auth user allowed to record pay adjustments ("Kyle-only"). NULL = nobody. Kyle sets it.
---   cutover_date: last payday the HUB paid. Anything due on or before it is never payable here (paid_by_hub). NULL =
---     pending Kyle: lines due on a payday the hub already submitted (<= latest 'submit' cutoff) show payable NULL, flagged.
---   missed_spiff_payday (PB Q12, pending Kyle): next_open_payday (default) = a spiff found only in Premier (board did not
+--   missed_spiff_payday (PB Q12, confirmed by Kyle 10/31): next_open_payday (default) = a spiff found only in Premier (board did not
 --     claim it) whose booked cycle is already submitted pays on the first payday after the latest submitted one;
 --     booked_cycle = it stays in its Date Booked cycle.
 alter table public.recon_pay_config add column if not exists payroll_owner_user_id uuid;
-alter table public.recon_pay_config add column if not exists cutover_date date check (cutover_date is null or extract(dow from cutover_date) = 5);
 alter table public.recon_pay_config add column if not exists missed_spiff_payday text not null default 'next_open_payday'
   check (missed_spiff_payday in ('next_open_payday', 'booked_cycle'));
-alter table public.recon_pay_config add column if not exists missed_spiff_payday_status text not null default 'pending_kyle'
-  check (missed_spiff_payday_status in ('pending_kyle', 'confirmed'));
+alter table public.recon_pay_config add column if not exists missed_spiff_payday_status text not null default 'confirmed'
+  check (missed_spiff_payday_status in ('pending_kyle', 'confirmed'));   -- Kyle 10/31 relayed via Orchestrator: next open payday, anchored
+-- rev 3: adjustment_server_path (pending Kyle; default per Kyle 10/31): who besides the payroll owner may insert a pay
+--   adjustment with no signed-in user. postgres_break_glass (default) = only the SQL Editor (postgres), stamped and logged
+--   as break-glass; off = nobody. service_role is always refused. Guarded like payroll_owner_user_id.
+--   (cutover_date was removed in rev 3: the hub cutover import, table hub_cutover, starts the clock.)
+alter table public.recon_pay_config add column if not exists adjustment_server_path text not null default 'postgres_break_glass'
+  check (adjustment_server_path in ('postgres_break_glass', 'off'));
 
 insert into public.premier_addon_map (source, pattern, addon_key, tier, qualifies_bonus, note, status) values
   ('premier_label',   'consult\s*care',                 'consultcare', null,    true, 'CONSULTCARE_KEYWORD; real label "AWA ConsultCare AEU"', 'approved'),
@@ -552,7 +740,7 @@ insert into public.premier_addon_map (source, pattern, addon_key, tier, qualifie
   ('premier_benefit', '^\s*ultra',                      'consultcare', 'ultra', true, 'Product Benefit "Ultra - Member" -> $75', 'approved'),
   ('premier_label',   'wellness\s*4\s*(you|u)\M',       'wellness',    null,    true, 'WELLNESS_KEYWORDS Wellness4You;Wellness4U -> $20', 'approved'),
   ('premier_label',   'ad\s*&\s*d',                     'add_type',    null,    true, 'INCREASED_KEYWORDS AD&D; real labels "AWA SecureElite AME-AD&D", "HD SecureShield CI-AME-AD&D"', 'approved'),
-  ('premier_label',   '(^|[^a-z])add([^a-z]|$)',        'add_type',    null,    true, 'PROPOSED list change (payroll-breakdown §6.3 Q13), needs Kyle''s OK: whole word ADD, e.g. "HD ProtectLife ADD"', 'proposed'),
+  ('premier_label',   '(^|[^a-z])add([^a-z]|$)',        'add_type',    null,    true, 'Whole word ADD, e.g. "HD ProtectLife ADD": APPROVED (Kyle 10/31 relayed via Orchestrator; payroll-breakdown §6.3 Q13)', 'approved'),
   ('premier_label',   'champion\s*care',                'champion',    null,    true, 'ChampionCare / Champion Care kept as trigger (Kyle 10/29); no spiff', 'approved'),
   ('board_answer',    'consult\s*care.*asset',          'consultcare', 'asset', true, 'AO "Consult Care - Asset"', 'approved'),
   ('board_answer',    'consult\s*care.*edge',           'consultcare', 'edge',  true, 'AO "Consult Care - Edge"', 'approved'),
