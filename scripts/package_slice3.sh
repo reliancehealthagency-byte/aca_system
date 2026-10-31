@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PKG="${1:-/workspace/aca_system_deploy}"
-case "$(realpath -m "$PKG")" in "$(git rev-parse --show-toplevel)"*) echo "package dir is inside the repo; refused" >&2; exit 1;; esac
+case "$(realpath -m "$PKG")/" in "$(git rev-parse --show-toplevel)/"*) echo "package dir is inside the repo; refused" >&2; exit 1;; esac
 [ -z "$(git status --porcelain -- supabase scripts web | grep -v '^??')" ] || { echo "tree has uncommitted changes; commit first" >&2; exit 1; }
 bash scripts/build_slice3_paste.sh "$PKG/slice3_paste.sql" >/dev/null
 for f in supabase/rollback/slice3_rollback.sql supabase/deploy/slice3_preflight.sql supabase/deploy/slice3_retire_depcheck.sql; do
