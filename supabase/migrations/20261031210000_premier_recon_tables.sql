@@ -622,26 +622,25 @@ create or replace function public.pay_adjustment_open_payday() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 declare uid uuid := auth.uid(); rl text := public.audit_actor_role(); owner uuid; srv text;
 begin
-  -- "Kyle-only": a signed-in user may record an adjustment only if they ARE recon_pay_config.payroll_owner_user_id.
-  -- NULL owner = nobody can (Kyle's auth user id is set by Kyle; it is never guessed). Server roles (SQL Editor owner,
-  -- service_role: imports run by Kyle) are stamped 'server:<role>'.
+  -- rev 4 (Kyle directly, 10/31 7:03 PM ET): ANY admin (is_admin()) may record an adjustment; entered_by / entered_by_uid
+  -- are always set here from auth.uid() (the file's "Entered By" text is kept in source_entered_by). The payroll owner
+  -- (recon_pay_config.payroll_owner_user_id) no longer gates adjustments; it still gates ownership / protected settings,
+  -- payroll submits and the one-time hub cutover.
   -- Kyle 10/31: the admin key (service_role) never records adjustments, signed-in user claim or not.
   if rl = 'service_role' or current_user = 'service_role' then
-    raise exception 'pay adjustments: the service_role (admin key) path is refused; the payroll owner records adjustments (postgres SQL Editor = audited break-glass)';
+    raise exception 'pay adjustments: the service_role (admin key) path is refused; a signed-in admin records adjustments (postgres SQL Editor = audited break-glass)';
   end if;
   if uid is null and rl in ('postgres', 'supabase_admin') then
     -- rev 3 (Kyle 10/31 default, still configurable): service_role is refused; the SQL Editor (postgres) is an audited
     -- break-glass path (entered_by 'break-glass:postgres', event payroll.adjustment.break_glass); 'off' refuses both.
     srv := (select adjustment_server_path from public.recon_pay_config where id);
     if rl = 'service_role' or srv = 'off' then
-      raise exception 'pay adjustments: the % path is refused (recon_pay_config.adjustment_server_path = %); the payroll owner records adjustments', rl, srv;
+      raise exception 'pay adjustments: the % path is refused (recon_pay_config.adjustment_server_path = %); a signed-in admin records adjustments', rl, srv;
     end if;
     new.entered_by := 'break-glass:' || rl;
   else
-    select payroll_owner_user_id into owner from public.recon_pay_config where id;
-    if owner is null or uid is distinct from owner then
-      raise exception 'only the payroll owner (recon_pay_config.payroll_owner_user_id%) may record pay adjustments',
-        case when owner is null then ', not set yet' else '' end;
+    if uid is null or not public.is_admin() then
+      raise exception 'only a signed-in admin may record pay adjustments';
     end if;
     new.entered_by := coalesce((select a.display_name from public.agents a where a.user_id = uid limit 1), uid::text);
   end if;
@@ -717,7 +716,9 @@ alter table public.recon_pay_config add column if not exists post_date_source te
 alter table public.recon_pay_config add column if not exists post_date_source_status text not null default 'confirmed'
   check (post_date_source_status in ('pending_kyle', 'confirmed'));
 -- rev 2 (Orchestrator review):
---   payroll_owner_user_id: the ONE auth user allowed to record pay adjustments ("Kyle-only"). NULL = nobody. Kyle sets it.
+--   payroll_owner_user_id: Kyle's auth user (rev 4: it no longer gates adjustments, which any admin may enter). It gates
+--   changing the owner / adjustment_server_path, recording a payroll submit and the one-time hub cutover. NULL = only the
+--   SQL Editor. Set at apply time from /workspace/secrets/payroll_owner_user_id.txt (scripts/payroll_owner_sql.sh).
 --   missed_spiff_payday (PB Q12, confirmed by Kyle 10/31): next_open_payday (default) = a spiff found only in Premier (board did not
 --     claim it) whose booked cycle is already submitted pays on the first payday after the latest submitted one;
 --     booked_cycle = it stays in its Date Booked cycle.

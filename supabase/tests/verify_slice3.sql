@@ -643,10 +643,15 @@ insert into auth.users (email) values ('admin2.test@example.com');
 insert into public.agents (display_name, email, role, user_id)
 select 'Second Admin (fake)', 'admin2.test@example.com', 'admin', id from auth.users where email = 'admin2.test@example.com';
 select pg_temp.act('authenticated','admin.test@example.com');
-do $$ begin
-  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason) values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY owner unset');
-  reset role; perform pg_temp.r('K1. owner not set (NULL): even an admin cannot record an adjustment', false, 'insert succeeded');
-exception when others then reset role; perform pg_temp.r('K1. owner not set (NULL): even an admin cannot record an adjustment', sqlerrm like '%not set yet%', sqlerrm); end $$;
+insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by, external_ref)
+values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY owner unset', 'Kyle', 'verify-k1');
+select pg_temp.srv();
+select pg_temp.r('K1. (rev 4) with the owner not set, an admin CAN record an adjustment; entered_by comes from auth.uid(), file text kept apart',
+  (select entered_by = 'Test Admin (fake)' and entered_by_uid = (select id from auth.users where email = 'admin.test@example.com')
+     from public.pay_adjustments where external_ref = 'verify-k1')
+  and exists (select 1 from public.event_log e join public.pay_adjustments a on a.id::text = e.row_id
+               where e.event_type = 'payroll.adjustment.recorded' and a.external_ref = 'verify-k1'),
+  (select format('entered_by=%s', entered_by) from public.pay_adjustments where external_ref = 'verify-k1'));
 select pg_temp.act('authenticated','admin2.test@example.com');
 do $$ begin
   update public.recon_pay_config set payroll_owner_user_id = auth.uid() where id;
@@ -664,21 +669,38 @@ select pg_temp.act('authenticated','admin2.test@example.com');
 do $$ begin
   update public.recon_pay_config set payroll_owner_user_id = auth.uid() where id;
   insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by) values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY takeover', 'Kyle');
-  reset role; perform pg_temp.r('O9. (Orchestrator repro) another admin cannot take ownership and then enter adjustments', false, 'took over');
-exception when others then reset role; perform pg_temp.r('O9. (Orchestrator repro) another admin cannot take ownership and then enter adjustments', sqlerrm like '%payroll owner%', sqlerrm); end $$;
+  reset role; perform pg_temp.r('O9. (Orchestrator repro) another admin still cannot take ownership (the whole attempt rolls back)', false, 'took over');
+exception when others then reset role; perform pg_temp.r('O9. (Orchestrator repro) another admin still cannot take ownership (the whole attempt rolls back)', sqlerrm like '%payroll owner%', sqlerrm); end $$;
 select pg_temp.act('authenticated','admin2.test@example.com');
-do $$ begin
-  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by) values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY other admin', 'Kyle');
-  reset role; perform pg_temp.r('K3. another admin (not the owner) is refused, even claiming entered_by = Kyle', false, 'insert succeeded');
-exception when others then reset role; perform pg_temp.r('K3. another admin (not the owner) is refused, even claiming entered_by = Kyle', sqlerrm like '%only the payroll owner%', sqlerrm); end $$;
+insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by, external_ref)
+values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY other admin', 'Kyle', 'verify-k3');
+select pg_temp.srv();
+select pg_temp.r('K3. (rev 4) another admin (not the owner) CAN record one; claiming entered_by = Kyle is ignored (stamped as that admin), audited',
+  (select entered_by = 'Second Admin (fake)' and entered_by_uid = (select id from auth.users where email = 'admin2.test@example.com')
+     from public.pay_adjustments where external_ref = 'verify-k3')
+  and exists (select 1 from public.event_log e join public.pay_adjustments a on a.id::text = e.row_id
+               where e.event_type = 'payroll.adjustment.recorded' and a.external_ref = 'verify-k3'),
+  (select format('entered_by=%s', entered_by) from public.pay_adjustments where external_ref = 'verify-k3'));
+select pg_temp.r('K3b. the admin is still not the owner: payroll_owner_user_id unchanged (Kyle''s / the configured owner)',
+  (select payroll_owner_user_id = (select id from auth.users where email = 'admin.test@example.com') from public.recon_pay_config where id));
 select pg_temp.act('authenticated','admin.test@example.com');
 insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by, external_ref)
 values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY owner entry', 'Somebody Else', 'verify-owner-1');
 select pg_temp.srv();
-select pg_temp.r('K2. the configured owner can record one; a spoofed entered_by is ignored (set from auth.uid() server-side)',
+select pg_temp.r('K2. the owner (Kyle) can record one too; a spoofed entered_by is ignored (set from auth.uid() server-side)',
   (select entered_by = 'Test Admin (fake)' and entered_by_uid = (select id from auth.users where email = 'admin.test@example.com')
      from public.pay_adjustments where external_ref = 'verify-owner-1'),
   (select format('entered_by=%s', entered_by) from public.pay_adjustments where external_ref = 'verify-owner-1'));
+select pg_temp.act('authenticated','agent.test@example.com');
+do $$ begin
+  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by) values ('Alex Testagent (fake)', '2026-11-13', 'manual', 50, 'VERIFY self-pay', 'Kyle');
+  reset role; perform pg_temp.r('K6. a signed-in non-admin (agent) is refused, even claiming entered_by = Kyle', false, 'insert succeeded');
+exception when others then reset role; perform pg_temp.r('K6. a signed-in non-admin (agent) is refused, even claiming entered_by = Kyle', true, sqlerrm); end $$;
+select pg_temp.act('authenticated','admin2.test@example.com');
+do $$ begin
+  insert into public.payroll_cutoffs (payday, cutoff_at, source, note) values ('2026-11-20', '2026-11-19 14:30-05', 'submit', 'VERIFY admin2 submit');
+  reset role; perform pg_temp.r('K7. owner-only stays owner-only: a non-owner admin still can''t record a payroll submit', false, 'inserted');
+exception when others then reset role; perform pg_temp.r('K7. owner-only stays owner-only: a non-owner admin still can''t record a payroll submit', sqlerrm like '%payroll owner%', sqlerrm); end $$;
 select pg_temp.act('service_role','admin.test@example.com');
 do $$ begin
   insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by) values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY admin key', 'Kyle');

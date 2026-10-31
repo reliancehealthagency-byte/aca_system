@@ -48,16 +48,17 @@ begin
     execute format('create policy %1$s_admin on public.%1$I for all to authenticated using (public.is_admin()) with check (public.is_admin())', t);
   end loop;
 end $$;
--- pay_adjustments (rev 2): admins READ; only the payroll owner (recon_pay_config.payroll_owner_user_id, set by Kyle;
--- NULL = nobody) may INSERT. Rows are immutable (trigger), so there is no update/delete policy. The BEFORE INSERT trigger
--- enforces the same rule and overwrites entered_by / entered_by_uid / created_by from auth.uid().
+-- pay_adjustments (rev 4, Kyle directly 10/31 7:03 PM ET): admins READ and any admin may INSERT. Rows are immutable
+-- (trigger), so there is no update/delete policy. The BEFORE INSERT trigger enforces the same rule, refuses service_role,
+-- allows postgres only as audited break-glass, and overwrites entered_by / entered_by_uid / created_by from auth.uid().
 drop policy if exists pay_adjustments_admin on public.pay_adjustments;
 drop policy if exists pay_adjustments_admin_read on public.pay_adjustments;
 drop policy if exists pay_adjustments_owner_insert on public.pay_adjustments;
 create policy pay_adjustments_admin_read on public.pay_adjustments for select to authenticated using (public.is_admin());
-create policy pay_adjustments_owner_insert on public.pay_adjustments for insert to authenticated
-  with check (auth.uid() is not null
-              and auth.uid() = (select c.payroll_owner_user_id from public.recon_pay_config c where c.id));
+drop policy if exists pay_adjustments_admin_insert on public.pay_adjustments;
+-- rev 4 (Kyle directly, 10/31 7:03 PM ET): any admin may insert; the trigger stamps entered_by from auth.uid().
+create policy pay_adjustments_admin_insert on public.pay_adjustments for insert to authenticated
+  with check (auth.uid() is not null and public.is_admin());
 
 -- ---------- payroll owner / cutover / submit guards (rev 3) ----------
 -- "Server" = the SQL Editor (postgres / supabase_admin) or the service_role key, checked with current_user (these
@@ -498,7 +499,7 @@ grant execute on function public.recon_parse_date(text), public.recon_parse_ts_e
   public.board_answer_addons(text), public.abs_item_count(numeric), public.recon_spiff_payday(timestamptz, date)
   to authenticated, service_role;
 
--- payroll.adjustment.recorded: one internal event per manual adjustment (Kyle-only entry; rows are append-only).
+-- payroll.adjustment.recorded: one internal event per manual adjustment (any admin, rev 4; rows are append-only).
 create or replace function public.log_pay_adjustment() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -507,7 +508,7 @@ begin
     values ('payroll.adjustment.break_glass', public.audit_actor_uid(), public.audit_actor_role(), 'pay_adjustments', new.id::text, 'EVENT',
             jsonb_build_object('agent', new.agent_name, 'payday', new.payday, 'amount', new.amount, 'entered_by', new.entered_by,
                                'source_entered_by', new.source_entered_by, 'external_ref', new.external_ref,
-                               'note', 'inserted from the SQL Editor (no signed-in payroll owner): break-glass path, review'));
+                               'note', 'inserted from the SQL Editor (no signed-in admin): break-glass path, review'));
   end if;
   insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
   values ('payroll.adjustment.recorded', public.audit_actor_uid(), public.audit_actor_role(), 'pay_adjustments', new.id::text, 'EVENT',
