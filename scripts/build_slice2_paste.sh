@@ -9,7 +9,7 @@ out="${1:-/workspace/aca_system_deploy/slice2_paste.sql}"
   echo "-- Aborts (no changes) unless expenses are exactly the slice-one seed. A re-run after success is a no-op."
   echo "begin;"
   echo; cat supabase/deploy/slice2_preflight_block.sql
-  for f in supabase/migrations/202610312*.sql supabase/seed_slice2.sql; do echo; echo "-- ===== $f ====="; cat "$f"; done
+  for f in supabase/migrations/2026103120*.sql supabase/seed_slice2.sql; do echo; echo "-- ===== $f ====="; cat "$f"; done
   echo; cat supabase/deploy/slice2_record_migrations.sql
   echo; echo "commit;"
 } > "$out"
