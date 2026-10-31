@@ -14,6 +14,10 @@ create table if not exists public.expense_categories (
   created_at  timestamptz not null default now()
 );
 comment on table public.expense_categories is 'Expense category lookup (admin only). expenses.category references code.';
+-- Audit from the first row (same generic trigger as slice one).
+drop trigger if exists audit_expense_categories on public.expense_categories;
+create trigger audit_expense_categories after insert or update or delete on public.expense_categories
+  for each row execute function public.audit_row_change();
 
 insert into public.expense_categories (code, label, sort_order) values
   ('lead_spend',      'Lead spend',        10),
@@ -103,10 +107,7 @@ drop trigger if exists revenue_adjustments_touch_updated_at on public.revenue_ad
 create trigger revenue_adjustments_touch_updated_at before update on public.revenue_adjustments
   for each row execute function public.touch_updated_at();
 
--- Same generic audit trigger as slice one on the new tables (expenses already has audit_expenses).
-drop trigger if exists audit_expense_categories on public.expense_categories;
-create trigger audit_expense_categories after insert or update or delete on public.expense_categories
-  for each row execute function public.audit_row_change();
+-- Same generic audit trigger on revenue_adjustments (expenses already has audit_expenses; expense_categories above).
 drop trigger if exists audit_revenue_adjustments on public.revenue_adjustments;
 create trigger audit_revenue_adjustments after insert or update or delete on public.revenue_adjustments
   for each row execute function public.audit_row_change();
