@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 
-export const metadata = { title: 'Reliance backend: slice one', description: 'Seed-data dashboard' };
+export const metadata = { title: 'Reliance backend', description: 'Seed-data dashboard' };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (

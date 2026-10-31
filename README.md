@@ -1,4 +1,4 @@
-# aca_system: Reliance backend, slice one (skeleton, seed data only)
+# aca_system: Reliance backend (slice one skeleton + slice two line-item P&L, seed data only)
 
 Backend for Reliance Health Agency's two-system rebuild (architecture spec approved by Kyle 10/31/2026).
 This slice is a **skeleton with fake seed data only**: no GoHighLevel, Kimbo, Ringba or Premier integrations, and no real PII.
@@ -6,7 +6,7 @@ This slice is a **skeleton with fake seed data only**: no GoHighLevel, Kimbo, Ri
 - Supabase project `aca-system`: `https://szkmzpquomcqgkvzpoez.supabase.co` (ref `szkmzpquomcqgkvzpoez`, us-east-1, Free). Keys are **never** in this repo.
 - Postgres schema + RLS + audited event log: `supabase/migrations/`
 - Fake seed data: `supabase/seed.sql`
-- Verification (24 checks, runs in a rolled-back transaction): `supabase/tests/verify.sql`
+- Verification (24 checks, runs in a rolled-back transaction): `supabase/tests/verify.sql` (10a/10b assert the P&L values and run before the checks that change a rate and a premium)
 - Dashboard (Next.js App Router, TypeScript): `web/`
 
 ## Schema (Premier-first)
@@ -18,7 +18,7 @@ This slice is a **skeleton with fake seed data only**: no GoHighLevel, Kimbo, Ri
 | `applications` | contact_id, carrier, plan_type, status, submitted_date, **premier_billing_date** |
 | `sales` | contact_id, application_id, **agent_of_record** (form submitter / CRM converter, locked), `premier_agent_ref` (**reference only, never used for attribution**), `sale_date` (= form Date Booked), `board_premium` (claim), `premier_premium` (truth), `pay_premium` (generated = premier_premium), `addon_products`, `post_dated` |
 | `call_metrics` | agent_name, date, calls_made, connects, appointments_set |
-| `expenses` | category, amount, date, description |
+| `expenses` | category (FK to `expense_categories.code`), amount, date, description, **source**, vendor, external_ref, created_by, updated_at (slice two) |
 | `commission_config` | **The one place commission rates live**: `base_rate` 0.38, `addon_bonus_rate` 0.05, `qualifying_addon_patterns` (LIKE patterns: ConsultCare Asset/Edge/Ultra, Wellness4You, AD&D / ADD / "Any ADD type" / Champion) |
 | `event_log` | Append-only audit log (see below) |
 | `sales_commission` (view) | Commission derived at read time: `pay_premium × (base + bonus if a qualifying add-on)`. Also `commission_estimate` (uses the board claim while Premier is pending), `pay_basis_date` (Premier billing date for post-dated deals, else Date Booked) and `commission_pay_friday` (Friday after that Sun–Sat week) |
@@ -30,9 +30,32 @@ Changing a rate is a row update, not a migration: `update commission_config set 
 `daily_pl.net_placeholder = premium_total − agent_commission − expenses`, where `premium_total` is Premier's premium (or the board claim while Premier is pending) and `agent_commission` is `commission_estimate` from `commission_config`.
 **This is a placeholder.** The agency's real revenue per sale (the P&L prototype's 42% vs payroll's 38%/43%) is an open question, so the net figure is not the agency's real profit.
 
+## Slice two: line-item P&L
+Migrations `20261031200000..200200`, seed `supabase/seed_slice2.sql` (20 FAKE expense lines, Oct 1-24 2026), checks `supabase/tests/verify_slice2.sql` (29 checks, rolled back), rollback `supabase/rollback/slice2_rollback.sql`.
+
+**Live apply (SQL Editor paste, built by `scripts/build_slice2_paste.sh`):**
+- Paste file: `slice2_paste.sql`, sha256 `6f9f741562c757e666d79cbc65c088b5a6a38187215921c08cf190cc7be2c090`
+- Applied to live: **pending**
+- Order inside ONE transaction: preflight (`supabase/deploy/slice2_preflight_block.sql`: aborts unless expenses are exactly the 4 live slice-one rows by (date, amount, description, category), as read from live 10/31 in `supabase/deploy/live_expenses_preapply.json`, or slice two is already applied and recorded) -> 3 migrations -> `seed_slice2.sql` -> migration history (`supabase/deploy/slice2_record_migrations.sql`: `supabase_migrations.schema_migrations`, CLI shape, slice-one versions backfilled, `on conflict do nothing`).
+- Standalone read-only preflight: `supabase/deploy/slice2_preflight.sql`. Live check: `scripts/verify_live_slice2.py` (read-only by default; `--allow-writes` adds VERIFY-tagged user-level tests with cleanup in `finally`). Local suite: `scripts/local_test_slice2.sh`.
+
+| Object | What it is |
+|---|---|
+| `expense_categories` | Lookup: lead_spend, dialer_software, payroll_spiffs, office, marketing, other. Admin only, audited |
+| `expenses` (extended) | Existing rows kept; old free-text categories remapped (Leads -> lead_spend, Software -> dialer_software) and the 4 slice-one seed rows get external_ref seed-s1-01..04; logged as row.update events |
+| `revenue_adjustments` | Manual revenue lines not tied to one sale's premium: carrier_bonus, override, chargeback (must be negative: check constraint), other_revenue. Admin only, audited, empty |
+| `pl_unpriced_sales` (view) | Sales with no Premier and no board premium (they have no P&L line); count shown on `/pl`. Admin only |
+| `pl_line_items` (view) | Every P&L line: line_date, week_start (Sunday), month_start, line_type (revenue / commission / expense), category, category_label, description, source, amount, signed_amount, ref_table, ref_id, agent_name |
+| `pl_daily`, `pl_weekly`, `pl_monthly` (views) | Sums of `pl_line_items`: sales_count, line_count, revenue, commission, expenses, net. A drill-down always adds back to its summary row |
+
+Revenue lines per sale: one premium line (`premium_premier`, or `premium_board_claim` while Premier is pending; add-ons are named in the description).
+Commission lines per sale: `agent_commission_base` (base rate x premium) and, with a qualifying add-on, `agent_commission_addon_bonus` (the remainder, so the two add up exactly to `commission_estimate`). `commission_config`, `pay_premium` and the attribution lock are unchanged.
+The slice-one `daily_pl`/`weekly_pl`/`monthly_pl` views are kept as-is and match the new views while `revenue_adjustments` is empty.
+Dashboard: `/pl?period=daily|weekly|monthly` (summary per period) and `/pl/<period>/<YYYY-MM-DD>` (lines grouped by type and category with totals). Admin only.
+
 ## Audited event log
 - One table, `public.event_log`: `id, occurred_at, event_type, actor_uid (auth.uid()), actor_role (JWT role or DB session user), table_name, row_id, action, before, after, changed_fields, detail`.
-- A generic trigger logs every INSERT / UPDATE / DELETE on `agents, contacts, applications, sales, call_metrics, expenses, commission_config`. No-op updates are not logged.
+- A generic trigger logs every INSERT / UPDATE / DELETE on `agents, contacts, applications, sales, call_metrics, expenses, commission_config` (+ `expense_categories`, `revenue_adjustments` in slice two). No-op updates are not logged.
 - **Premium mismatch:** when `premier_premium` and `board_premium` differ by more than $0.01, a `premium_mismatch` event is written (detail: both figures, the diff, agent_of_record, "attribution unchanged", paid on Premier).
 - **Immutable:** UPDATE/DELETE/TRUNCATE privileges are revoked from anon, authenticated and service_role, and a trigger raises on any UPDATE, DELETE or TRUNCATE. (The database owner could still drop the trigger; that's a schema change and shows in migrations.)
 

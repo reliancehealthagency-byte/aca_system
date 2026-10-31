@@ -52,11 +52,14 @@ insert into public.call_metrics (agent_name, date, calls_made, connects, appoint
   ('Blair Sample (fake)',   '2026-10-29', 110, 25, 3),
   ('Blair Sample (fake)',   '2026-10-30', 128, 30, 4);
 
-insert into public.expenses (category, amount, date, description) values
-  ('Leads',    200.00, '2026-10-26', 'FAKE seed: lead spend'),
-  ('Leads',    175.00, '2026-10-29', 'FAKE seed: lead spend'),
-  ('Leads',    150.00, '2026-10-31', 'FAKE seed: lead spend'),
-  ('Software',  49.00, '2026-10-31', 'FAKE seed: subscription');
+-- Slice two: categories are lookup codes (expense_categories) and source is required. On the live project these rows
+-- were inserted by slice one as 'Leads'/'Software' and remapped in place by migration 20261031200000.
+insert into public.expenses (category, amount, date, description, source, external_ref) values
+  ('lead_spend',      200.00, '2026-10-26', 'FAKE seed: lead spend',   'seed', 'seed-s1-01'),
+  ('lead_spend',      175.00, '2026-10-29', 'FAKE seed: lead spend',   'seed', 'seed-s1-02'),
+  ('lead_spend',      150.00, '2026-10-31', 'FAKE seed: lead spend',   'seed', 'seed-s1-03'),
+  ('dialer_software',  49.00, '2026-10-31', 'FAKE seed: subscription', 'seed', 'seed-s1-04')
+on conflict (source, external_ref) where external_ref is not null do nothing;
 
 -- (Re)link agents to auth users by email, in case the users were created after the seed ran.
 update public.agents a set user_id = u.id from auth.users u where u.email = a.email and a.user_id is null;

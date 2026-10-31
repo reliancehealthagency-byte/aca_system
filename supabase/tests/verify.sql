@@ -75,6 +75,23 @@ select pg_temp.r('7a. commission 38% base (100.00 -> 38.00)',
 select pg_temp.r('7b. commission 43% with Wellness4You (120.00 -> 51.60)',
   (select commission_rate=0.43 and commission=51.60 from sales_commission where id='00000000-0000-4000-8000-00000005a002'));
 
+-- 10. daily / weekly P&L (as admin). Runs BEFORE checks 8/9, which change a rate and a Premier premium in this
+-- transaction (9b sets 95.00 on the post-dated sale); reading after them gave the wrong 565.00 / 220.70 week total.
+-- Expected = seed math: premium 100+120+140+90+110 = 560.00; commission 38.00+51.60+53.20+34.20 (estimate)+41.80 = 218.80.
+select pg_temp.act('authenticated','admin.test@example.com');
+do $$ declare d record; w record; begin
+  select * into d from public.daily_pl where day = date '2026-10-31';
+  select * into w from public.weekly_pl where week_start = date '2026-10-25';
+  reset role;
+  perform pg_temp.r('10a. daily_pl 2026-10-31 = 1 sale, 110.00, 41.80, 199.00, net -130.80',
+    d.sales_count = 1 and d.premium_total = 110.00 and d.agent_commission = 41.80 and d.expenses = 199.00 and d.net_placeholder = -130.80,
+    format('sales=%s premium=%s commission=%s expenses=%s net=%s', d.sales_count, d.premium_total, d.agent_commission, d.expenses, d.net_placeholder));
+  perform pg_temp.r('10b. weekly_pl 10/25 = 5 sales, 560.00, 218.80, 574.00, net -232.80',
+    w.sales_count = 5 and w.premium_total = 560.00 and w.agent_commission = 218.80 and w.expenses = 574.00 and w.net_placeholder = -232.80,
+    format('sales=%s premium=%s commission=%s expenses=%s net=%s', w.sales_count, w.premium_total, w.agent_commission, w.expenses, w.net_placeholder));
+end $$;
+reset role;
+
 -- 8. config change changes the result, no migration
 update public.commission_config set base_rate = 0.40 where id;
 select pg_temp.r('8. base_rate 0.38 -> 0.40 changes commission (38.00 -> 40.00, 43% -> 45%)',
@@ -95,18 +112,6 @@ do $$ begin
   update public.sales set agent_of_record='00000000-0000-4000-8000-00000000a002' where id='00000000-0000-4000-8000-00000005a003';
   perform pg_temp.r('9d. agent_of_record locked', false, 'update succeeded');
 exception when others then perform pg_temp.r('9d. agent_of_record locked', true, sqlerrm); end $$;
-
--- 10. daily / weekly P&L (as admin)
-select pg_temp.act('authenticated','admin.test@example.com');
-do $$ declare d record; w record; begin
-  select * into d from public.daily_pl where day = date '2026-10-31';
-  select * into w from public.weekly_pl where week_start = date '2026-10-25';
-  reset role;
-  perform pg_temp.r('10a. daily_pl returns today (2026-10-31)', d.day is not null,
-    format('sales=%s premium=%s commission=%s expenses=%s net=%s', d.sales_count, d.premium_total, d.agent_commission, d.expenses, d.net_placeholder));
-  perform pg_temp.r('10b. weekly_pl returns this week (Sun 10/25-Sat 10/31)', w.week_start is not null,
-    format('sales=%s premium=%s commission=%s expenses=%s net=%s', w.sales_count, w.premium_total, w.agent_commission, w.expenses, w.net_placeholder));
-end $$;
 
 -- 11. RLS as agent: own sales only; no expenses / P&L / config / event log
 select pg_temp.act('authenticated','agent.test@example.com');

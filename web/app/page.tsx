@@ -67,9 +67,10 @@ export default async function Dashboard() {
   return (
     <main>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h1 style={{ margin: 0 }}>Reliance backend: slice one (seed data)</h1>
+        <h1 style={{ margin: 0 }}>Reliance backend (seed data)</h1>
         <form action="/auth/signout" method="post">
           <span style={{ marginRight: 12 }}>{auth.user.email}{admin ? ' (admin)' : ''}</span>
+          {admin ? <a href="/pl" style={{ marginRight: 12 }}>P&amp;L drill-down</a> : null}
           <a href="/account" style={{ marginRight: 12 }}>Change password</a>
           <button type="submit">Sign out</button>
         </form>
@@ -83,6 +84,12 @@ export default async function Dashboard() {
         <PLCard title={`Today's P&L (${today})`} pl={daily.data ?? null} admin={admin} />
         <PLCard title={`This week (from ${weekStart})`} pl={weekly.data ?? null} admin={admin} />
       </div>
+      {admin ? (
+        <p>
+          Line items: <a href={`/pl/daily/${today}`}>today</a> · <a href={`/pl/weekly/${weekStart}`}>this week</a> ·{' '}
+          <a href={`/pl/monthly/${today.slice(0, 8)}01`}>this month</a> · <a href="/pl">all periods</a>
+        </p>
+      ) : null}
 
       <h2>Recent sales</h2>
       {sales.error ? <p style={{ color: '#b00' }}>Could not load sales.</p> : null}
