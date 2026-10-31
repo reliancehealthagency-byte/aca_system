@@ -70,6 +70,7 @@ export default async function Dashboard() {
         <h1 style={{ margin: 0 }}>Reliance backend: slice one (seed data)</h1>
         <form action="/auth/signout" method="post">
           <span style={{ marginRight: 12 }}>{auth.user.email}{admin ? ' (admin)' : ''}</span>
+          <a href="/account" style={{ marginRight: 12 }}>Change password</a>
           <button type="submit">Sign out</button>
         </form>
       </header>
