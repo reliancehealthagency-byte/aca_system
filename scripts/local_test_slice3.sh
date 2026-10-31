@@ -62,7 +62,7 @@ res "A12 event_log delta from paste (config-row audit only)" "$([ $((EV1-EV0)) -
 for g in "update sales set lead_source='web' where ctid=(select ctid from sales limit 1)|lead_source" \
          "insert into pay_adjustments(agent_name,payday,kind,amount,reason,entered_by) values ('Test Agent','2026-11-06','manual',5,'real adj','Kyle')|non-mock pay adjustment" \
          "insert into recon_imports(kind,file_name,file_sha256,encoding,line_ending,header,row_count,is_mock,hash_scheme) select kind,'real.csv',repeat('b',64),encoding,line_ending,header,0,false,'hmac-sha256' from (values ('sales_board','utf-8','CRLF',(select header from (select array['Timestamp','Member ID','Date Booked','x','Active Date','Agent','Premium','Customer Name','Customer Email','Customer Phone','x','x','Post Date','Email','x','ABS Addon?','x','Deal Type','Agent','x','FFM','Client Name','x','x','Date Booked','x','x','x','Income','x','x','Premier/Neo Addon?','Premier/Neo Member ID','Premier/Neo Premium','ABS Addon?','ABS Member ID','ABS Premium','x','Phone Number','x','Increased Comm/Spiff Product?','Agent']::text[] header) h))) v(kind,encoding,line_ending,header)|non-mock import" \
-         "insert into hub_paid_lock(file_sha256,row_num,payday,agent_name,paid_total) values (repeat('c',64),1,'2026-10-30','Test Agent',10); insert into hub_cutover(file_name,file_sha256,note) values ('hub.csv',repeat('c',64),'hub')|hub cutover recorded (clock started)" \
+         "insert into hub_paid_lock(file_sha256,row_num,payday,agent_name,paid_total,locked_at) values (repeat('c',64),1,'2026-10-30','Test Agent',10,'2026-10-29 14:07'); insert into hub_cutover(file_name,file_sha256,note) values ('hub.csv',repeat('c',64),'hub')|hub cutover recorded (clock started)" \
          "update recon_pay_config set adjustment_server_path='off' where id|changed recon_pay_config (break-glass setting)" \
          "insert into agent_name_aliases(alias,agent_id) select 'Alias Test',id from agents limit 1|agent alias rows" \
          "update recon_pay_config set payroll_owner_user_id=gen_random_uuid() where id|payroll owner set" \
@@ -167,13 +167,34 @@ python3 scripts/csv_to_recon_sql.py --mock --hub "$T/hub_bad.csv" >/dev/null 2>"
 res "E11 hub file with a non-Friday Pay Friday is refused" "$([ $rc != 0 ] && grep -q "is not a Friday" "$T/e11" && echo PASS || echo FAIL)" "$(cut -c1-100 "$T/e11")"
 D=t3_imp; liveish $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1
 touch "$T/marker"; GS0=$(git status --porcelain | md5sum)
-python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --hub "$T/hub.csv" --salt-file "$SALT" --psql "-d $D" >/dev/null 2>&1; rc=$?
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --hub "$T/hub.csv" --salt-file "$SALT" --psql "-d $D" >/dev/null 2>"$T/e14"; rc=$?
+res "E14 --hub without --confirm-hub is a dry run: prints the planned paydays + last_hub_payday, writes nothing" "$([ $rc != 0 ] && grep -q 'paydays 2026-10-23, 2026-10-30; last_hub_payday = 2026-10-30' "$T/e14" && grep -q 'DRY RUN' "$T/e14" && [ "$(q $D -c 'select (select count(*) from recon_imports)+(select count(*) from hub_paid_lock)')" = 0 ] && echo PASS || echo FAIL)" "$(grep -o 'hub cutover plan.*' "$T/e14" | cut -c1-110)"
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --board "$BD" --hub "$T/hub.csv" --confirm-hub --salt-file "$SALT" --psql "-d $D" >/dev/null 2>&1; rc=$?
 NEWF=$( (find "$T" /tmp /workspace/aca_system -maxdepth 2 -newer "$T/marker" -type f \( -name '*.sql' -o -name '*recon*' \) 2>/dev/null) | grep -v "^$T/marker$" | wc -l)
 res "E7 --psql streams a real-mode import (Premier + board + hub cutover) straight into the DB: ops rows land, export finalized, clock started" "$([ $rc = 0 ] && [ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select max(cardinality(raw_fields)) from premier_member_products')" = 68 ] && [ "$(q $D -c "select count(*) from recon_imports where finalized_at is not null and hash_scheme='hmac-sha256'")" = 1 ] && [ "$(q $D -c 'select last_hub_payday from hub_cutover')" = 2026-10-30 ] && echo PASS || echo FAIL)" "exit=$rc rows=$(q $D -c 'select count(*) from premier_member_products') hub=$(q $D -c 'select last_hub_payday from hub_cutover')"
 res "E12 no generated SQL lingers: the --psql run wrote no file (box /tmp, repo, temp dir) and the repo is unchanged" "$([ "$NEWF" = 0 ] && [ "$(git status --porcelain | md5sum)" = "$GS0" ] && echo PASS || echo FAIL)" "new files=$NEWF"
-python3 scripts/csv_to_recon_sql.py --hub "$T/hub.csv" --salt-file "$SALT" --psql "-d $D" >/dev/null 2>"$T/e13"; rc=$?
+python3 scripts/csv_to_recon_sql.py --hub "$T/hub.csv" --confirm-hub --salt-file "$SALT" --psql "-d $D" >/dev/null 2>"$T/e13"; rc=$?
 res "E13 importing the hub file a second time is refused (one-time clock start)" "$([ $rc != 0 ] && [ "$(q $D -c 'select count(*) from hub_paid_lock')" = 2 ] && echo PASS || echo FAIL)" "$(grep -o 'ERROR: .*' "$T/e13" | head -1 | cut -c1-110)"
+# rev 4: payroll_owner_sql.sh sets the owner from the secrets-style file without ever printing it
+OW="$T/owner.txt"; ( umask 077; python3 -c 'import uuid; print(uuid.uuid4())' > "$OW" ); OU=$(cat "$OW")
+q $D -c "insert into auth.users(id,email) values ('$OU','owner.test@example.com')" >/dev/null
+bash scripts/payroll_owner_sql.sh >"$T/o0.out" 2>&1; rc0=$?
+OWNER_FILE="$OW" bash scripts/payroll_owner_sql.sh --psql "-d $D" >"$T/o1.out" 2>&1; rc1=$?
+OWNER_FILE="$OW" bash scripts/payroll_owner_sql.sh --out "$PWD/owner_test.sql" >"$T/o2.out" 2>&1; rc2=$?
+res "E18 payroll_owner_sql.sh streams the owner id into psql (owner set) and never prints it; no-arg and in-repo --out are refused" "$([ $rc0 != 0 ] && [ $rc1 = 0 ] && [ $rc2 != 0 ] && [ ! -e owner_test.sql ] && [ "$(q $D -c 'select payroll_owner_user_id from recon_pay_config')" = "$OU" ] && ! grep -qF "$OU" "$T/o0.out" "$T/o1.out" "$T/o2.out" && echo PASS || echo FAIL)" "rc=$rc0/$rc1/$rc2 $(head -c 90 "$T/o1.out")"
 psql -q -d postgres -c "drop database if exists t3_imp" >/dev/null 2>&1
+python3 scripts/csv_to_recon_sql.py --premier "$PH" --salt-file "$SALT" --out "$PWD/supabase/import_test.sql" >/dev/null 2>"$T/e16"; rc=$?
+res "E16 --out inside the git working tree is refused (and generated import SQL is gitignored)" "$([ $rc != 0 ] && grep -q 'inside the git working tree' "$T/e16" && [ ! -e supabase/import_test.sql ] && git check-ignore -q x_import.sql && git check-ignore -q generated.sql && echo PASS || echo FAIL)" "$(cut -c1-110 "$T/e16")"
+printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\r\n10/30/2026,Test Agent,120.50,118.00,10/29/2026 14:07,mock\r\n11/06/2026,James Carangelo,0,,,mock\r\n' > "$T/hub_blank.csv"
+printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\r\n10/30/2026,Test Agent,120.50,118.00,10/29/2026 14:07,mock\r\n10/29/2027,Test Agent,10,10,10/29/2026 14:07,typo\r\n' > "$T/hub_future.csv"
+python3 scripts/csv_to_recon_sql.py --mock --hub "$T/hub_blank.csv" --confirm-hub >/dev/null 2>"$T/e15a"; ra=$?
+python3 scripts/csv_to_recon_sql.py --mock --hub "$T/hub_future.csv" --confirm-hub >/dev/null 2>"$T/e15b"; rb=$?
+res "E15 script refuses hub rows with a blank Locked At (repro 1) or a future Pay Friday (repro 2: 10/29/2027)" "$([ $ra != 0 ] && grep -q 'Locked At (ET) is blank' "$T/e15a" && [ $rb != 0 ] && grep -q 'is after today' "$T/e15b" && echo PASS || echo FAIL)" "$(cut -c1-80 "$T/e15a") / $(cut -c1-80 "$T/e15b")"
+D=t3_mock; liveish $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1
+python3 scripts/csv_to_recon_sql.py --mock --premier "$PH" --hub "$T/hub.csv" --confirm-hub --psql "-d $D" >/dev/null 2>&1; r1=$?
+python3 scripts/csv_to_recon_sql.py --mock --board "$BD" --hub "$T/hub.csv" --confirm-hub --psql "-d $D" >/dev/null 2>&1; r2=$?
+res "E17 a refused --mock import leaves no orphan rows (one transaction): the board import rolled back with the refused 2nd hub file" "$([ $r1 = 0 ] && [ $r2 != 0 ] && [ "$(q $D -c "select count(*) from recon_imports where kind='sales_board'")" = 0 ] && [ "$(q $D -c 'select count(*) from hub_paid_lock')" = 2 ] && echo PASS || echo FAIL)" "run1=$r1 run2=$r2 board_imports=$(q $D -c "select count(*) from recon_imports where kind='sales_board'")"
+psql -q -d postgres -c "drop database if exists t3_mock" >/dev/null 2>&1
 
 # F. slices one and two untouched in the repo (only the slice-two paste builder glob changed, output byte-identical)
 CH=$(git diff --name-only main -- supabase/migrations/2026103119*.sql supabase/migrations/2026103120*.sql supabase/seed.sql supabase/seed_slice2.sql supabase/tests/verify.sql supabase/tests/verify_slice2.sql supabase/rollback/slice2_rollback.sql supabase/deploy/slice2_* | paste -sd,)

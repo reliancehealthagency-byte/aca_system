@@ -51,6 +51,14 @@ BOARD_BLANK = [28]                                                   # AC Income
 MADJ_REQUIRED = ['Agent', 'Payday', 'Amount', 'Reason/Note', 'Member ID', 'Entered By', 'Date Entered']   # + optional Covers
 HUB_REQUIRED = ['Pay Friday', 'Agent', 'Paid Total', 'Locked At (ET)']   # + optional System Total, Note
 ALLOW_REVERT = False
+CONFIRM_HUB = False
+import datetime as _dt
+try:
+    from zoneinfo import ZoneInfo as _Z
+    TODAY_ET = _dt.datetime.now(_Z('America/New_York')).date()
+except Exception:
+    TODAY_ET = _dt.date.today()
+REPO_ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 DEFAULT_SALT_FILE = '/workspace/secrets/recon_hash_salt.txt'
 
 def money(v, where):
@@ -238,7 +246,7 @@ def emit_hub(path, mock, out):
     if not data:
         die(f'{path}: no rows')
     ix = {c: header.index(c) for c in header}
-    rows = []
+    rows = []; days = set()
     for i, r in enumerate(data):
         w = f'{path} line {i + 2}'
         day = parse_day(r[ix['Pay Friday']], w)
@@ -247,12 +255,24 @@ def emit_hub(path, mock, out):
         agent = r[ix['Agent']].strip()
         if not agent:
             die(f'{w}: Agent is blank')
+        if not r[ix['Paid Total']].strip():
+            die(f'{w}: Paid Total is blank (only paydays the hub actually paid belong in the cutover file)')
         paid = money_any(r[ix['Paid Total']], w)
         sys_t = money_any(r[ix['System Total']], w) if 'System Total' in ix and r[ix['System Total']].strip() else 'null'
         la = r[ix['Locked At (ET)']].strip()
-        locked = f"(timestamp {lit(la)} at time zone 'America/New_York')" if la else 'null'
+        if not la:
+            die(f'{w}: Locked At (ET) is blank: that payday was not locked (paid) by the hub; remove the row')
+        if day > TODAY_ET:
+            die(f'{w}: Pay Friday {day} is after today ({TODAY_ET}): a future payday can\'t have been paid by the hub (typo?)')
+        locked = f"(timestamp {lit(la)} at time zone 'America/New_York')"
         note = lit(r[ix['Note']]) if 'Note' in ix and r[ix['Note']].strip() else 'null'
         rows.append(f"  ({lit(sha)}, {i + 1}, date {lit(day.isoformat())}, {lit(agent)}, {paid}, {sys_t}, {locked}, {note})")
+        days.add(day)
+    plan = (f"hub cutover plan: {len(data)} row(s); paydays {', '.join(d.isoformat() for d in sorted(days))};"
+            f" last_hub_payday = {max(days).isoformat()} (ONE-TIME and immutable: everything due on or before it is paid_by_hub)")
+    print(plan, file=sys.stderr)
+    if not CONFIRM_HUB:
+        die('hub cutover DRY RUN: nothing written. Check the paydays and last_hub_payday above, then re-run with --confirm-hub')
     out.write(f"-- hub cutover: {os.path.basename(path)} ({len(data)} Paid Lock rows, sha256 {sha}); ONE-TIME, owner / SQL Editor only\n")
     out.write("insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note) values\n")
     out.write(",\n".join(rows) + ";\n")
@@ -276,8 +296,14 @@ if __name__ == '__main__':
     ap.add_argument('--salt-file', default=os.environ.get('RECON_HASH_SALT_FILE', DEFAULT_SALT_FILE),
                     help='HMAC salt for phone/email hashes (0600 file; required for real imports)')
     ap.add_argument('--allow-revert', action='store_true', help='finalize a board export even if it reverts a submission (after checking)')
+    ap.add_argument('--confirm-hub', action='store_true', help='write the hub cutover (without it --hub is a dry run that prints the plan)')
     a = ap.parse_args()
     ALLOW_REVERT = a.allow_revert
+    CONFIRM_HUB = a.confirm_hub
+    if a.out:
+        op = os.path.realpath(a.out)
+        if op == REPO_ROOT or op.startswith(REPO_ROOT + os.sep):
+            die(f'--out {a.out} is inside the git working tree ({REPO_ROOT}): write generated SQL outside the repo (e.g. /tmp) and shred it after use')
     if not a.mock and not (a.out or a.psql):
         die('real (non --mock) imports must use --psql "<args>" (no file) or --out FILE (0600, delete after use)')
     load_salt(a.salt_file, a.mock)
@@ -291,8 +317,10 @@ if __name__ == '__main__':
     if a.madj:
         emit_madj(a.madj, a.mock, buf)
     sql = buf.getvalue()
-    if not a.mock:
-        sql = 'begin;\n' + sql + 'commit;\n'   # one transaction: a refused board export leaves nothing behind
+    if not a.mock or a.psql or a.out:
+        # one transaction: a refused board export / hub cutover leaves nothing behind (mock too, rev 4). Plain --mock to
+        # stdout stays bare: it is the committed seed, which callers include inside their own transaction.
+        sql = 'begin;\n' + sql + 'commit;\n'
     if a.psql:
         r = subprocess.run(['psql', '-v', 'ON_ERROR_STOP=1', '-q'] + shlex.split(a.psql), input=sql.encode())
         sys.exit(r.returncode)

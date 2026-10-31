@@ -570,7 +570,7 @@ create table if not exists public.hub_paid_lock (
   agent_name    text not null,
   paid_total    numeric(12,2) not null,
   system_total  numeric(12,2),
-  locked_at     timestamptz,
+  locked_at     timestamptz not null,   -- rev 4: a hub row without its Locked At is not a paid payroll (refused)
   note          text,
   unique (file_sha256, row_num)
 );
@@ -646,15 +646,9 @@ begin
   end if;
   new.entered_by_uid := uid;
   new.created_by := uid;
-  -- agent link (rev 3): an explicit agent_id must exist and match agent_name; else resolved from the roster by name
-  -- (case-insensitive). Unresolved = NULL: the agent can't see it in my_pay_adjustments() until Kyle fixes the name.
-  if new.agent_id is not null then
-    if not exists (select 1 from public.agents a where a.id = new.agent_id and lower(a.display_name) = lower(new.agent_name)) then
-      raise exception 'pay adjustment: agent_id % does not match agent_name %', new.agent_id, new.agent_name;
-    end if;
-  else
-    new.agent_id := (select a.id from public.agents a where lower(a.display_name) = lower(btrim(new.agent_name)));
-  end if;
+  -- agent link (rev 4): agent_id is ALWAYS resolved here from agent_name (roster display name, else agent_name_aliases);
+  -- a client-supplied agent_id is ignored. Unresolved = NULL: the agent can't see it in my_pay_adjustments() until fixed.
+  new.agent_id := public.recon_agent_id(new.agent_name);
   if exists (select 1 from public.pay_line_locks where payday = new.payday) then
     raise exception 'payday % is locked (payroll submitted): enter the adjustment on the next open payday', new.payday;
   end if;

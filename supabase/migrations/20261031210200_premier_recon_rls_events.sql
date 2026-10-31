@@ -183,10 +183,25 @@ begin
 end $$;
 create or replace function public.hub_paid_lock_guard() returns trigger
 language plpgsql set search_path = public, pg_temp as $$
+declare b record; today date := (now() at time zone 'America/New_York')::date;
 begin
   perform public.recon_owner_or_sql_editor('hub cutover');
   if exists (select 1 from public.hub_cutover) then
     raise exception 'hub cutover already recorded: the hub file is imported once (no more hub rows)';
+  end if;
+  -- rev 4 input checks (Orchestrator rev-3 B1): the cutover is immutable, so a bad row must never get in.
+  if new.locked_at is null then
+    raise exception 'hub row %: Locked At is blank: only paydays the hub actually locked (paid) can be in the cutover file', new.row_num;
+  end if;
+  if new.paid_total is null then
+    raise exception 'hub row %: Paid Total is blank', new.row_num;
+  end if;
+  if new.payday > today then
+    raise exception 'hub row %: Pay Friday % is after today (%): a future payday can''t have been paid by the hub (typo?)', new.row_num, new.payday, today;
+  end if;
+  select * into b from public.recon_cutover_bounds();
+  if b.last_submit is not null and new.payday > b.last_submit + 7 then
+    raise exception 'hub row %: Pay Friday % is after the last recorded submit % + 7 days (%): refused (typo?)', new.row_num, new.payday, b.last_submit, b.last_submit + 7;
   end if;
   return new;
 end $$;

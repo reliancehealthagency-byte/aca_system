@@ -23,3 +23,9 @@ dist/
 *salt*
 # payroll owner id (lives in /workspace/secrets, never in the repo)
 *payroll_owner_user_id*
+# generated import / owner SQL must never be committed (rev 4)
+/*.sql
+scripts/*.sql
+*.import.sql
+*_import*.sql
+owner*.sql

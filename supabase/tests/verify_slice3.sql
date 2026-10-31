@@ -480,11 +480,41 @@ do $$ begin
 exception when others then reset role; perform pg_temp.r('O1b. the admin key (service_role) cannot start the clock either', true, sqlerrm); end $$;
 select pg_temp.srv();
 do $$ begin
-  insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, note)
-  values (repeat('8', 64), 1, '2026-10-23', 'Kaitlyn Romine', 100, 100, 'VERIFY short file');
+  insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note)
+  values (repeat('8', 64), 1, '2026-10-23', 'Kaitlyn Romine', 100, 100, '2026-10-22 14:46', 'VERIFY short file');
   insert into public.hub_cutover (file_name, file_sha256, note) values ('VERIFY hub short', repeat('8', 64), 'VERIFY');
   perform pg_temp.r('O2. a hub file ending 10/23 is refused: 10/30 is already submitted (the cutover can''t move backwards)', false, 'recorded');
 exception when others then perform pg_temp.r('O2. a hub file ending 10/23 is refused: 10/30 is already submitted (the cutover can''t move backwards)', sqlerrm like '%already submitted%', sqlerrm); end $$;
+-- rev-3 B1 repros (Orchestrator): bad hub rows must never reach the immutable cutover
+create temp table pay_before_hb as select sum(coalesce(final_payable, 0)) t from public.premier_recon_trueup;
+do $$ begin
+  insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note) values
+    (repeat('7', 64), 1, '2026-10-30', 'Kaitlyn Romine', 129.50, 129.50, '2026-10-29 14:07', 'VERIFY repro 1'),
+    (repeat('7', 64), 2, '2026-11-06', 'James Carangelo', 0, null, null, 'VERIFY repro 1');
+  insert into public.hub_cutover (file_name, file_sha256, note) values ('VERIFY hub repro 1', repeat('7', 64), 'VERIFY');
+  perform pg_temp.r('HB1. (repro 1) a hub file with 10/30 locked plus "11/06, James, 0, blank Locked At" is refused', false, 'recorded');
+exception when others then perform pg_temp.r('HB1. (repro 1) a hub file with 10/30 locked plus "11/06, James, 0, blank Locked At" is refused', sqlerrm like '%Locked At is blank%', sqlerrm); end $$;
+do $$ begin
+  insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note) values
+    (repeat('6', 64), 1, '2026-10-30', 'Kaitlyn Romine', 129.50, 129.50, '2026-10-29 14:07', 'VERIFY repro 2'),
+    (repeat('6', 64), 2, '2027-10-29', 'Kaitlyn Romine', 10, 10, '2026-10-29 14:07', 'VERIFY repro 2 typo');
+  insert into public.hub_cutover (file_name, file_sha256, note) values ('VERIFY hub repro 2', repeat('6', 64), 'VERIFY');
+  perform pg_temp.r('HB2. (repro 2) one typo row dated 10/29/2027 is refused (after today and after last submit + 7)', false, 'recorded');
+exception when others then perform pg_temp.r('HB2. (repro 2) one typo row dated 10/29/2027 is refused (after today and after last submit + 7)', sqlerrm like '%Pay Friday 2027-10-29 is after%', sqlerrm); end $$;
+do $$ begin
+  insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note) values
+    (repeat('5', 64), 1, '2026-11-13', 'Kaitlyn Romine', 10, 10, '2026-10-29 14:07', 'VERIFY +7');
+  perform pg_temp.r('HB3. a Pay Friday after the last recorded submit (10/30) + 7 days is refused, even with Locked At filled', false, 'inserted');
+exception when others then perform pg_temp.r('HB3. a Pay Friday after the last recorded submit (10/30) + 7 days is refused, even with Locked At filled', sqlerrm like '%after%', sqlerrm); end $$;
+do $$ begin
+  insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note) values
+    (repeat('4', 64), 1, '2026-10-30', 'Kaitlyn Romine', null, null, '2026-10-29 14:07', 'VERIFY blank paid');
+  perform pg_temp.r('HB4. a hub row with a blank Paid Total is refused', false, 'inserted');
+exception when others then perform pg_temp.r('HB4. a hub row with a blank Paid Total is refused', sqlerrm like '%Paid Total is blank%', sqlerrm); end $$;
+select pg_temp.r('HB5. after the refusals nothing was written: no hub rows, no cutover, open-week payable unchanged',
+  not exists (select 1 from public.hub_paid_lock) and not exists (select 1 from public.hub_cutover)
+  and (select sum(coalesce(final_payable, 0)) from public.premier_recon_trueup) = (select t from pay_before_hb),
+  (select format('payable=%s before=%s', (select sum(coalesce(final_payable, 0)) from public.premier_recon_trueup), t) from pay_before_hb));
 -- the real (mock) hub "Paid Lock" import, run in the SQL Editor (postgres) as the script emits it
 insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note) values
   (repeat('e', 64), 1, '2026-10-23', 'Nicholas Ziccardi', 119.32, 119.32, '2026-10-22 14:46', 'VERIFY mock'),
@@ -643,15 +673,39 @@ insert into auth.users (email) values ('admin2.test@example.com');
 insert into public.agents (display_name, email, role, user_id)
 select 'Second Admin (fake)', 'admin2.test@example.com', 'admin', id from auth.users where email = 'admin2.test@example.com';
 select pg_temp.act('authenticated','admin.test@example.com');
-insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by, external_ref)
-values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY owner unset', 'Kyle', 'verify-k1');
+insert into public.pay_adjustments (agent_name, payday, kind, amount, reason, entered_by, entered_by_uid, created_by, agent_id, source_entered_by, external_ref)
+values ('Chris Wilfong', '2026-11-13', 'manual', 5, 'VERIFY owner unset', 'Kyle', '00000000-0000-0000-0000-0000000000b1',
+        '00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000b3', 'Kyle (file text)', 'verify-k1');
 select pg_temp.srv();
-select pg_temp.r('K1. (rev 4) with the owner not set, an admin CAN record an adjustment; entered_by comes from auth.uid(), file text kept apart',
+select pg_temp.r('K1. (rev 4) any admin CAN record an adjustment (owner not set); spoofed entered_by / entered_by_uid / created_by / agent_id ignored (auth.uid() + server-side agent lookup); file text kept apart',
   (select entered_by = 'Test Admin (fake)' and entered_by_uid = (select id from auth.users where email = 'admin.test@example.com')
-     from public.pay_adjustments where external_ref = 'verify-k1')
+          and created_by = entered_by_uid and agent_id is null and source_entered_by = 'Kyle (file text)'
+     from public.pay_adjustments where external_ref = 'verify-k1'),
+  (select format('entered_by=%s agent_id=%s', entered_by, agent_id) from public.pay_adjustments where external_ref = 'verify-k1'));
+select pg_temp.r('K1b. every adjustment is audited twice: the row audit (INSERT) and payroll.adjustment.recorded',
+  exists (select 1 from public.event_log e join public.pay_adjustments a on a.id::text = e.row_id
+           where e.event_type = 'payroll.adjustment.recorded' and a.external_ref = 'verify-k1')
   and exists (select 1 from public.event_log e join public.pay_adjustments a on a.id::text = e.row_id
-               where e.event_type = 'payroll.adjustment.recorded' and a.external_ref = 'verify-k1'),
-  (select format('entered_by=%s', entered_by) from public.pay_adjustments where external_ref = 'verify-k1'));
+               where e.table_name = 'pay_adjustments' and e.action = 'INSERT' and a.external_ref = 'verify-k1'),
+  (select string_agg(e.event_type || '/' || e.action, ', ') from public.event_log e join public.pay_adjustments a on a.id::text = e.row_id where a.external_ref = 'verify-k1'));
+do $$ begin
+  update public.pay_adjustments set amount = 500 where external_ref = 'verify-k1';
+  perform pg_temp.r('K1c. an adjustment row is immutable (update refused, even for postgres)', false, 'updated');
+exception when others then perform pg_temp.r('K1c. an adjustment row is immutable (update refused, even for postgres)', true, sqlerrm); end $$;
+select pg_temp.r('K2b. the RLS insert policy and the trigger agree: the policy checks is_admin() (no owner condition)',
+  (select count(*) = 1 and bool_and(with_check like '%is_admin()%' and with_check not like '%payroll_owner%')
+     from pg_policies where tablename = 'pay_adjustments' and cmd = 'INSERT'),
+  (select string_agg(policyname || ': ' || with_check, '; ') from pg_policies where tablename = 'pay_adjustments' and cmd = 'INSERT'));
+select pg_temp.act('anon','agent.test@example.com');
+do $$ begin
+  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason) values ('Test', '2026-11-13', 'manual', 5, 'anon write');
+  reset role; perform pg_temp.r('K2c. anon is refused', false, 'insert succeeded');
+exception when others then reset role; perform pg_temp.r('K2c. anon is refused', true, sqlerrm); end $$;
+select pg_temp.act('authenticated','admin2.test@example.com');
+do $$ begin
+  perform public.recon_freeze_closed_weeks('2026-11-06', 'payroll_submit');
+  reset role; perform pg_temp.r('K3c. freezing weeks stays owner / postgres only (a non-owner admin is refused)', false, 'ran');
+exception when others then reset role; perform pg_temp.r('K3c. freezing weeks stays owner / postgres only (a non-owner admin is refused)', sqlerrm like '%owner or SQL Editor%', sqlerrm); end $$;
 select pg_temp.act('authenticated','admin2.test@example.com');
 do $$ begin
   update public.recon_pay_config set payroll_owner_user_id = auth.uid() where id;
