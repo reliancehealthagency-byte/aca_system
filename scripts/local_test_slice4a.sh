@@ -10,14 +10,18 @@ newdb(){ psql -q -d postgres -c "drop database if exists $1" -c "create database
   psql -q -d $1 -c "insert into auth.users(email) values ('admin.test@example.com'),('agent.test@example.com')" >/dev/null; }
 q(){ psql -X -At -v ON_ERROR_STOP=1 -d "$@" 2>/dev/null; }
 run(){ psql -X -q -v ON_ERROR_STOP=1 -d $1 -f $2 2>/dev/null; }
-passes(){ run $1 $2 | grep -cE '\| PASS'; }
-total(){ psql -X -q -d $1 -f $2 2>/dev/null | grep -cE '^ +[0-9]+ \| (PASS|FAIL)'; }
-fails(){ run $1 $2 | grep -E '\| FAIL' | tr -s ' ' | cut -c1-140 | paste -sd';'; }
+# each verify file runs ONCE per db (cached output); passes/total/fails read the cache
+VC=$(mktemp -d); trap 'rm -rf "$VC"' EXIT
+vout(){ local k="$VC/$1_$(basename $2)"; [ -f "$k" ] || psql -X -q -d $1 -f $2 > "$k" 2>&1; cat "$k"; }
+vreset(){ rm -f "$VC/$1_"*; }
+passes(){ vout $1 $2 | grep -cE '^ +[0-9]+ \| PASS'; }
+total(){ vout $1 $2 | grep -cE '^ +[0-9]+ \| (PASS|FAIL)'; }
+fails(){ vout $1 $2 | grep -E '\| FAIL|ERROR' | tr -s ' ' | cut -c1-140 | paste -sd';'; }
 S3=$(ls supabase/migrations/2026103119*.sql supabase/migrations/2026103120*.sql supabase/migrations/2026103121*.sql supabase/migrations/2026103122*.sql 2>/dev/null)
 L1=supabase/migrations/20261101100000_actuals_ledger.sql
 L2=supabase/migrations/20261101100100_closed_week_next_open_payday.sql
 L3=supabase/migrations/20261101100200_closed_week_autopay_on.sql
-HEALTH="select format('%s|%s|%s|%s', total, unbalanced, empty_transactions, unposted) from ledger_health"
+HEALTH="select format('%s|%s|%s|%s', total::int, unbalanced, empty_transactions, unposted) from ledger_health"
 TRUE="select md5(string_agg(row(t.*)::text, '|' order by line_key)) from premier_recon_trueup t"
 
 # U. live-like upgrade: everything live has today (slices 1-3) + mock data, then the slice-4a migrations one at a time
@@ -30,7 +34,7 @@ res "U2 closed-week migration applies; policy stays 'hold' (live behavior unchan
 n=$(passes $D supabase/tests/verify_slice3.sql); T3=$(total $D supabase/tests/verify_slice3.sql)
 res "U4 verify_slice3.sql all pass after 100000+100100 (policy hold)" "$([ $T3 -gt 0 ] && [ $n = $T3 ] && echo PASS || echo FAIL)" "$n/$T3 $(fails $D supabase/tests/verify_slice3.sql)"
 EV0=$(q $D -c "select count(*) from event_log where event_type = 'recon.config.decision'")
-psql -q -v ON_ERROR_STOP=1 -d $D -f $L3 >/dev/null 2>/tmp/t4u3.err; rc=$?
+psql -q -v ON_ERROR_STOP=1 -d $D -f $L3 >/dev/null 2>/tmp/t4u3.err; rc=$?; vreset $D
 res "U5 autopay-on migration: policy next_open_payday + one recon.config.decision event" "$([ $rc = 0 ] && [ "$(q $D -c 'select closed_week_policy from recon_pay_config where id')" = next_open_payday ] && [ "$(q $D -c "select count(*) from event_log where event_type = 'recon.config.decision'")" = $((EV0+1)) ] && echo PASS || echo FAIL)" "rc=$rc $(head -c 200 /tmp/t4u3.err)"
 n=$(passes $D supabase/tests/verify_slice4a.sql); T4=$(total $D supabase/tests/verify_slice4a.sql)
 res "U6 verify_slice4a.sql all pass after upgrade (slice-3 scenario + LG + CW)" "$([ $T4 -gt 0 ] && [ $n = $T4 ] && echo PASS || echo FAIL)" "$n/$T4 $(fails $D supabase/tests/verify_slice4a.sql)"
