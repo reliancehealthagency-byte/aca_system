@@ -109,6 +109,10 @@ Paid Lock tab, plus the hub's Lock Open Items tab (read-only, from the SAME read
   the actual switch; re-export both tabs right before it; until it is recorded, no backend submits for paydays the hub still pays.
   Paid Lock values are frozen after the import; later corrections go through `pay_adjustments`.
 - The older `csv_to_recon_sql.py --hub` path is superseded (it does not import open items, and after a cutover none can be added).
+- Roster prerequisite: the live dry run stays BLOCKED until the backend roster + `agent_name_aliases` are loaded (planned in
+  slice 4a/4c: the LIVE hub Agent Aliases tab plus the hub's code-only defaults).
+- Rollback of the migration: `supabase/rollback/hub_lock_open_items_rollback.sql` (SQL Editor; refused once the cutover has been
+  applied; otherwise restores the pre-migration schema exactly; run it before `slice3_rollback.sql`).
 - Read-only preflight: `supabase/deploy/hub_cutover_preflight.sql`. Tests: `scripts/local_test_hub_cutover.sh [REAL.csv]`
   (fresh local build of this tree; fake fixtures `supabase/tests/fixtures/hub_paid_lock_mock.csv`, `hub_lock_open_mock.csv`).
 

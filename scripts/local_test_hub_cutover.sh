@@ -222,6 +222,43 @@ mkapply $D --csv $FX --lock-open $T/open_c.csv; rc=$(run $D $T/apply_$D.sql)
 submit $D 2026-11-06; q $D -c "select premier_lock_payday('2026-11-06')" >/dev/null
 res "X6 control: the same confirmed line with NO open item is paid_by_hub (\$0), never locked" "$([ $rc = 0 ] && [ "$(pv $D)" = 'paid_by_hub|0|-|2026-10-23' ] && [ "$(locks $D)" = none ] && echo PASS || echo FAIL)" "$(pv $D)"
 
+
+# ---------- K. rollback of migration 20261101120000_hub_lock_open_items ----------
+RB=supabase/rollback/hub_lock_open_items_rollback.sql; MIG=supabase/migrations/20261101120000_hub_lock_open_items.sql
+dumps(){ pg_dump -s -d $1 | grep -vE '^\\(un)?restrict ' > $2; }
+D=hubcut_k1; psql -q -d postgres -c "drop database if exists $D" -c "create database $D" >/dev/null 2>&1
+psql -q -v ON_ERROR_STOP=1 -d $D -f supabase/tests/local_supabase_stub.sql >/dev/null 2>&1
+psql -q -d $D -c "insert into auth.users(email) values ('admin.test@example.com'),('agent.test@example.com'),('agent2.test@example.com')" >/dev/null
+for f in supabase/migrations/*.sql; do [ "$f" = $MIG ] && continue; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $f >/dev/null 2>&1 || echo "FAIL migration $f"; done
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed.sql >/dev/null 2>&1
+q $D -c "create schema if not exists supabase_migrations; create table if not exists supabase_migrations.schema_migrations (version text primary key, name text)" >/dev/null
+dumps $D $T/k_before.sql
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f $MIG >/dev/null 2>&1; q $D -c "insert into supabase_migrations.schema_migrations (version, name) values ('20261101120000', 'hub_lock_open_items')" >/dev/null
+{ echo "set role authenticated;"; cat $RB; } > $T/k_auth.sql; rc=$(run $D $T/k_auth.sql)
+res "K1 rollback refused for a non-postgres caller (SQL Editor only); nothing changed" "$([ $rc != 0 ] && grep -qE 'refused: run it in the SQL Editor|permission denied' $T/out && [ "$(q $D -c "select to_regclass('public.hub_lock_open_items') is not null")" = t ] && echo PASS || echo FAIL)" "$(err)"
+rc=$(run $D $RB); dumps $D $T/k_after.sql
+res "K2 rollback before any cutover: OK; pg_dump --schema-only identical to main before the migration (tables, views, functions, triggers, policies, grants); version row removed" "$([ $rc = 0 ] && grep -q 'rollback OK' $T/out && diff -q $T/k_before.sql $T/k_after.sql >/dev/null && [ "$(q $D -c "select count(*) from supabase_migrations.schema_migrations where version = '20261101120000'")" = 0 ] && echo PASS || echo FAIL)" "$(diff $T/k_before.sql $T/k_after.sql | grep -c '^[<>]') differing dump lines"
+rc=$(run $D $RB)
+res "K3 rollback again: refused (not applied), nothing changed" "$([ $rc != 0 ] && grep -q 'is not applied' $T/out && dumps $D $T/k_after2.sql && diff -q $T/k_before.sql $T/k_after2.sql >/dev/null && echo PASS || echo FAIL)" "$(err)"
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f $MIG >/dev/null 2>&1; rc1=$?; rc=$(run $D $RB); dumps $D $T/k_after3.sql
+res "K4 re-apply the migration after a rollback, then roll back again: still identical (repeatable)" "$([ $rc1 = 0 ] && [ $rc = 0 ] && diff -q $T/k_before.sql $T/k_after3.sql >/dev/null && echo PASS || echo FAIL)" ""
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f $MIG >/dev/null 2>&1
+q $D -c "insert into hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note) values (repeat('a', 64), 2, '2026-10-30', 'A Test', 1, 1, '2026-10-29 16:40 America/New_York', 'k5')" >/dev/null 2>$T/e; ins=$?
+rc=$(run $D $RB)
+res "K5 rollback refused when hub_paid_lock has rows (cutover started), nothing changed" "$([ $ins = 0 ] && [ $rc != 0 ] && grep -q 'cutover has been applied' $T/out && [ "$(q $D -c "select to_regclass('public.premier_recon_hub_open') is not null")" = t ] && echo PASS || echo FAIL)" "$(err) $(head -c 100 $T/e)"
+rc=$(run hubcut_t8 $RB)
+res "K6 rollback refused after a recorded cutover (APPLY done: hub_cutover + hub_paid_lock + open items), nothing changed" "$([ $rc != 0 ] && grep -q 'cutover has been applied' $T/out && [ "$(q hubcut_t8 -c "select (select count(*) from hub_cutover)||'|'||(select count(*) > 0 from hub_lock_open_items)||'|'||(pg_get_viewdef('premier_recon_trueup'::regclass) like '%hub_lock_open_items%')")" = '1|true|true' ] && echo PASS || echo FAIL)" "$(err) | state $(q hubcut_t8 -c "select (select count(*) from hub_cutover)||'|'||(select count(*) from hub_lock_open_items)")"
+python3 - "$RB" > $T/k7 <<'PY'
+import sys
+rb = open(sys.argv[1]).read()
+v = '\n'.join(open('supabase/migrations/20261031210100_premier_recon_views.sql').read().split('\n')[547:635])
+f = '\n'.join(open('supabase/migrations/20261031210200_premier_recon_rls_events.sql').read().split('\n')[465:498])
+ok = v.startswith('create or replace view public.premier_recon_trueup') and f.startswith('create or replace function public.premier_lock_payday') and v in rb and f in rb
+print('ok' if ok else 'drift')
+PY
+res "K7 the rollback's restored true-up / lock function are byte-copies of the slice-three migrations (drift guard)" "$([ "$(cat $T/k7)" = ok ] && echo PASS || echo FAIL)" "$(cat $T/k7)"
+psql -q -d postgres -c "drop database if exists hubcut_k1" >/dev/null 2>&1
+
 # ---------- R. the real file (optional): dry run on a fresh build + the mock board, nothing written ----------
 if [ -n "$REAL" ]; then
   RO=${REAL_OPEN:-$(dirname "$REAL")/lock_open_import.csv}; SN=$(dirname "$REAL")/snapshot.json
