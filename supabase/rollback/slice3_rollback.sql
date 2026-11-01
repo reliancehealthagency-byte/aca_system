@@ -320,3 +320,7 @@ do $$ begin
 end $$;
 
 commit;
+
+-- Tell PostgREST (the Supabase API) to reload its schema cache now, so the API stops serving the dropped objects and sees
+-- the recreated slice-two views immediately (Orchestrator rev-4 recommendation). Outside the transaction; harmless if repeated.
+notify pgrst, 'reload schema';

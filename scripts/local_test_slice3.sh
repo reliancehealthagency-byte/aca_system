@@ -51,6 +51,8 @@ mf="$PKG/slice3_package_manifest.txt"; mh=$(sed -n 's/^head //p' "$mf" 2>/dev/nu
 mok=PASS; [ "$mh" = "$(git rev-parse HEAD)" ] || mok=FAIL
 while read -r sha name; do [ "$(sha256sum < "$PKG/$name" | cut -d' ' -f1)" = "$sha" ] || mok=FAIL; done < <(sed -n 's/^sha256 //p' "$mf" 2>/dev/null)
 res "P2 package manifest: head = HEAD, every package sha matches, tree clean" "$([ $mok = PASS ] && [ -z "$dirty" ] && echo PASS || echo FAIL)" "manifest head=${mh:0:7} HEAD=$(git rev-parse --short HEAD) dirty=${dirty:-no}"
+nt=""; for f in "$PASTE" $RB "$PKG/slice3_rollback.sql"; do [ "$(grep -v '^[[:space:]]*$' "$f" | tail -1)" = "notify pgrst, 'reload schema';" ] || nt="$nt $(basename $f)"; done
+res "P3 paste and rollback (repo + package) end with: notify pgrst, 'reload schema';" "$([ -z "$nt" ] && echo PASS || echo FAIL)" "${nt:-all end with it}"
 rm -rf "$T0"
 
 # G. repo hygiene (rev 4): scratch SQL ignored, migrations/seeds not; no secret in tracked files or the package

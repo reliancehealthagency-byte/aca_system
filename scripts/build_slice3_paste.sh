@@ -14,5 +14,9 @@ out="${1:-/workspace/aca_system_deploy/slice3_paste.sql}"
   for f in supabase/migrations/2026103121*.sql; do echo; echo "-- ===== $f ====="; cat "$f"; done
   echo; cat supabase/deploy/slice3_record_migrations.sql
   echo; echo "commit;"
+  echo
+  echo "-- Tell PostgREST (the Supabase API) to reload its schema cache now, so /pl sees the new views and stops serving the"
+  echo "-- retired ones immediately (Orchestrator rev-4 recommendation). Final statement; harmless if repeated."
+  echo "notify pgrst, 'reload schema';"
 } > "$out"
 sha256sum "$out" | tee "$out.sha256"
