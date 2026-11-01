@@ -123,8 +123,11 @@ psql -X -q -d $D -f supabase/migrations/20261031210200_premier_recon_rls_events.
 ok=$(q $D -c 'select public.hub_open_items_schema_ok()')
 psql -X -q -d $D -c "\set ON_ERROR_STOP 1" -c "insert into pay_line_locks (line_key, component, payday, agent_name, amount) values ('X-P','commission','2026-11-06','X',1)" >/tmp/t4g2.out 2>&1; rc=$?
 res "P13 rerun guard: re-running the 10/31 lock function (20261031210200) after 4a makes #7's guard false and refuses locks" "$([ "$ok" = f ] && [ $rc != 0 ] && grep -q 'pay_line_locks REFUSED' /tmp/t4g2.out && echo PASS || echo FAIL)" "ok=$ok $(grep -o 'ERROR.*' /tmp/t4g2.out | head -1 | cut -c1-120)"
-psql -X -q -v ON_ERROR_STOP=1 -d $D -f $L2 >/tmp/t4g3.out 2>&1; rc=$?
-res "P14 re-running 4a's 20261101130100 restores the combined lock: guard true again (4a satisfies #7's rerun guard)" "$([ $rc = 0 ] && [ "$(q $D -c 'select public.hub_open_items_schema_ok()')" = t ] && echo PASS || echo FAIL)" "rc=$rc $(grep -m1 ERROR /tmp/t4g3.out)"
+# recovery (#7's own fix "re-run 20261101120000" is refused while 4a is applied, by #7's order guard): 4a rollback -> #7 -> 4a
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/rollback/slice4a_rollback.sql >/tmp/t4g3.out 2>&1; r1=$?
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f $P7M >>/tmp/t4g3.out 2>&1; r2=$?
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f "$PK/slice4a_paste.sql" >>/tmp/t4g3.out 2>&1; r3=$?
+res "P14 recovery after a 10/31 re-run with 4a applied: 4a rollback, re-run #7 (20261101120000), re-apply the 4a paste -> #7's guard true, combined definitions back" "$([ $r1 = 0 ] && [ $r2 = 0 ] && [ $r3 = 0 ] && [ "$(q $D -c "select public.hub_open_items_schema_ok() and strpos(pg_get_viewdef('premier_recon_trueup'::regclass), 'closed_week_carry_anchors') > 0")" = t ] && echo PASS || echo FAIL)" "rc=$r1/$r2/$r3 $(grep -m1 ERROR /tmp/t4g3.out)"
 # 4a without #7: refused cleanly
 D2=t4_no7; newdb $D2
 for f in $S3O supabase/seed.sql supabase/seed_slice2.sql supabase/seed_slice3_mock.sql; do psql -q -v ON_ERROR_STOP=1 -d $D2 -f $f >/dev/null 2>&1; done
