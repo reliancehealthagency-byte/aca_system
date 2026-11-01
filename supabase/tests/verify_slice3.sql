@@ -36,14 +36,14 @@ update public.recon_pay_config set one_time_fee_policy = 'pending_kyle' where id
 -- T0. slice-one LIKE claim, checked against Premier's REAL labels in the mock file (before loading: use the raw CSV labels)
 \ir ../seed_slice3_mock.sql
 \if :{?slice4a}
--- slice 4a: closed_week_policy is 'next_open_payday' once migration 20261101100200 ran (fresh build), else 'hold' (live today).
+-- slice 4a: closed_week_policy is 'hold' (fresh build, live) unless the manual autopay switch ran (next_open_payday).
 -- The scenario checks below were written against 'hold'; they run with it set explicitly (rolled back) and the carry is
 -- tested directly at the end (CW0-CW6).
 create temp table cw_start as
   select (select closed_week_policy from public.recon_pay_config where id) as policy,
          (select column_default from information_schema.columns where table_schema = 'public' and table_name = 'recon_pay_config' and column_name = 'closed_week_policy') as col_default;
 \endif
--- slice 4a: where the closed_week_policy column exists (20261101100100+), these checks run under 'hold' (rolled back).
+-- slice 4a: where the closed_week_policy column exists (20261101130100+), these checks run under 'hold' (rolled back).
 do $$ begin
   if exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'recon_pay_config' and column_name = 'closed_week_policy') then
     execute $q$update public.recon_pay_config set closed_week_policy = 'hold' where id$q$;

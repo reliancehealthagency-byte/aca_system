@@ -16,12 +16,12 @@ select pg_temp.r('LG3. hub-era paydays: the hub paid totals post once each (exp_
   (select coalesce(sum(paid_total), 0) from public.hub_paid_lock) = (select coalesce(sum(amount), 0) from public.ledger_lines where account = 'exp_rep_hub_paid')
   and (select count(*) from public.hub_paid_lock where paid_total <> 0) = (select count(*) from public.ledger_transactions where source_kind = 'hub_paid_lock'),
   (select format('hub=%s ledger=%s', (select sum(paid_total) from public.hub_paid_lock), (select sum(amount) from public.ledger_lines where account = 'exp_rep_hub_paid'))));
-select pg_temp.r('LG4. adjustments post only once their payday is submitted and after the cutover (hub-era rows are inside the hub totals, never twice)',
+select pg_temp.r('LG4. adjustments post only once their payday is LOCKED (pushed; not at submit) and after the cutover (hub-era rows are inside the hub totals, never twice)',
   not exists (select 1 from public.ledger_transactions t join public.pay_adjustments a on a.id = t.source_id
                where t.source_kind = 'pay_adjustment' and (a.payday <= (select last_hub_payday from public.hub_cutover)
-                     or not exists (select 1 from public.payroll_cutoffs c where c.payday = a.payday and c.source = 'submit')))
+                     or not exists (select 1 from public.pay_line_locks k where k.payday = a.payday)))
   and (select coalesce(sum(a.amount), 0) from public.pay_adjustments a where a.payday > (select last_hub_payday from public.hub_cutover)
-         and exists (select 1 from public.payroll_cutoffs c where c.payday = a.payday and c.source = 'submit'))
+         and exists (select 1 from public.pay_line_locks k where k.payday = a.payday))
       = (select coalesce(sum(amount), 0) from public.ledger_lines where account in ('exp_rep_adjustments', 'exp_rep_clawbacks')),
   (select format('posted=%s not posted=%s', count(*) filter (where exists (select 1 from public.ledger_transactions t where t.source_kind = 'pay_adjustment' and t.source_id = a.id)),
                  count(*) filter (where not exists (select 1 from public.ledger_transactions t where t.source_kind = 'pay_adjustment' and t.source_id = a.id))) from public.pay_adjustments a));
@@ -105,7 +105,7 @@ select pg_temp.r('LG14. corrections: credit 500 superseded by 450 then reversed 
   (select string_agg(source_kind || ':' || memo, '; ' order by id) from public.ledger_transactions where txn_date = '2026-11-02'));
 
 -- ======== slice 4a: closed-week rows on the NEXT OPEN payday (Kyle directive 11/01; Hub v19.11 L1771-1779) ========
-select pg_temp.r('CW0. closed_week_policy at start: next_open_payday once migration 20261101100200 ran (fresh build; column default next_open_payday), else hold (live today)',
+select pg_temp.r('CW0. closed_week_policy at start: hold (fresh build and live; next_open_payday only after the manual switch closed_week_autopay_on.sql)',
   (select case when col_default ~ 'next_open_payday' then policy = 'next_open_payday' else policy = 'hold' end from cw_start),
   (select format('policy=%s default=%s', policy, col_default) from cw_start));
 create temp table cw_before as
@@ -146,3 +146,108 @@ do $$ begin
   update public.closed_week_carry_anchors set payday = payday + 7 where true;
   perform pg_temp.r('CW6. carry anchors are immutable', false, 'updated');
 exception when others then perform pg_temp.r('CW6. carry anchors are immutable', sqlerrm like '%immutable%', sqlerrm); end $$;
+
+-- ======== slice 4a review fixes (Orchestrator 11/01 12:45 PM): drops on Friday, routine ledger check, Books owner-only ========
+select pg_temp.srv();
+insert into public.manual_entries (kind, source, entry_date, period, amount, note) values
+  ('deposit_box', 'allstate_earned', '2026-11-29', 'week', 100, 'VERIFY LG15 week of Sun 11/29'),
+  ('deposit_box', 'premier_book',    '2026-11-22', 'week', 40,  'VERIFY LG15 week of Sun 11/22');
+set constraints all immediate;
+select pg_temp.r('LG15. earned drops post on the Friday deposit date (week start + 5): week of Sun 11/29 -> Fri 12/04 = DECEMBER revenue; week of 11/22 -> Fri 11/27 (November)',
+  (select t.txn_date = '2026-12-04' from public.ledger_transactions t join public.manual_entries e on e.id = t.source_id
+    where t.source_kind = 'manual_entry' and e.note = 'VERIFY LG15 week of Sun 11/29')
+  and (select t.txn_date = '2026-11-27' from public.ledger_transactions t join public.manual_entries e on e.id = t.source_id
+    where t.source_kind = 'manual_entry' and e.note = 'VERIFY LG15 week of Sun 11/22')
+  and (select earned_total >= 100 from public.pl_actual_monthly where month_start = '2026-12-01')
+  and (select allstate_earned = 100 from public.pl_actual_weekly where week_start = '2026-11-29')
+  and (select confirmed_lines_match from public.pl_projected_vs_actual_weekly where week_start = '2026-11-29'),
+  (select string_agg(e.note || ' -> ' || t.txn_date, '; ') from public.ledger_transactions t join public.manual_entries e on e.id = t.source_id
+    where t.source_kind = 'manual_entry' and e.note like 'VERIFY LG15%'));
+select pg_temp.r('LG16. routine check: ledger_check() = true on a clean ledger, logs one ledger.check event, and a watermark exists',
+  public.ledger_check() and exists (select 1 from public.event_log where event_type = 'ledger.check' and (detail ->> 'ok')::boolean)
+  and exists (select 1 from public.ledger_watermarks));
+do $$ declare m text; begin
+  begin
+    alter table public.ledger_lines disable trigger user;
+    alter table public.ledger_transactions disable trigger user;
+    delete from public.ledger_lines where txn_id = (select max(id) from public.ledger_transactions);
+    delete from public.ledger_transactions where id = (select max(id) from public.ledger_transactions);
+    raise exception 'RESULT:%:%', (select missing_vs_watermark from public.ledger_health), public.ledger_check();
+  exception when others then m := sqlerrm; end;
+  perform pg_temp.r('LG17. tamper detection: postgres disabling the immutability triggers and deleting a transaction is caught (missing_vs_watermark > 0, ledger_check() false)',
+    m ~ '^RESULT:[1-9][0-9]*:f$', m);
+end $$;
+select pg_temp.act('authenticated','admin.test@example.com');
+create temp table lg_adm as select (select count(*) from public.ledger_transactions) tx, (select count(*) from public.pl_actual_weekly) wk,
+  (select count(*) from public.ledger_health) h;
+select pg_temp.srv();
+update public.recon_pay_config set payroll_owner_user_id = (select id from auth.users where email = 'admin.test@example.com') where id;
+select pg_temp.act('authenticated','admin.test@example.com');
+create temp table lg_own as select (select count(*) from public.ledger_transactions) tx, (select count(*) from public.pl_actual_weekly) wk;
+select pg_temp.srv();
+update public.recon_pay_config set payroll_owner_user_id = null where id;
+select pg_temp.r('LG18. Books are owner-only until 4c pay_admin: an admin who is not the payroll owner sees no ledger / actual P&L rows; the payroll owner does',
+  (select tx = 0 and wk = 0 and h = 0 from lg_adm) and (select tx > 0 and wk > 0 from lg_own),
+  (select format('admin tx=%s wk=%s | owner tx=%s wk=%s', a.tx, a.wk, o.tx, o.wk) from lg_adm a, lg_own o));
+
+-- ======== cutover prerequisites G1 / G2 / G4 (inside the clock: cutover 10/30) ========
+-- G2: a board row for a hub-era week (booked Wed 10/21 -> week payday 10/30 <= cutover) first seen now, with its Premier row
+insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count, is_mock, note)
+select kind, 'VERIFY G2 premier', repeat('2', 64), encoding, line_ending, header, 1, true, 'VERIFY' from public.recon_imports where kind='premier_member_products' limit 1;
+insert into public.premier_member_products (import_id, row_num, raw_fields)
+select (select id from public.recon_imports where file_name='VERIFY G2 premier'), 1,
+       (select array_agg(case when h = 'Member ID' then '687990999' else p.raw ->> h end order by o) from unnest(i.header) with ordinality u(h, o))
+  from public.premier_member_products p join public.recon_imports i on i.id = p.import_id
+ where p.member_id = '687990240' and p.product_label = 'AdvantCare 9' and i.file_name not like 'VERIFY%';
+select pg_temp.mk('VERIFY export G2 (hub-era late row)', repeat('3', 64));
+insert into public.board_submissions (import_id, row_num, raw_fields)
+select pg_temp.imp('VERIFY export G2 (hub-era late row)'), row_number() over (order by x.f[1]), x.f from (
+  (select distinct on (b.submission_key) b.raw_fields f from public.board_submissions b join public.recon_imports i on i.id = b.import_id
+    where i.finalized_at is not null and b.submission_key in (select l.k from pg_temp.latest() l)
+    order by b.submission_key, i.id desc)
+  union all select array['10/21/2026 11:00:00', '687990999'] || b.raw_fields[3:42] from public.board_submissions_current b where b.member_id = '687990240') x;
+select public.recon_finalize_board_import(pg_temp.imp('VERIFY export G2 (hub-era late row)'), true);   -- test: newest versions re-sent
+update public.recon_pay_config set closed_week_policy = 'hold' where id;
+create temp table g2_hold as select * from public.premier_recon_trueup where line_key = '20261021110000-P';
+update public.recon_pay_config set closed_week_policy = 'next_open_payday' where id;
+select pg_temp.r('G2a. hub-era late row under hold: held (pay NULL, held_hub_era_late_row), NOT a silent $0 paid_by_hub',
+  (select pay_commission is null and cutover_status is distinct from 'paid_by_hub' and hold_status = 'held_hub_era_late_row' from g2_hold),
+  (select format('pay=%s status=%s hold=%s', pay_commission, cutover_status, hold_status) from g2_hold));
+select pg_temp.r('G2b. hub-era late row under next_open_payday: carried to the next open payday (11/27), pays its commission, not paid_by_hub',
+  (select pay_commission > 0 and cutover_status is null and hold_status = 'hub_era_late_carried' and carried_commission_payday = '2026-11-27'
+     from public.premier_recon_trueup where line_key = '20261021110000-P'),
+  (select format('pay=%s status=%s hold=%s carried=%s', pay_commission, cutover_status, hold_status, carried_commission_payday)
+     from public.premier_recon_trueup where line_key = '20261021110000-P'));
+-- G1: S36 (687990331) was awaiting its first payment ($0) when 11/13 was submitted (never locked); Premier now shows it paid
+insert into public.recon_imports (kind, file_name, file_sha256, encoding, line_ending, header, row_count, is_mock, note)
+select kind, 'VERIFY G1 premier paid', repeat('4', 64), encoding, line_ending, header, 2, true, 'VERIFY' from public.recon_imports where kind='premier_member_products' limit 1;
+insert into public.premier_member_products (import_id, row_num, raw_fields)
+select (select id from public.recon_imports where file_name='VERIFY G1 premier paid'), row_number() over (),
+       (select array_agg(case h when 'Paid' then 'Yes' when 'Last Payment' then '1' when 'First Billing Date' then '11/02/2026'
+                                when 'Next Billing Date' then '12/02/2026' else p.raw ->> h end order by o) from unnest(i.header) with ordinality u(h, o))
+  from public.premier_member_products p join public.recon_imports i on i.id = p.import_id
+ where p.member_id = '687990331' and i.file_name not like 'VERIFY%';
+create temp table g1_before as select * from public.premier_recon_trueup where member_id = '687990331' and line_type = 'P';
+select pg_temp.r('G1a. Premier confirmed after its payday was submitted: the line is payable, flagged due_on_submitted_payday_unlocked, pays on 11/27 (next open payday)',
+  (select pay_commission > 0 and due_on_submitted_payday_unlocked and pays_on_payday = '2026-11-27' and not commission_locked from g1_before),
+  (select format('status=%s pay=%s unlocked_due=%s pays_on=%s', line_status, pay_commission, due_on_submitted_payday_unlocked, pays_on_payday) from g1_before));
+insert into public.payroll_cutoffs (payday, cutoff_at, source, note) values ('2026-11-27', '2026-11-25 14:30-05', 'submit', 'VERIFY submit 11/27')
+  on conflict (payday) do update set source = 'submit', cutoff_at = excluded.cutoff_at, note = excluded.note;
+create temp table g1_lk as select public.premier_lock_payday('2026-11-27') n1, public.premier_lock_payday('2026-11-27') n2;
+set constraints all immediate;
+select pg_temp.r('G1b. lock 11/27 pays it ONCE (commission lock on 11/27 = its amount; a second lock adds nothing); no $0 lock anywhere; the G2 late row also locks on 11/27',
+  (select count(*) = 1 and bool_and(k.payday = '2026-11-27' and k.amount = (select pay_commission from g1_before))
+     from public.pay_line_locks k join public.premier_recon_lines l on l.line_key = k.line_key where l.member_id = '687990331' and l.line_type = 'P' and k.component = 'commission')
+  and (select n2 = 0 from g1_lk) and not exists (select 1 from public.pay_line_locks where amount = 0)
+  and exists (select 1 from public.pay_line_locks where line_key = '20261021110000-P' and component = 'commission' and payday = '2026-11-27')
+  and (select not due_on_submitted_payday_unlocked from public.premier_recon_trueup where member_id = '687990331' and line_type = 'P'),
+  (select format('locked 11/27: %s (n2=%s)', string_agg(line_key || ':' || component || '=' || amount || ' [' || note || ']', ', '), (select n2 from g1_lk))
+     from public.pay_line_locks where payday = '2026-11-27'));
+-- G4: hub-era manual adjustments are refused on the app paths
+select pg_temp.act('authenticated','admin.test@example.com');
+do $$ begin
+  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason) values ('Alex Testagent (fake)', '2026-10-23', 'manual', 5, 'VERIFY G4 hub era');
+  perform pg_temp.r('G4. a manual adjustment dated on/before the last hub payday (10/23 <= 10/30) is refused for an admin (hub-era adjustments are never pay)', false, 'inserted');
+exception when others then perform pg_temp.r('G4. a manual adjustment dated on/before the last hub payday (10/23 <= 10/30) is refused for an admin (hub-era adjustments are never pay)',
+  sqlerrm like '%on or before the last hub payday%', sqlerrm); end $$;
+select pg_temp.srv();

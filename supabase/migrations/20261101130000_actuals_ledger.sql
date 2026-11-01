@@ -1,4 +1,4 @@
--- Slice 4a, part 1 of 3: the ACTUALS LEDGER (Kyle directive 11/01 11:26 AM ET, master-context "Foundation for next slices").
+-- Slice 4a, part 1 of 2: the ACTUALS LEDGER (Kyle directive 11/01 11:26 AM ET, master-context "Foundation for next slices").
 -- An immutable, double-entry ledger of CONFIRMED transactions only. The actual P&L is computed from it and nothing else;
 -- projections (the slice-three walk) never post here ("Projections never touch the balanced books").
 --
@@ -9,12 +9,16 @@
 --                             (reversing rows already carry -amount and post as themselves). Ledger net == current entries.
 --   overhead_entry(_superseded) monthly overhead by source name, same correction rules.
 --   pay_line_lock             finalized payroll per line + component (what payroll paid on a locked payday).
---   pay_adjustment            manual adjustments / true-ups / approved clawbacks on a SUBMITTED payday after the hub cutover
---                             (hub-era adjustments are inside the hub paid totals, never posted twice).
+--   pay_adjustment            manual adjustments / true-ups / approved clawbacks on a LOCKED (pushed) payday after the hub
+--                             cutover: they post when that payday's lock is written, not at the submit (Orchestrator 11/01).
+--                             Hub-era adjustments are inside the hub paid totals and are refused (G4), never posted.
 --   hub_paid_lock             pre-cutover paydays: the hub's locked paid total per agent (posted once the cutover exists).
 -- Not posted (by design): board estimates, Premier-corrected projections, OPEN / held lines, undecided clawback flags.
 -- Sign convention: ledger_lines.amount > 0 = debit, < 0 = credit. Every transaction sums to exactly 0 (deferred check).
--- Cash basis: revenue / costs hit cash on their entry date; payroll hits cash on its payday.
+-- Cash basis: revenue / costs hit cash on their entry date; payroll hits cash on its payday. Earned drops (deposit_box,
+-- period week: Allstate, Premier Book, O'Neil) post on the Friday deposit date = week start (Sun) + 5 (Kyle 11:55), so a
+-- week starting Sun 11/29 deposited Fri 12/4 is December revenue; Neo (monthly) posts on its entry date.
+-- Reads: the payroll owner and the SQL Editor only (ledger_can_read) until slice 4c's pay_admin role.
 
 create table if not exists public.ledger_accounts (
   code       text primary key check (code ~ '^[a-z0-9_]+$'),
@@ -70,6 +74,17 @@ comment on table public.ledger_transactions is
   'Actuals ledger (slice 4a): one row per posted source row, immutable. Drill-down: (source_kind, source_id) -> the source table row.';
 comment on table public.ledger_lines is 'Actuals ledger lines: amount > 0 debit, < 0 credit; each transaction sums to 0. Immutable.';
 
+-- Watermark (append-only): ledger size after every posting run. A row count / sum below the last watermark = rows were
+-- removed behind the immutability triggers (e.g. postgres disabling them): ledger_health / ledger_check() report it.
+create table if not exists public.ledger_watermarks (
+  id           bigint generated always as identity primary key,
+  at           timestamptz not null default now(),
+  transactions bigint not null,
+  lines        bigint not null,
+  abs_total    numeric(16,2) not null,
+  max_txn_id   bigint
+);
+
 -- Immutable: no update / delete / truncate for anyone (corrections are new source rows that post their own reversals).
 create or replace function public.ledger_immutable() returns trigger
 language plpgsql as $$
@@ -77,7 +92,7 @@ begin
   raise exception 'the actuals ledger is immutable (%): post a correcting source row instead', tg_table_name;
 end $$;
 do $$ declare t text; begin
-  foreach t in array array['ledger_transactions', 'ledger_lines', 'ledger_accounts'] loop
+  foreach t in array array['ledger_transactions', 'ledger_lines', 'ledger_accounts', 'ledger_watermarks'] loop
     execute format('drop trigger if exists %I_immutable on public.%I', t, t);
     execute format('create trigger %I_immutable before update or delete on public.%I for each row execute function public.ledger_immutable()', t, t);
     execute format('drop trigger if exists %I_no_truncate on public.%I', t, t);
@@ -127,15 +142,28 @@ language sql immutable as $$
   end
 $$;
 
+-- Ledger date of a manual entry: earned drops entered for a week post on its Friday deposit date (Sun + 5).
+create or replace function public.ledger_entry_date(p_kind text, p_period text, p_entry_date date) returns date
+language sql immutable as $$
+  select case when p_kind = 'deposit_box' and p_period = 'week'
+              then p_entry_date - extract(dow from p_entry_date)::int + 5 else p_entry_date end $$;
+
+-- Books reads: payroll owner (signed in, not the admin key) or the SQL Editor / internal definer functions. Invoker-rights.
+create or replace function public.ledger_can_read() returns boolean
+language sql stable set search_path = public, pg_temp as $$
+  select coalesce(current_user in ('postgres', 'supabase_admin')
+                  or (auth.uid() is not null and auth.uid() = public.recon_payroll_owner()
+                      and current_user <> 'service_role' and public.audit_actor_role() is distinct from 'service_role'), false) $$;
+
 -- Every confirmed source row not yet posted (drill-down + "nothing left behind" check). Admin / server roles only.
 create or replace view public.ledger_pending_sources with (security_invoker = true) as
 with cut as (select (select h.last_hub_payday from public.hub_cutover h) as cutover)
-select 'manual_entry'::text source_kind, e.id source_id, e.entry_date txn_date, e.amount,
+select 'manual_entry'::text source_kind, e.id source_id, public.ledger_entry_date(e.kind, e.period, e.entry_date) txn_date, e.amount,
        public.ledger_manual_account(e.kind, e.source) account, coalesce(e.source, e.kind) dimension, e.agent_name, null::text line_type,
        e.kind || coalesce(' ' || e.source, '') || coalesce(' (' || e.correction_kind || ' of #' || e.correction_of || ')', '') memo
   from public.manual_entries e where public.ledger_manual_account(e.kind, e.source) is not null
 union all
-select 'manual_entry_superseded', o.id, o.entry_date, -o.amount, public.ledger_manual_account(o.kind, o.source), coalesce(o.source, o.kind),
+select 'manual_entry_superseded', o.id, public.ledger_entry_date(o.kind, o.period, o.entry_date), -o.amount, public.ledger_manual_account(o.kind, o.source), coalesce(o.source, o.kind),
        o.agent_name, null, 'reversal: #' || o.id || ' superseded by #' || c.id
   from public.manual_entries o join public.manual_entries c on c.correction_of = o.id and c.correction_kind = 'supersede'
  where public.ledger_manual_account(o.kind, o.source) is not null
@@ -160,7 +188,7 @@ select 'pay_adjustment', a.id, a.payday, a.amount,
        'payroll adjustment ' || a.kind || ': ' || a.reason
   from public.pay_adjustments a, cut
  where cut.cutover is not null and a.payday > cut.cutover
-   and exists (select 1 from public.payroll_cutoffs c where c.payday = a.payday and c.source = 'submit')
+   and exists (select 1 from public.pay_line_locks k where k.payday = a.payday)   -- posts at lock / push, not at submit
 union all
 select 'hub_paid_lock', h.id, h.payday, h.paid_total, 'exp_rep_hub_paid', h.agent_name, h.agent_name, null,
        'hub paid total ' || h.agent_name || ' ' || h.payday
@@ -169,7 +197,7 @@ select 'hub_paid_lock', h.id, h.payday, h.paid_total, 'exp_rep_hub_paid', h.agen
 
 create or replace view public.ledger_unposted_sources with (security_invoker = true) as
 select p.* from public.ledger_pending_sources p
- where p.amount <> 0 and public.recon_can_read()
+ where p.amount <> 0 and public.ledger_can_read()
    and not exists (select 1 from public.ledger_transactions t where t.source_kind = p.source_kind and t.source_id = p.source_id);
 comment on view public.ledger_unposted_sources is 'Confirmed source rows not yet in the actuals ledger. Must be empty after every write (triggers post at once).';
 
@@ -192,6 +220,9 @@ begin
     insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
     values ('ledger.posted', public.audit_actor_uid(), public.audit_actor_role(), 'ledger_transactions', null, 'EVENT',
             jsonb_build_object('transactions', n));
+    insert into public.ledger_watermarks (transactions, lines, abs_total, max_txn_id)
+    select (select count(*) from public.ledger_transactions), (select count(*) from public.ledger_lines),
+           (select coalesce(sum(abs(amount)), 0) from public.ledger_lines), (select max(id) from public.ledger_transactions);
   end if;
   return n;
 end $$;
@@ -226,7 +257,7 @@ create or replace view public.ledger_trial_balance with (security_invoker = true
 select a.code account, a.name, a.type, coalesce(sum(l.amount) filter (where l.amount > 0), 0)::numeric(14,2) debits,
        coalesce(-sum(l.amount) filter (where l.amount < 0), 0)::numeric(14,2) credits, coalesce(sum(l.amount), 0)::numeric(14,2) balance
   from public.ledger_accounts a left join public.ledger_lines l on l.account = a.code
- where public.recon_can_read()
+ where public.ledger_can_read()
  group by a.code, a.name, a.type, a.sort order by a.sort;
 create or replace view public.ledger_health with (security_invoker = true) as
 select (select count(*) from public.ledger_transactions) transactions,
@@ -234,9 +265,31 @@ select (select count(*) from public.ledger_transactions) transactions,
        (select coalesce(sum(amount), 0) from public.ledger_lines)::numeric(14,2) total,
        (select count(*) from (select txn_id from public.ledger_lines group by txn_id having sum(amount) <> 0 or count(*) < 2) x) unbalanced,
        (select count(*) from public.ledger_transactions t where not exists (select 1 from public.ledger_lines l where l.txn_id = t.id)) empty_transactions,
-       (select count(*) from public.ledger_unposted_sources) unposted
- where public.recon_can_read();
-comment on view public.ledger_health is 'One row: the ledger always balances (total 0, unbalanced 0, empty 0) and nothing confirmed is unposted.';
+       (select count(*) from public.ledger_unposted_sources) unposted,
+       -- rows missing vs the last watermark (deleted behind the triggers)
+       (select greatest(w.transactions - (select count(*) from public.ledger_transactions), 0)
+              + greatest(w.lines - (select count(*) from public.ledger_lines), 0)
+          from public.ledger_watermarks w order by w.id desc limit 1) as missing_vs_watermark,
+       (select max(at) from public.ledger_watermarks) as last_watermark_at
+ where public.ledger_can_read();
+comment on view public.ledger_health is 'One row: the ledger balances (total 0, unbalanced 0, empty 0), nothing confirmed is unposted, nothing missing vs the last watermark. Recomputed on every read; ledger_check() is the routine check.';
+
+-- Routine check (Pulse refresh / daily routine / before each lock): recomputes ledger_health, logs ledger.check (ok or the
+-- failing counts) and returns ok. Owner or SQL Editor. Never repairs anything.
+create or replace function public.ledger_check() returns boolean
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare h record; ok boolean;
+begin
+  if not (public.recon_owner_or_break_glass() is true) then raise exception 'ledger_check: payroll owner or SQL Editor only'; end if;
+  select * into h from public.ledger_health;
+  ok := h.total = 0 and h.unbalanced = 0 and h.empty_transactions = 0 and h.unposted = 0
+        and coalesce(h.missing_vs_watermark, 0) = 0;
+  insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
+  values ('ledger.check', public.audit_actor_uid(), public.audit_actor_role(), 'ledger_transactions', null, 'EVENT',
+          jsonb_build_object('ok', ok, 'transactions', h.transactions, 'total', h.total, 'unbalanced', h.unbalanced,
+                             'empty', h.empty_transactions, 'unposted', h.unposted, 'missing_vs_watermark', h.missing_vs_watermark));
+  return ok;
+end $$;
 
 -- ---------- the ACTUAL P&L (from the ledger only) ----------
 -- Same shape as the projected walk, so the two read side by side. Rep pay = what was actually paid, on its payday.
@@ -245,7 +298,7 @@ select t.txn_date as day, (t.txn_date - extract(dow from t.txn_date)::int) as we
        a.pl_line, a.type, case when a.type = 'revenue' then -l.amount else l.amount end as amount,
        l.dimension, l.line_type, t.agent_name, t.source_kind, t.source_id, t.id as txn_id, t.memo
   from public.ledger_lines l join public.ledger_transactions t on t.id = l.txn_id join public.ledger_accounts a on a.code = l.account
- where a.pl_line is not null and public.recon_can_read();
+ where a.pl_line is not null and public.ledger_can_read();
 comment on view public.pl_actual_lines is
   'Every actual-P&L line from the ledger (revenue positive, Premier debits positive as a deduction, costs positive). Drill-down: source_kind / source_id. Admin only.';
 
@@ -271,7 +324,7 @@ select day, (day - extract(dow from day)::int) as week_start, date_trunc('month'
        (rep_commission + rep_spiffs + rep_abs + rep_adjustments + rep_clawbacks + rep_hub_paid)::numeric(12,2) as actual_rep_pay,
        ((credits - debits) + (transfers_ringba + transfers_acme) - lead_spend
         - (rep_commission + rep_spiffs + rep_abs + rep_adjustments + rep_clawbacks + rep_hub_paid))::numeric(12,2) as net
-  from w where public.recon_can_read();
+  from w where public.ledger_can_read();
 comment on view public.pl_actual_daily is
   'ACTUAL daily P&L from the ledger: (credits - debits) + transfer revenue - lead spend - rep pay actually paid (on its payday). Admin only.';
 
@@ -284,7 +337,7 @@ w as (select m.*, ws::date week_start, greatest(ws::date, m.month_start) - m.mon
         from m cross join generate_series(m.month_start - extract(dow from m.month_start)::int,
                                           (m.month_start + interval '1 month' - interval '1 day')::date, interval '7 days') ws)
 select week_start, month_start, source_name, (round(amount * d1 / dim, 2) - round(amount * d0 / dim, 2))::numeric(12,2) amount
-  from w where public.recon_can_read();
+  from w where public.ledger_can_read();
 
 create or replace view public.pl_actual_weekly with (security_invoker = true) as
 with dd as (select week_start, sum(credits) credits, sum(debits) debits, sum(credit_revenue) credit_revenue, sum(transfer_revenue) transfer_revenue,
@@ -305,7 +358,7 @@ select k.week_start, k.week_start + 6 as week_end,
        (coalesce(daily_net, 0) + coalesce(allstate_earned, 0) + coalesce(premier_book, 0) + coalesce(neo_book, 0) + coalesce(oneil_aca, 0)
         - coalesce(overhead, 0))::numeric(12,2) net
   from k left join dd using (week_start) left join e using (week_start) left join o using (week_start)
- where public.recon_can_read();
+ where public.ledger_can_read();
 comment on view public.pl_actual_weekly is 'ACTUAL weekly P&L (Sun-Sat) from the ledger: daily nets + earned lines - overhead (prorated by days, DEFAULT). Admin only.';
 
 create or replace view public.pl_actual_monthly with (security_invoker = true) as
@@ -322,7 +375,7 @@ select k.month_start, (k.month_start + interval '1 month' - interval '1 day')::d
        coalesce(overhead, 0)::numeric(12,2) overhead,
        (coalesce(daily_net, 0) + coalesce(earned_total, 0) - coalesce(overhead, 0))::numeric(12,2) net
   from k left join dd using (month_start) left join e using (month_start) left join o using (month_start)
- where public.recon_can_read();
+ where public.ledger_can_read();
 comment on view public.pl_actual_monthly is 'ACTUAL monthly P&L from the ledger: daily nets + earned lines of the month - full monthly overhead. Admin only.';
 
 -- ---------- the PROJECTED P&L: the slice-three walk, renamed for the dual-layer model (never trued up in place) ----------
@@ -345,18 +398,18 @@ select coalesce(p.week_start, a.week_start) week_start,
          = (coalesce(a.credit_revenue, 0), coalesce(a.transfer_revenue, 0), coalesce(a.total_spend, 0), coalesce(a.earned_total, 0), coalesce(a.overhead, 0))
          as confirmed_lines_match
   from public.pl_weekly_walk p full join public.pl_actual_weekly a on a.week_start = p.week_start
- where public.recon_can_read();
+ where public.ledger_can_read();
 comment on view public.pl_projected_vs_actual_weekly is
   'Projected vs actual per week: variance = projected rep pay - actual rep pay (timing / true-up); confirmed_lines_match must be true. Admin only.';
 
 -- ---------- security ----------
 do $$ declare t text; begin
-  foreach t in array array['ledger_accounts', 'ledger_transactions', 'ledger_lines'] loop
+  foreach t in array array['ledger_accounts', 'ledger_transactions', 'ledger_lines', 'ledger_watermarks'] loop
     execute format('alter table public.%I enable row level security', t);
     execute format('revoke all on public.%I from anon, public, authenticated, service_role', t);
     execute format('grant select on public.%I to authenticated', t);
     execute format('drop policy if exists %I_admin_read on public.%I', t, t);
-    execute format('create policy %I_admin_read on public.%I for select to authenticated using (public.is_admin())', t, t);
+    execute format('create policy %I_admin_read on public.%I for select to authenticated using (public.ledger_can_read())', t, t);
   end loop;
   foreach t in array array['ledger_pending_sources', 'ledger_unposted_sources', 'ledger_trial_balance', 'ledger_health', 'pl_actual_lines',
                            'pl_actual_daily', 'pl_actual_overhead_weekly', 'pl_actual_weekly', 'pl_actual_monthly', 'pl_projected_daily',
@@ -370,7 +423,9 @@ revoke execute on function public.ledger_post_pair(date, text, bigint, text, tex
   from public, anon, authenticated, service_role;
 revoke execute on function public.ledger_sync() from public, anon, service_role;
 grant execute on function public.ledger_sync() to authenticated;
-grant execute on function public.ledger_manual_account(text, text) to authenticated;
+grant execute on function public.ledger_manual_account(text, text), public.ledger_entry_date(text, text, date), public.ledger_can_read() to authenticated;
+revoke execute on function public.ledger_check() from public, anon, service_role;
+grant execute on function public.ledger_check() to authenticated;
 
 -- Backfill: post every confirmed row that already exists (live: the manual entries entered since slice three).
 select public.ledger_post_pending();
