@@ -83,6 +83,21 @@ npm install && npm run build && npm start
 ```
 `supabase/tests/local_supabase_stub.sql` lets the migrations run on a plain local Postgres for testing. **Never run it against the real project.**
 
+## One-time hub cutover (Paid Lock import)
+Layout (Kyle 11/01 11:55 AM ET, relayed): `Pay Friday | Agent | Paid Total | System Total | Locked At (ET) | Note`, the hub's
+Paid Lock tab. `scripts/hub_cutover.py`:
+- `build`: the tab read twice (UNFORMATTED serials + as displayed; both must agree) -> normalized CSV (ISO dates, cents,
+  Locked At to the minute in ET; the display hides the time). Real pay data never goes in this public repo (`--out` refuses).
+- `check`: rows and sums per payday, Paid vs System variances, duplicates, hub-roster and backend agent-id mapping, ET parsing,
+  System Total vs Finalized Paydays, hub Lock Open Items still open. Exit 1 on a hard error.
+- `sql --dry-run | --confirm-hub`: one SQL Editor paste = one DO block (one transaction). The dry run validates against the
+  live state and then raises, so nothing persists. Apply: payroll owner login or SQL Editor (postgres break-glass, audited by
+  `payroll.hub_cutover.recorded` + `payroll.hub_cutover.import`). Same file again = no-op; another file = refused; refused if
+  this system already locked a payday or submitted one after the file's last payday; in-DB re-check of duplicates, Fridays,
+  per-payday counts and sums.
+- Read-only preflight: `supabase/deploy/hub_cutover_preflight.sql`. Tests: `scripts/local_test_hub_cutover.sh [REAL.csv]`
+  (fresh local build of this tree; mock fixture `supabase/tests/fixtures/hub_paid_lock_mock.csv`).
+
 ## Seed data (fake)
 3 agents (1 admin, 2 agents), 10 contacts (`@example.com`, 555-01xx phones), 5 applications, 5 sales in the week of Sun 10/25 to Sat 10/31/2026:
 one at 38%, one with Wellness4You at 43%, one premium mismatch (board $150 vs Premier $140, paid on $140),

@@ -1,0 +1,8 @@
+Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note
+2026-10-30,Alex Testagent (fake),170.00,170.00,2026-10-29 16:40,MOCK desk submit
+2026-10-30,Blair Sample (fake),"$1,203.41",1203.41,2026-10-29 16:40,MOCK desk submit
+2026-10-23,Alex Testagent (fake),309.20,234.20,10/23/2026 11:23,MOCK paid +75 vs system
+2026-10-23,Blair Sample (fake),95.25,135.25,2026-10-23 11:23,MOCK paid -40 vs system
+2026-10-23,UNKNOWN,0.00,0.00,2026-10-23 11:23,MOCK $0 unknown row (kept like the hub)
+2026-10-16,Alex Testagent (fake),49.00,,10/19/2026,MOCK start line (date-only Locked At)
+2026-10-16,Blair Sample (fake),(12.50),,2026-10-19 15:58,MOCK negative paid total
