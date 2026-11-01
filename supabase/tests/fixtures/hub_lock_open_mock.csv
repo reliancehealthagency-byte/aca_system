@@ -1,0 +1,4 @@
+Line ID,Agent,Member ID,Type,Original Pay Friday,Est Commission,Status at Lock,Locked Through,Paid On,Note,Kind,Source
+20261005101010-600000001-P,Alex Testagent (fake),600000001,Premier,2026-10-09,98.40,Awaiting first payment,2026-10-16,,MOCK post date open at the 10/16 start line,post_date,lock_open_items_tab
+20261012101010-600000002-P,Blair Sample (fake),600000002,Premier,2026-10-23,367.65,Awaiting first payment,2026-10-23,2026-10-30,MOCK post date paid at the 10/30 lock,post_date,lock_open_items_tab
+20261019101010-600000003-P,Alex Testagent (fake),600000003,Premier,2026-10-23,0.00,pending PHS at lock,2026-10-23,,MOCK unconfirmed at the 10/23 lock,unconfirmed,hub_code_seed

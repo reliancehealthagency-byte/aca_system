@@ -9,7 +9,7 @@ CLIENT DATA (rev 3, Kyle 10/31 relayed via Orchestrator): ops is admin-only (Kyl
   database derives a normalized ops copy. Matching hashes: HMAC-sha256 with the salt in
   /workspace/secrets/recon_hash_salt.txt (0600, never committed, never printed); real imports refuse to run unsalted.
   --mock uses plain sha256 so the committed mock seed is reproducible.
-HUB CUTOVER (rev 3): --hub PAIDLOCK.csv = the hub "Paid Lock" tab (Pay Friday, Agent, Paid Total, Locked At (ET); optional
+HUB CUTOVER (rev 3, SUPERSEDED by scripts/hub_cutover.py, which also imports the Lock Open Items): --hub PAIDLOCK.csv = the hub "Paid Lock" tab (Pay Friday, Agent, Paid Total, Locked At (ET); optional
   System Total, Note). One-time: it starts this system's clock; every payday in it is paid_by_hub.
 BOARD EXPORTS (rev 3): the board import is FINALIZED at the end of the same transaction (recon_finalize_board_import). The
   database refuses a stale export (newest Timestamp older than the latest export's) and one that would revert a
