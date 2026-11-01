@@ -5,9 +5,9 @@
 #   TOKEN=XXXXXXXXXX scripts/hub_cutover_rebuild.sh PKG_DIR  # same, plus the APPLY sql bound to that dry-run token
 #
 # PKG_DIR/source/ must hold ONE read of the hub sheet (Sheets connector, read-only; never write to the sheet):
-#   paid_lock_unformatted.csv  paid_lock_formatted.csv  lock_open_items.csv  hub_code_seeds.csv
+#   paid_lock_unformatted.csv  paid_lock_formatted.csv  lock_open_items.csv  manual_adjustments_formatted.csv  cover_seeds.csv
 #   finalized_paydays_summary.csv  agent_sheets.csv  agent_aliases.csv
-# Outputs (0600, private: real pay data never goes in the repo): paid_lock_import.csv, lock_open_import.csv,
+# Outputs (0600, private: real pay data never goes in the repo): paid_lock_import.csv, lock_open_import.csv, adjustments_import.csv,
 # snapshot.json, checks.md, hub_cutover_dryrun.sql, [hub_cutover_apply.sql], hub_cutover_preflight.sql,
 # hub_lock_open_items_rollback.sql, manifest.txt.
 # Nothing here touches a database. The SQL files are pasted into the Supabase SQL Editor by the owner.
@@ -15,14 +15,15 @@ set -euo pipefail
 PKG=${1:?usage: hub_cutover_rebuild.sh PKG_DIR}; S=$PKG/source
 HERE=$(cd "$(dirname "$0")/.." && pwd); PY="python3 $HERE/scripts/hub_cutover.py"
 umask 077
-for f in paid_lock_unformatted.csv paid_lock_formatted.csv lock_open_items.csv hub_code_seeds.csv \
+for f in paid_lock_unformatted.csv paid_lock_formatted.csv lock_open_items.csv manual_adjustments_formatted.csv cover_seeds.csv \
          finalized_paydays_summary.csv agent_sheets.csv agent_aliases.csv; do
   [ -s "$S/$f" ] || { echo "missing $S/$f (re-export the hub tabs in ONE read first)" >&2; exit 2; }
 done
 $PY build --unformatted "$S/paid_lock_unformatted.csv" --formatted "$S/paid_lock_formatted.csv" --out "$PKG/paid_lock_import.csv" \
-    --lock-open-formatted "$S/lock_open_items.csv" --lock-open-out "$PKG/lock_open_import.csv" --hub-code-seeds "$S/hub_code_seeds.csv"
+    --lock-open-formatted "$S/lock_open_items.csv" --lock-open-out "$PKG/lock_open_import.csv" \
+    --adjustments-formatted "$S/manual_adjustments_formatted.csv" --adjustments-out "$PKG/adjustments_import.csv" --cover-seeds "$S/cover_seeds.csv"
 { $PY check --csv "$PKG/paid_lock_import.csv" --roster "$S/agent_sheets.csv" --aliases "$S/agent_aliases.csv" \
-      --finalized "$S/finalized_paydays_summary.csv" --lock-open "$PKG/lock_open_import.csv"
+      --finalized "$S/finalized_paydays_summary.csv" --lock-open "$PKG/lock_open_import.csv" --adjustments "$PKG/adjustments_import.csv"
   cat <<'MD'
 
 ### Runbook (one line)
@@ -38,14 +39,18 @@ At the switch only: re-export the hub tabs (one read) → `scripts/hub_cutover_r
 - That load is planned in slice 4a/4c: it loads the LIVE hub "Agent Aliases" tab **plus the code-only defaults** the hub adds when the tab doesn't map a name (`CODE_ALIASES_` / `CODE_DIALER_`; one agent resolves by code only, not the tab). Reference: `/workspace/artifacts/validation_1029/agent_name_map.md`.
 - Order at the switch: slice 4a/4c roster + aliases live → Premier board export loaded → re-export the tabs → rebuild → dry run.
 
+### Open items and hub adjustments (Orchestrator B-2)
+- Lock Open Items come from the tab only: the hub has no placeholder logic (v19.9-v19.11); a $0 pending line in a snapshot is only a rendering, so it is not imported.
+- Hub-era Manual Adjustments are NOT imported as pay (they are inside the Paid Lock totals). Every line-linked one (Covers column, or a hub code COVER_SEEDS_ match; the hard-coded wrong-ID links are ignored) is imported as a paid-elsewhere marker on that line component (`hub_paid_elsewhere`): the backend pays it $0 and never locks it, however spiffs are recomputed later. See the tables above (a spiff the hub paid via the 10/30 lock shows "paid 2026-10-30 via the lock").
+
 ### Rollback (schema only, before any cutover)
 `hub_lock_open_items_rollback.sql` undoes migration 20261101120000 (SQL Editor): refuses once the cutover has been applied (any hub_paid_lock row, a recorded hub_cutover, or imported open items); otherwise restores the pre-migration schema exactly (verified: pg_dump --schema-only identical). Run it before `slice3_rollback.sql`.
 MD
 } > "$PKG/checks.md"
-$PY sql --csv "$PKG/paid_lock_import.csv" --lock-open "$PKG/lock_open_import.csv" --snapshot "$PKG/snapshot.json" --dry-run --out "$PKG/hub_cutover_dryrun.sql"
+$PY sql --csv "$PKG/paid_lock_import.csv" --lock-open "$PKG/lock_open_import.csv" --adjustments "$PKG/adjustments_import.csv" --snapshot "$PKG/snapshot.json" --dry-run --out "$PKG/hub_cutover_dryrun.sql"
 rm -f "$PKG/hub_cutover_apply.sql"
 if [ -n "${TOKEN:-}" ]; then
-  $PY sql --csv "$PKG/paid_lock_import.csv" --lock-open "$PKG/lock_open_import.csv" --snapshot "$PKG/snapshot.json" \
+  $PY sql --csv "$PKG/paid_lock_import.csv" --lock-open "$PKG/lock_open_import.csv" --adjustments "$PKG/adjustments_import.csv" --snapshot "$PKG/snapshot.json" \
       --confirm-hub --dry-run-token "$TOKEN" --out "$PKG/hub_cutover_apply.sql"
 fi
 cp "$HERE/supabase/deploy/hub_cutover_preflight.sql" "$PKG/hub_cutover_preflight.sql"

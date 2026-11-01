@@ -1,15 +1,16 @@
 -- ROLLBACK for migration 20261101120000_hub_lock_open_items (hub Lock Open Items import + open-item exemption).
 -- ONE transaction: any error rolls the whole thing back. Run in the SQL Editor (postgres) only if the migration must be undone.
 -- What it does:
---   1. Refuses once the cutover has started: any hub_paid_lock row, a recorded hub_cutover row, or any hub_lock_open_items
---      row (open items are only ever written together with the cutover). Then nothing is changed. Also refuses a non-postgres
+--   1. Refuses once the cutover has started: any hub_paid_lock row, a recorded hub_cutover row, or any hub_lock_open_items /
+--      hub_paid_elsewhere row (only ever written together with the cutover); and when slice 4a is applied on top. Then nothing is changed. Also refuses a non-postgres
 --      caller (DDL; SQL Editor only).
 --   2. Restores the pre-migration schema exactly:
 --      - premier_recon_trueup and premier_lock_payday(date) back to their slice-three definitions (the blocks below are
 --        byte-copies of 20261031210100_premier_recon_views.sql and 20261031210200_premier_recon_rls_events.sql;
 --        create or replace keeps their grants, owner and comments, which the migration never changed);
---      - drops premier_recon_hub_open, the table hub_lock_open_items (its triggers and policy go with it) and
---        hub_lock_open_items_guard().
+--      - drops premier_recon_hub_open, the tables hub_lock_open_items and hub_paid_elsewhere (their triggers and
+--        policies go with them), their guard functions, and the rerun guard (trigger pay_line_locks_hub_schema_guard,
+--        pay_line_locks_hub_schema_guard(), hub_open_items_schema_ok()).
 --   3. Deletes version 20261101120000 from supabase_migrations.schema_migrations.
 --   4. Post-checks inside the transaction (raises = everything rolled back): no hub_lock_open_items objects left, the
 --      true-up and lock function no longer reference them, and the true-up column list is the slice-three one.
@@ -30,6 +31,13 @@ do $$ declare n bigint; begin
   if n > 0 then
     raise exception 'hub_lock_open_items rollback refused: the hub cutover has been applied (% hub_paid_lock / hub_cutover row(s)); the clock started', n;
   end if;
+  if to_regclass('public.closed_week_carry_anchors') is not null or to_regclass('public.ledger_accounts') is not null then
+    raise exception 'hub_lock_open_items rollback refused: slice 4a is applied on top; restoring the slice-three true-up / lock function would drop 4a''s carry';
+  end if;
+  if to_regclass('public.hub_paid_elsewhere') is not null then
+    execute 'select count(*) from public.hub_paid_elsewhere' into n;
+    if n > 0 then raise exception 'hub_lock_open_items rollback refused: % paid-elsewhere marker(s) in hub_paid_elsewhere; export them first', n; end if;
+  end if;
   execute 'select count(*) from public.hub_lock_open_items' into n;
   if n > 0 then
     raise exception 'hub_lock_open_items rollback refused: % imported open item(s) in hub_lock_open_items; export them first', n;
@@ -37,6 +45,9 @@ do $$ declare n bigint; begin
 end $$;
 
 drop view if exists public.premier_recon_hub_open;
+drop trigger if exists pay_line_locks_hub_schema_guard on public.pay_line_locks;
+drop function if exists public.pay_line_locks_hub_schema_guard();
+drop function if exists public.hub_open_items_schema_ok();
 
 -- ===== premier_recon_trueup: byte-copy of 20261031210100_premier_recon_views.sql =====
 create or replace view public.premier_recon_trueup with (security_invoker = true) as
@@ -165,6 +176,8 @@ end $$;
 
 drop table if exists public.hub_lock_open_items;
 drop function if exists public.hub_lock_open_items_guard();
+drop table if exists public.hub_paid_elsewhere;
+drop function if exists public.hub_paid_elsewhere_guard();
 
 do $$ begin
   if to_regclass('supabase_migrations.schema_migrations') is not null then
@@ -174,7 +187,10 @@ end $$;
 
 do $$ declare cols text; begin
   if to_regclass('public.hub_lock_open_items') is not null or to_regclass('public.premier_recon_hub_open') is not null
-     or exists (select 1 from pg_proc where proname = 'hub_lock_open_items_guard') then
+     or to_regclass('public.hub_paid_elsewhere') is not null
+     or exists (select 1 from pg_proc where proname in ('hub_lock_open_items_guard', 'hub_paid_elsewhere_guard',
+                                                         'hub_open_items_schema_ok', 'pay_line_locks_hub_schema_guard'))
+     or exists (select 1 from pg_trigger where tgname = 'pay_line_locks_hub_schema_guard') then
     raise exception 'hub_lock_open_items rollback post-check failed: objects left behind';
   end if;
   if pg_get_viewdef('public.premier_recon_trueup'::regclass) like '%hub_lock_open_items%'
