@@ -107,7 +107,18 @@ Paid Lock tab, plus the hub's Lock Open Items tab (read-only, from the SAME read
 - Hub-era Manual Adjustments are NOT imported as pay (they are inside the Paid Lock totals). Every line-linked one
   (Covers `pay|reverse|dup|claw spiff:<line>|comm:<line>`, or a cover-seed match) becomes a marker in `hub_paid_elsewhere`:
   that line component pays $0 in the backend (status `hub_paid_elsewhere`) and `premier_lock_payday` never locks it, however
-  spiffs are recomputed later. A line-linked adjustment on a payday after the last hub payday is refused (decide it first).
+  spiffs are recomputed later.
+- MUST RE-ENTER (B-3): every Manual Adjustments row dated after the last hub payday, line-linked or not (advance repays,
+  spot paybacks), was never paid by the hub and is NOT imported (neither pay nor marker). `build` writes `must_reenter.csv`
+  and refuses unless `--reenter-ack` lists each row exactly (Tab Row, Payday, Agent, Amount, Acknowledged By); both shas go
+  into `snapshot.json`, `sql` re-checks them and puts them in the dry-run token and the import event. A `REHEARSAL...` ack is
+  accepted for a dry run only; `--confirm-hub` refuses it. `check --must-reenter F --reenter-ack F` lists them.
+- Settled by hub: `premier_recon_clawbacks` shows `settled_by_hub` for a refund / void whose clawback payday is on/before
+  the cutover or whose commission the hub clawed by hand (`claw` marker); the event log says "settled by hub" instead of
+  "needs Kyle approve", and `pay_adjustments_hub_clawback_guard` refuses a `clawback_approved` for it (no second clawback).
+- Marker drift: `premier_recon_paid_elsewhere_drift` compares the hub-paid / clawed amount of each marked part with the
+  backend amount now; `differs` (a later add-on, a reinstatement) is logged once per amount
+  (`hub_cutover.paid_elsewhere_amount_differs`) for Kyle, never paid automatically.
 - Guards: migration 20261101120000 and the preflight refuse if slice 4a (20261101100000 / 20261101100100) is already
   applied (merge order #7 first; 4a rebased on top ships the combined view and lock function). If the 10/31 views / lock
   migrations are re-run after 20261101120000, `pay_line_locks_hub_schema_guard` refuses every payday lock (and the preflight

@@ -297,6 +297,248 @@ begin
   return n;
 end $$;
 
+-- SETTLED BY HUB (Orchestrator 11/01 should-fix 2): a refund / void whose clawback payday is on/before the cutover, or whose
+-- commission the hub clawed by hand (a 'claw' marker, e.g. tab row 9), was settled by the hub. It shows 'settled_by_hub'
+-- (never 'needs_kyle_approve') and a clawback_approved adjustment for it is refused, so it can't be clawed twice.
+create or replace view public.premier_recon_clawbacks with (security_invoker = true) as
+select x.*,
+       x.hub_era_date or x.hub_claw_marker as settled_by_hub,
+       case when x.hub_claw_marker then 'hub clawed it by hand (claw marker, tab row ' || x.claw_rows || ')'
+            when x.hub_era_date then 'clawback payday ' || x.clawback_pay_friday || ' is on/before the hub cutover ' || x.last_hub_payday
+       end as settled_reason,
+       case when x.hub_era_date or x.hub_claw_marker then 'settled_by_hub'
+            when exists (select 1 from public.pay_adjustments a where a.line_key = x.line_key and a.kind = 'clawback_approved') then 'approved'
+            else 'needs_kyle_approve' end as status
+  from (select l.line_key, l.hub_line_id, l.member_id, l.agent_name, l.line_status, l.clawback_proposed, l.clawback_pay_friday,
+               h.last_hub_payday,
+               coalesce(h.last_hub_payday is not null and l.clawback_pay_friday <= h.last_hub_payday, false) as hub_era_date,
+               m.rows is not null as hub_claw_marker, m.rows as claw_rows
+          from public.premier_recon_lines l
+          left join public.hub_cutover h on true
+          left join (select line_id, string_agg(distinct tab_row::text, ', ') rows from public.hub_paid_elsewhere
+                      where component = 'commission' and cover_kind = 'claw' group by line_id) m on m.line_id = l.hub_line_id
+         where l.clawback_proposed is not null and public.recon_can_read()) x;
+revoke all on public.premier_recon_clawbacks from public, anon, authenticated;
+grant select on public.premier_recon_clawbacks to authenticated;
+
+create or replace function public.pay_adjustments_hub_clawback_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare why text;
+begin
+  if new.kind = 'clawback_approved' then
+    select settled_reason into why from public.premier_recon_clawbacks where line_key = new.line_key and settled_by_hub;
+    if why is null and new.line_key is not null then      -- also when the line is not (or no longer) a proposed clawback
+      select coalesce(case when exists (select 1 from public.hub_paid_elsewhere p where p.line_id = l.hub_line_id
+                                         and p.component = 'commission' and p.cover_kind = 'claw') then 'hub claw marker' end,
+                      case when l.clawback_pay_friday <= (select last_hub_payday from public.hub_cutover) then 'clawback payday on/before the hub cutover' end)
+        into why from public.premier_recon_lines l where l.line_key = new.line_key;
+    end if;
+    if why is not null then
+      raise exception 'clawback_approved REFUSED for %: settled by hub (%); approving it would claw it a second time', new.line_key, why;
+    end if;
+  end if;
+  return new;
+end $$;
+drop trigger if exists pay_adjustments_hub_clawback_guard on public.pay_adjustments;
+create trigger pay_adjustments_hub_clawback_guard before insert on public.pay_adjustments
+  for each row execute function public.pay_adjustments_hub_clawback_guard();
+revoke execute on function public.pay_adjustments_hub_clawback_guard() from public, anon;
+
+-- MARKER DRIFT (should-fix 3): a marker zeroes the whole part for good. When the backend amount on a marked part differs
+-- from what the hub paid / clawed (a later add-on, a reinstatement), it is listed here (status 'differs') and logged once per
+-- amount by premier_log_recon_events (hub_cutover.paid_elsewhere_amount_differs) instead of being silently lost.
+-- hub_amount per line part: pay +amount, dup -amount (paid outside), claw -amount (clawed); a multi-line row is split evenly;
+-- 'reverse' rows only move money between agents (not counted). backend_amount: commission = actual_commission,
+-- spiffs = actual_spiffs (which already includes missed_spiffs).
+create or replace view public.premier_recon_paid_elsewhere_drift with (security_invoker = true) as
+with m as (select line_id, component, cover_kind, tab_row,
+                  amount / count(*) over (partition by file_sha256, tab_row) as per_line
+             from public.hub_paid_elsewhere where public.recon_can_read()),
+h as (select line_id, component,
+             sum(case cover_kind when 'pay' then per_line when 'dup' then -per_line when 'claw' then -per_line end) as hub_amount,
+             string_agg(tab_row || ' ' || cover_kind, ', ' order by tab_row) as hub_rows
+        from m group by 1, 2)
+select h.line_id as hub_line_id, l.line_key, l.agent_name, h.component, h.hub_rows, round(h.hub_amount, 2) as hub_amount,
+       case when l.line_key is null then null when h.component = 'commission' then coalesce(l.actual_commission, 0)
+            else coalesce(l.actual_spiffs, 0) end as backend_amount,
+       case when l.line_key is null or h.hub_amount is null then null
+            else (case when h.component = 'commission' then coalesce(l.actual_commission, 0)
+                       else coalesce(l.actual_spiffs, 0) end) - round(h.hub_amount, 2) end as difference,
+       case when l.line_key is null then 'board_line_not_loaded'
+            when h.hub_amount is null then 'reverse_only'
+            when abs((case when h.component = 'commission' then coalesce(l.actual_commission, 0)
+                           else coalesce(l.actual_spiffs, 0) end) - round(h.hub_amount, 2)) > 0.005 then 'differs'
+            else 'matches' end as status
+  from h left join public.premier_recon_lines l on l.hub_line_id = h.line_id;
+revoke all on public.premier_recon_paid_elsewhere_drift from public, anon, authenticated;
+grant select on public.premier_recon_paid_elsewhere_drift to authenticated;
+
+-- premier_log_recon_events: byte copy of 20261031210200 except the clawback flag (settled_by_hub, above) and the drift event.
+create or replace function public.premier_log_recon_events() returns int
+language plpgsql security definer set search_path = public, pg_temp as $$
+declare
+  r record; prev jsonb; cur jsonb; n int := 0; uid uuid := public.audit_actor_uid(); rl text := public.audit_actor_role();
+  base jsonb;
+begin
+  if not (public.is_admin() or rl in ('service_role', 'postgres', 'supabase_admin')) then
+    raise exception 'premier_log_recon_events: admin only';
+  end if;
+  perform public.premier_anchor_missed_spiffs();
+
+  for r in select * from public.premier_recon_lines
+            where line_type in ('P', 'PADD') and line_status not in ('duplicate_board_row', 'not_in_premier') loop
+    cur := jsonb_build_object('premium', r.premier_premium_incl_one_time, 'paid_status', r.paid_status,
+                              'pay_friday', r.commission_pay_friday, 'post_dated', r.premier_post_dated);
+    select state into prev from public.premier_recon_event_state where state_key = 'line:' || r.line_key;
+    base := coalesce(prev, jsonb_build_object('premium', r.board_premium, 'paid_status', 'board_claim',
+                                               'pay_friday', r.expected_pay_friday, 'post_dated', r.board_post_date));
+    if (base->>'premium') is distinct from (cur->>'premium')
+       and abs(coalesce((base->>'premium')::numeric, 0) - coalesce((cur->>'premium')::numeric, 0)) > 0.01 then
+      insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
+      values ('premium_mismatch', uid, rl, 'board_submissions', r.line_key, 'EVENT',
+              jsonb_build_object('source', 'premier_recon', 'line_key', r.line_key, 'member_id', r.member_id, 'agent', r.agent_name, 'attribution', 'unchanged',
+                                 'from', base->'premium', 'from_source', case when prev is null then 'board_claim' else 'premier_previous' end,
+                                 'to', cur->'premium', 'premier_excl_one_time', r.premier_premium_excl_one_time,
+                                 'paid_on', 'premier_premium', 'open_item', r.open_item));
+      n := n + 1;
+    end if;
+    if (base->>'paid_status') is distinct from (cur->>'paid_status')
+       and not (prev is null and r.paid_status in ('confirmed', 'confirmed_inactive')) then
+      insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
+      values ('premier.paid_status_diff', uid, rl, 'board_submissions', r.line_key, 'EVENT',
+              jsonb_build_object('member_id', r.member_id, 'agent', r.agent_name, 'from', base->'paid_status', 'to', cur->'paid_status',
+                                 'hold', r.hold_reasons, 'refund_pending', r.refund_pending));
+      n := n + 1;
+    end if;
+    if (base->>'pay_friday') is distinct from (cur->>'pay_friday') then
+      insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
+      values ('premier.pay_week_diff', uid, rl, 'board_submissions', r.line_key, 'EVENT',
+              jsonb_build_object('member_id', r.member_id, 'agent', r.agent_name, 'from', base->'pay_friday', 'to', cur->'pay_friday',
+                                 'premier_first_billing_date', r.premier_first_billing_date, 'keyed_off', 'premier_billing_date'));
+      n := n + 1;
+    end if;
+    if (base->>'post_dated') is distinct from (cur->>'post_dated') then
+      insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
+      values ('premier.post_date_diff', uid, rl, 'board_submissions', r.line_key, 'EVENT',
+              jsonb_build_object('member_id', r.member_id, 'agent', r.agent_name, 'from', base->'post_dated', 'to', cur->'post_dated',
+                                 'board_post_date', r.board_post_date, 'premier_first_billing_date', r.premier_first_billing_date));
+      n := n + 1;
+    end if;
+    insert into public.premier_recon_event_state(state_key, state, updated_at) values ('line:' || r.line_key, cur, now())
+    on conflict (state_key) do update set state = excluded.state, updated_at = now()
+      where premier_recon_event_state.state is distinct from excluded.state;
+  end loop;
+
+  -- one-off info items
+  for r in
+    select 'duplicate_board_row:' || line_key k, line_key ref,
+           jsonb_build_object('kind', 'duplicate_board_row', 'member_id', member_id, 'agent', agent_name, 'pay', 0,
+                              'note', 'same member already on an earlier board row; this row pays nothing') d
+      from public.premier_recon_lines where line_status = 'duplicate_board_row'
+    union all
+    select 'agent_ref:' || line_key, line_key,
+           jsonb_build_object('kind', 'premier_agent_label_differs', 'member_id', member_id, 'board_agent', agent_name,
+                              'premier_agent_label', premier_agent_label, 'attribution', 'unchanged (board)')
+      from public.premier_recon_lines
+     where premier_agent_label is not null and agent_name is not null and line_status <> 'duplicate_board_row'
+       and lower(regexp_replace(premier_agent_label, '^.*-\s*', '')) <> lower(agent_name)
+    union all
+    select 'addon_mismatch:' || line_key, line_key,
+           jsonb_build_object('kind', 'addon_mismatch', 'member_id', member_id, 'agent', agent_name,
+                              'board_answer', board_addon_answer, 'paid_on', 'premier_products',
+                              'note', case when board_addon_answer is null then 'board AO blank: Premier add-on on the original deal is paid (missed spiff caught)'
+                                           else 'board AO is a claim only; Premier products on the original deal decide +5% and spiffs' end)
+      from public.premier_recon_lines where board_vs_premier_products_differ and line_status <> 'duplicate_board_row'
+    union all
+    select 'blank_created:' || line_key, line_key,
+           jsonb_build_object('kind', 'blank_product_created_date', 'member_id', member_id, 'rows', blank_created,
+                              'note', 'product with no Created Date never counts toward the original deal (Q11 working rule)')
+      from public.premier_recon_lines where coalesce(blank_created, 0) > 0
+    union all
+    select 'open:' || line_key, line_key,
+           jsonb_build_object('kind', 'open_decision', 'member_id', member_id, 'agent', agent_name, 'open_item', open_item,
+                              'reading_a', open_alt_a_total, 'reading_b', open_alt_b_total, 'status', 'pending Kyle decision')
+      from public.premier_recon_open_items
+    union all
+    -- hub cutover (20261101120000): a hub-era clawback (date on/before the cutover, or clawed by hand via a hub 'claw' marker)
+    -- is settled by the hub: shown as such, never 'needs Kyle approve' (and a clawback_approved for it is refused)
+    select case when c.settled_by_hub then 'clawback_settled:' else 'clawback:' end || c.line_key, c.line_key,
+           case when c.settled_by_hub
+                then jsonb_build_object('kind', 'clawback_settled_by_hub', 'member_id', c.member_id, 'agent', c.agent_name,
+                                        'amount', c.clawback_proposed, 'payday', c.clawback_pay_friday, 'status', 'settled by hub',
+                                        'settled_reason', c.settled_reason)
+                else jsonb_build_object('kind', 'clawback_proposed', 'member_id', c.member_id, 'agent', c.agent_name, 'amount', c.clawback_proposed,
+                                        'payday', c.clawback_pay_friday, 'status', 'needs Kyle approve; spiffs kept') end
+      from public.premier_recon_clawbacks c
+    union all
+    -- a part marked paid elsewhere whose backend amount now differs from what the hub paid (later add-on / reinstatement)
+    select 'pe_drift:' || d.hub_line_id || ':' || d.component || ':' || d.backend_amount, coalesce(d.line_key, d.hub_line_id),
+           jsonb_build_object('kind', 'paid_elsewhere_amount_differs', 'hub_line_id', d.hub_line_id, 'component', d.component,
+                              'hub_amount', d.hub_amount, 'backend_amount', d.backend_amount, 'difference', d.difference,
+                              'status', 'review: the backend pays this part $0 (hub marker); the difference is not paid automatically')
+      from public.premier_recon_paid_elsewhere_drift d where d.status = 'differs'
+    union all
+    select 'abs_flag:' || line_key, line_key,
+           jsonb_build_object('kind', 'abs_amount_flag', 'member_id', member_id, 'agent', agent_name, 'amount', board_premium, 'items', abs_items)
+      from public.premier_recon_lines where abs_flagged
+    union all
+    select 'unmatched_premier:' || coalesce(member_id, 'blank:' || md5(coalesce(note, ''))), coalesce(member_id, 'blank'),
+           jsonb_build_object('kind', category, 'member_id', member_id, 'premier_agent_label_reference', premier_agent_label_reference,
+                              'premium', premier_premium, 'note', note)
+      from public.premier_recon_unmatched_premier where category <> 'cancelled_enrollment'
+    union all
+    select 'rerun:' || o.member_id || ':' || n.member_id, o.member_id,
+           jsonb_build_object('kind', 'possible_rerun', 'refunded_member_id', o.member_id, 'new_member_id', n.member_id,
+                              'note', 'flag only: the new ID is credited only if it is on the board')
+      from public.premier_member_status o
+      join public.premier_member_status n on n.member_id <> o.member_id
+       and (n.phone_sha256 = o.phone_sha256 or n.email_sha256 = o.email_sha256)
+       and n.member_created_date between o.member_created_date and o.member_created_date + (select rerun_match_days from public.recon_pay_config where id)
+     where o.paid_status = 'refunded' and n.paid_status in ('confirmed', 'confirmed_inactive')
+    union all
+    -- rev 3: only when the content really changed (an unchanged copy in a re-export logs nothing), once per new content
+    select 'revised:' || b.submission_key || ':' || md5(b.raw_fields::text), b.submission_key || '-P',
+           jsonb_build_object('kind', 'board_submission_revised', 'submission_key', b.submission_key, 'member_id', b.member_id,
+                              'agent', b.agent_name, 'versions', b.versions, 'current_import_id', b.import_id,
+                              'changed_columns', (select string_agg(public.recon_col_letter(g - 1), ',' order by g)
+                                                    from generate_series(1, cardinality(b.raw_fields)) g
+                                                   where b.raw_fields[g] is distinct from b.prev_raw_fields[g]),
+                              'note', 'a later board export changed this submission; only the latest version is paid')
+      from public.board_submissions_current b where b.changed_from_previous and not b.frozen
+    union all
+    select 'dropped:' || b.submission_key || ':' || b.latest_import_id, b.submission_key || '-P',
+           jsonb_build_object('kind', 'dropped_from_export', 'submission_key', b.submission_key, 'member_id', b.member_id,
+                              'agent', b.agent_name, 'last_import_id', b.import_id, 'latest_import_id', b.latest_import_id,
+                              'note', 'missing from the newest board export inside its Timestamp range (deleted or re-timestamped row). Flag only: its last version still pays; removing it is a manual Kyle correction')
+      from public.board_submissions_current b where b.dropped_from_export and not b.frozen
+    union all
+    select 'closed_week:' || b.submission_key || ':' || b.newest_id || ':' || b.dropped_from_export, b.submission_key || '-P',
+           jsonb_build_object('kind', 'closed_week_change', 'submission_key', b.submission_key, 'member_id', b.member_id,
+                              'agent', b.agent_name, 'week_payday', b.week_payday, 'frozen_board_id', b.id,
+                              'newest_board_id', b.newest_id, 'dropped', b.dropped_from_export,
+                              'note', 'a later export changed or removed a submission of a closed week: flag only, pay stays on the frozen version')
+      from public.board_submissions_current b where b.closed_week_change
+    union all
+    select 'added_closed:' || b.submission_key, b.submission_key || '-P',
+           jsonb_build_object('kind', 'added_to_closed_week', 'submission_key', b.submission_key, 'member_id', b.member_id,
+                              'agent', b.agent_name, 'week_payday', b.week_payday,
+                              'note', 'first seen in an already-closed week: held, never paid automatically (Kyle decides)')
+      from public.board_submissions_current b where b.added_to_closed_week
+  loop
+    if not exists (select 1 from public.premier_recon_event_state where state_key = 'info:' || r.k) then
+      insert into public.event_log(event_type, actor_uid, actor_role, table_name, row_id, action, detail)
+      values (case when r.d->>'kind' = 'addon_mismatch' then 'addon_mismatch'
+                   when r.d->>'kind' in ('closed_week_change', 'added_to_closed_week', 'dropped_from_export') then 'board.' || (r.d->>'kind')
+                   when r.d->>'kind' in ('clawback_settled_by_hub', 'paid_elsewhere_amount_differs') then 'hub_cutover.' || (r.d->>'kind')
+                   else 'premier.info' end,
+              uid, rl, 'board_submissions', r.ref, 'EVENT', r.d);
+      insert into public.premier_recon_event_state(state_key, state) values ('info:' || r.k, r.d);
+      n := n + 1;
+    end if;
+  end loop;
+  return n;
+end $$;
+
 -- RERUN GUARD (Orchestrator 11/01): re-running 20261031210100 (views) or 20261031210200 (lock function) puts back the
 -- slice-three true-up / lock function WITHOUT the open-item exemption and paid-elsewhere markers; payroll would then
 -- silently treat open items as paid_by_hub (and could pay a marked line again). While this migration is in place, no
@@ -307,6 +549,7 @@ language sql stable set search_path = public, pg_temp as $$
      and pg_get_viewdef('public.premier_recon_trueup'::regclass) like '%hub_paid_elsewhere%'
      and coalesce((select prosrc from pg_proc where oid = 'public.premier_lock_payday(date)'::regprocedure), '') like '%hub_lock_open_items%'
      and coalesce((select prosrc from pg_proc where oid = 'public.premier_lock_payday(date)'::regprocedure), '') like '%hub_paid_elsewhere%'
+     and coalesce((select prosrc from pg_proc where oid = 'public.premier_log_recon_events()'::regprocedure), '') like '%premier_recon_clawbacks%'
 $$;
 create or replace function public.pay_line_locks_hub_schema_guard() returns trigger
 language plpgsql set search_path = public, pg_temp as $$

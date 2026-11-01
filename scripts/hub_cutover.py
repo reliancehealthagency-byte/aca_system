@@ -8,11 +8,14 @@ Locked At (ET) | Note, exactly these six columns in this order (the hub's PAID_L
          --lock-open-formatted LOCK_OPEN.csv --lock-open-out lock_open_import.csv          (or --no-lock-open)
          --adjustments-formatted MANUAL_ADJ.csv --adjustments-out adjustments_import.csv
          --cover-seeds cover_seeds.csv (private)                                           (or --no-adjustments)
+         [--reenter-ack reenter_ack.csv]  required when Manual Adjustments rows are dated after the last hub payday
+                                          (MUST RE-ENTER: never imported; listed in must_reenter.csv; B-3)
          -> also snapshot.json (all shas); sql --snapshot is mandatory.
          RAW = the tab read with UNFORMATTED_VALUE (Sheets serials keep the Locked At time the display hides);
          FMT = the same tab as displayed. Both must agree (date, agent, money) or nothing is written.
   check  --csv paid_lock_import.csv [--roster agent_sheets.csv] [--aliases agent_aliases.csv]
          [--finalized finalized.csv] [--lock-open lock_open_items.csv] [--agents-sql "<psql args>"]
+         [--adjustments adjustments_import.csv] [--must-reenter must_reenter.csv --reenter-ack reenter_ack.csv]
          Prints the checks table (markdown). Exit 1 on any hard error.
   sql    --csv paid_lock_import.csv --lock-open F --adjustments F --snapshot snapshot.json
          (--dry-run | --confirm-hub --dry-run-token T) (--out FILE | --psql "<psql args>")
@@ -41,6 +44,12 @@ ADJ_HEADER = ['Tab Row', 'Line ID', 'Component', 'Cover Kind', 'Agent', 'Payday'
 # Covers column carries the right line). Kept in a private CSV (real member data stays out of this public repo):
 COVER_SEEDS_HEADER = ['Agent', 'Payday', 'Amount', 'Note Regex', 'Kind', 'Items']
 COVER_KINDS = ('pay', 'reverse', 'dup', 'claw')
+# B-3 (Orchestrator 11/01): every Manual Adjustments row dated AFTER the last hub payday (line-linked or not: spot paybacks,
+# advance repays, ...) was never paid by the hub, and is NOT imported. build lists them in must_reenter.csv and refuses
+# unless an ack file lists each one (Tab Row, Payday, Agent, Amount + who acknowledged); both shas go into snapshot.json and
+# sql re-checks them. 'REHEARSAL...' acks are accepted for a dry run only; --confirm-hub needs a real one.
+MUST_HEADER = ['Tab Row', 'Payday', 'Agent', 'Amount', 'Covers', 'Note']
+ACK_HEADER = ['Tab Row', 'Payday', 'Agent', 'Amount', 'Acknowledged By']
 LINE_RE = r'(\d{14})-([^-]+)-(P|PADD|ACA|ABS)'
 ET = ZoneInfo('America/New_York')
 REPO_ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -284,15 +293,20 @@ def build_adj(fmt_path, seeds_path, out_path, last_hub_payday):
     if [h.strip() for h in t[0]][:len(ADJ_HUB_HEADER)] != ADJ_HUB_HEADER:
         raise Refused(f'Manual Adjustments header is not the hub layout: {t[0]}')
     seeds = load_cover_seeds(seeds_path) if seeds_path else []
-    lines = []
+    lines, must = [], []
     for i, r in enumerate(t[1:], start=2):
         r = (r + [''] * 8)[:8]
         w = f'Manual Adjustments row {i}'
         ag, note, cc = re.sub(r'\s+', ' ', r[0].strip()), r[3].strip(), r[7].strip()
-        if not ag or not r[1].strip() or not r[2].strip():
+        if not r[1].strip() or not r[2].strip():         # the hub skips a row without Payday / Amount too
             continue
         d, amt = parse_day(r[1], w), money(r[2], w)
         if amt == 0:
+            continue
+        if friday_on_or_after(d) > last_hub_payday:       # B-3: the hub never paid it -> MUST RE-ENTER, never imported
+            must.append([str(i), friday_on_or_after(d).isoformat(), ag or '(blank)', f'{amt:.2f}', cc, note])
+            continue
+        if not ag:                                       # hub-era row with no agent: the hub skipped it
             continue
         kind = items = None; src = ''
         if cc:
@@ -317,13 +331,46 @@ def build_adj(fmt_path, seeds_path, out_path, last_hub_payday):
             typ, lid = it.split(':', 1)
             if typ.lower() not in ('spiff', 'comm') or not re.fullmatch(LINE_RE, lid):
                 raise Refused(f'{w}: cover item {it!r} is not spiff:<Line ID> / comm:<Line ID>')
-            if pf > last_hub_payday:
-                raise Refused(f'{w}: line-linked adjustment on {pf}, after the last hub payday {last_hub_payday}: the hub has '
-                              'not paid it; decide it before the cutover')
             lines.append([str(i), lid, 'spiffs' if typ.lower() == 'spiff' else 'commission', kind, ag, pf.isoformat(),
                           f'{amt:.2f}', src, note])
     write_private(out_path, ADJ_HEADER, lines)
-    return len(lines)
+    return lines, must
+
+
+def load_must(path):
+    t = read_csv(path)
+    if not t or [h.strip() for h in t[0]] != MUST_HEADER:
+        raise Refused(f'{path}: header must be exactly {" | ".join(MUST_HEADER)}')
+    return [dict(row=int(r[0]), payday=r[1], agent=r[2], amt=Decimal(r[3]), covers=r[4], note=r[5]) for r in t[1:]]
+
+
+def check_ack(must, ack_path, confirm=False):
+    """Every MUST RE-ENTER row must be listed (Tab Row, Payday, Agent, Amount) with who acknowledged it; nothing extra.
+    -> 'rehearsal' | 'acknowledged' | 'none needed'."""
+    if not must and not ack_path:
+        return 'none needed'
+    show = '; '.join(f"row {m['row']} {m['payday']} {m['agent']} {m['amt']:+.2f}" for m in must)
+    if not ack_path:
+        raise Refused(f'{len(must)} Manual Adjustments row(s) after the last hub payday are NOT imported and MUST be re-entered '
+                      f'in the backend: {show}. Write an ack file ({",".join(ACK_HEADER)}) listing each one and pass --reenter-ack')
+    t = read_csv(ack_path)
+    if not t or [h.strip() for h in t[0]] != ACK_HEADER:
+        raise Refused(f'{ack_path}: header must be exactly {" | ".join(ACK_HEADER)}')
+    acks, who = set(), set()
+    for i, r in enumerate(t[1:], start=2):
+        if len(r) != len(ACK_HEADER) or not r[4].strip():
+            raise Refused(f'{ack_path} line {i}: every row needs Tab Row, Payday, Agent, Amount and Acknowledged By')
+        acks.add((int(r[0]), r[1].strip(), r[2].strip(), money(r[3], f'{ack_path} line {i}')))
+        who.add(r[4].strip())
+    want = {(m['row'], m['payday'], m['agent'], m['amt']) for m in must}
+    if acks != want:
+        fm = lambda xs: '; '.join(f'row {x[0]} {x[1]} {x[2]} {x[3]:+.2f}' for x in sorted(xs)) or 'none'
+        raise Refused(f'{ack_path} does not list exactly the MUST RE-ENTER rows: not acknowledged: {fm(want - acks)}; '
+                      f'not on the list: {fm(acks - want)}')
+    reh = any(w.upper().startswith('REHEARSAL') for w in who)
+    if reh and confirm:
+        raise Refused(f'{ack_path} is a REHEARSAL ack: --confirm-hub needs Kyle\'s own acknowledgment of the MUST RE-ENTER rows')
+    return 'rehearsal' if reh else 'acknowledged'
 
 
 def load_adj(path, last_hub_payday=None):
@@ -359,7 +406,7 @@ def sha_of(f):
     return hashlib.sha256(open(f, 'rb').read()).hexdigest()
 
 
-def check_snapshot(path, csv_path, open_path, adj_path):
+def check_snapshot(path, csv_path, open_path, adj_path, confirm=False):
     """Mandatory: every import file must be the one build wrote in the same read; the hub code file still as hashed."""
     try:
         s = json.load(open(path))
@@ -372,12 +419,27 @@ def check_snapshot(path, csv_path, open_path, adj_path):
             continue
         if key not in s or sha_of(f) != s[key]['sha256']:
             raise Refused(f'{f} is not the {key} file of snapshot {path}: rebuild all from one read of the tabs')
+    re_info = None
+    if adj_path is not None:
+        mr = s.get('must_reenter')
+        if not mr:
+            raise Refused(f'snapshot {path} does not record must_reenter.csv (rebuild: B-3, rows after the last hub payday)')
+        if not os.path.exists(mr['file']) or sha_of(mr['file']) != mr['sha256']:
+            raise Refused(f"must_reenter {mr['file']} changed or missing since snapshot {path}: rebuild")
+        must = load_must(mr['file'])
+        ak = s.get('reenter_ack')
+        if ak and (not os.path.exists(ak['file']) or sha_of(ak['file']) != ak['sha256']):
+            raise Refused(f"re-enter ack {ak['file']} changed or missing since snapshot {path}: rebuild")
+        status = check_ack(must, ak['file'] if ak else None, confirm)
+        re_info = dict(rows=len(must), total=sum(m['amt'] for m in must), sha=mr['sha256'],
+                       ack_sha=ak['sha256'] if ak else None, status=status)
     cs = s.get('cover_seeds')
     if adj_path is not None and cs is None:
         raise Refused(f'snapshot {path} does not record the hub code cover seeds file (rebuild)')
     if cs and cs.get('sha256'):
         if not os.path.exists(cs['file']) or sha_of(cs['file']) != cs['sha256']:
             raise Refused(f"hub code cover seeds {cs['file']} changed or missing since snapshot {path}: rebuild")
+    return re_info
 
 
 def write_private(path, header, lines):
@@ -432,10 +494,14 @@ def cmd_build(a):
         if not a.cover_seeds and not a.no_cover_seeds:
             die('pass --cover-seeds (private CSV of the hub code COVER_SEEDS_, minus the wrong-ID links) or --no-cover-seeds')
         last = max(dt.date.fromisoformat(x[0]) for x in lines)
+        must_out = a.must_reenter_out or os.path.join(os.path.dirname(os.path.realpath(a.adjustments_out)), 'must_reenter.csv')
         try:
-            build_adj(a.adjustments_formatted, None if a.no_cover_seeds else a.cover_seeds, a.adjustments_out, last)
+            _, must = build_adj(a.adjustments_formatted, None if a.no_cover_seeds else a.cover_seeds, a.adjustments_out, last)
+            write_private(must_out, MUST_HEADER, must)
+            ack_status = check_ack(load_must(must_out), a.reenter_ack)
         except Refused as e:
-            die(str(e))
+            die(f'REFUSED (B-3): {e}' if 'MUST' in str(e) or 'ack' in str(e) else str(e))
+        print(f'MUST RE-ENTER: {len(must)} row(s), total {sum(Decimal(m[3]) for m in must):+.2f} ({ack_status})')
     elif not a.no_adjustments:
         die('pass --adjustments-formatted (the hub Manual Adjustments tab, read in the SAME pass) or --no-adjustments')
     snap = {'built_at_et': dt.datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S'),
@@ -448,6 +514,9 @@ def cmd_build(a):
         snap['adjustments'] = {'file': os.path.realpath(a.adjustments_out), 'sha256': sha_of(a.adjustments_out)}
         snap['cover_seeds'] = ({'file': os.path.realpath(a.cover_seeds), 'sha256': sha_of(a.cover_seeds)} if not a.no_cover_seeds
                                else {'file': None, 'sha256': None, 'note': '--no-cover-seeds'})
+        snap['must_reenter'] = {'file': os.path.realpath(must_out), 'sha256': sha_of(must_out), 'rows': len(must)}
+        if a.reenter_ack:
+            snap['reenter_ack'] = {'file': os.path.realpath(a.reenter_ack), 'sha256': sha_of(a.reenter_ack), 'status': ack_status}
     sp = os.path.join(os.path.dirname(os.path.realpath(a.out)), 'snapshot.json')
     fd = os.open(sp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as fh:
@@ -577,8 +646,12 @@ def cmd_check(a):
           f"{len(arows)} markers on {len({(r['line_id'], r['comp']) for r in arows})} line components. Not imported as pay "
           f"(already inside the Paid Lock totals); the marked component pays $0 in the backend and is never locked.\n")
         P('| Tab row | Payday | Agent | Kind | Line ID | Component | Amount | Source |\n|---:|---|---|---|---|---|---:|---|')
+        nrow = {}
+        for r in arows:
+            nrow[r['row']] = nrow.get(r['row'], 0) + 1
         for r in sorted(arows, key=lambda x: (x['payday'], x['row'])):
-            P(f"| {r['row']} | {r['payday']} | {r['agent']} | {r['kind']} | {r['line_id']} | {r['comp']} | {r['amt']:+,.2f} | {r['source']} |")
+            multi = f" (row total, {nrow[r['row']]} lines)" if nrow[r['row']] > 1 else ''
+            P(f"| {r['row']} | {r['payday']} | {r['agent']} | {r['kind']} | {r['line_id']} | {r['comp']} | {r['amt']:+,.2f}{multi} | {r['source']} |")
         P('\n**Per line component** (where the hub settled it; the backend pays it $0 from the cutover on):\n')
         P('| Line ID | Component | Hub adjustments | Settled |\n|---|---|---|---|')
         for lid, comp in sorted({(r['line_id'], r['comp']) for r in arows}):
@@ -595,9 +668,26 @@ def cmd_check(a):
             v = sum((r['paid'] - r['system']) for r in vr if r['payday'] == d and r['agent'] == ag)
             adj = [r for r in arows if r['payday'] == d and r['agent'] == ag]
             seen_rows = {}
-            for r in adj:
-                seen_rows.setdefault(r['row'], r)
-            P(f"| {d} | {ag} | {v:+,.2f} | " + ('; '.join(f"row {x['row']} {x['kind']} {x['amt']:+,.2f} ({x['line_id']})" for x in seen_rows.values()) or '—') + ' |')
+            for r in adj:                                  # one entry per tab row, listing EVERY line it covers
+                seen_rows.setdefault(r['row'], [r, []])[1].append(r['line_id'])
+            P(f"| {d} | {ag} | {v:+,.2f} | " + ('; '.join(f"row {x['row']} {x['kind']} {x['amt']:+,.2f} ({', '.join(ls)})"
+                                                           for x, ls in seen_rows.values()) or '—') + ' |')
+    if a.must_reenter:
+        try:
+            must = load_must(a.must_reenter)
+            st = check_ack(must, a.reenter_ack)
+        except Refused as e:
+            st = None; hard.append(f'MUST RE-ENTER not acknowledged: {e}')
+        tot = sum(m['amt'] for m in must)
+        P(f"\n**MUST RE-ENTER** (Manual Adjustments dated after the last hub payday {days[-1]}: the hub never paid them, the "
+          f"cutover does NOT import them; enter each one in the backend for its payday): **{len(must)} row(s), total {tot:+,.2f}**"
+          f" — ack: {st or 'MISSING / INCOMPLETE'}"
+          + (" (REHEARSAL ack: enough for a dry run; the APPLY needs Kyle's own ack)" if st == 'rehearsal' else '') + "\n")
+        P('| Tab row | Payday | Agent | Amount | Line-linked | Note |\n|---:|---|---|---:|---|---|')
+        for m in sorted(must, key=lambda x: (x['payday'], x['row'])):
+            P(f"| {m['row']} | {m['payday']} | {m['agent']} | {m['amt']:+,.2f} | {m['covers'] or 'no'} | {m['note']} |")
+        if not must:
+            P('| — | none | | | | |')
     P('\n**Duplicates** (Pay Friday + Agent, case-insensitive): none (the loader refuses any).')
     P(f"\n**Date parsing (ET)**: every Pay Friday is a Friday on/before today ET ({TODAY_ET}); Locked At is written as "
       f"`timestamp '<value>' at time zone 'America/New_York'` (no DateStyle dependence):")
@@ -619,7 +709,7 @@ def lit(s):
 MIGRATION = os.path.join(REPO_ROOT, 'supabase', 'migrations', '20261101120000_hub_lock_open_items.sql')
 
 
-def build_sql(path, confirm, today=None, open_path=None, adj_path=None, token=None):
+def build_sql(path, confirm, today=None, open_path=None, adj_path=None, token=None, reenter=None):
     sha, rows, warns = load(path, today)
     days = sorted({r['payday'] for r in rows})
     osha, orows = None, []
@@ -748,6 +838,8 @@ declare
   c_adj_sha   constant text := {lit(asha)};
   c_adj_rows  constant int := {len(arows)};
   c_token     constant text := {lit(token)};
+  c_re_sha    constant text := {lit(reenter and reenter['sha'])};
+  c_re_ack    constant text := {lit(reenter and reenter['ack_sha'])};
   cur record; b record; n int; v_open int; s numeric; bad text; unmapped text; frozen int; summary text; matched int := 0; ob int;
   pe_matched int := 0;
   fp text; tok text; blockers text;
@@ -785,7 +877,7 @@ begin
   -- N-1 dry run before confirm: the dry run prints a token = hash of both file shas + the live state it checked
   -- (hub tables, locks, submits, board / Premier loads, roster). The APPLY embeds that token and refuses unless the
   -- live state still hashes to it, i.e. this exact file was dry-run against this exact state. Nothing is written for it.
-  fp := md5(concat_ws('|', c_sha, coalesce(c_open_sha, '-'), coalesce(c_adj_sha, '-'),
+  fp := md5(concat_ws('|', c_sha, coalesce(c_open_sha, '-'), coalesce(c_adj_sha, '-'), coalesce(c_re_sha, '-'), coalesce(c_re_ack, '-'),
               (select count(*) from public.hub_cutover), (select count(*) from public.hub_paid_lock),
               (select count(*) from public.hub_lock_open_items), (select count(*) from public.hub_paid_elsewhere),
               (select count(*) || ':' || coalesce(max(id), 0) from public.pay_line_locks),
@@ -854,12 +946,18 @@ begin
                                                                    'matched_board_lines', matched),
                              'paid_elsewhere', jsonb_build_object('file_sha256', c_adj_sha, 'markers', c_adj_rows,
                                                                   'matched_board_line_components', pe_matched),
+                             'must_reenter', jsonb_build_object('file_sha256', c_re_sha, 'ack_sha256', c_re_ack,
+                                                                'rows', {reenter['rows'] if reenter else 0},
+                                                                'total', {f"{reenter['total']:.2f}" if reenter else '0'},
+                                                                'note', 'Manual Adjustments after the last hub payday: NOT imported; re-enter in the backend'),
                              'path', case when public.audit_actor_role() in ('postgres', 'supabase_admin')
                                           then 'break-glass:' || public.audit_actor_role() else 'owner-login' end,
                              'ruling', 'Kyle 11/01 11:55 AM ET (relayed by Orchestrator): Paid Lock layout for the one-time import'));
   end if;
-  summary := format('%s rows, %s paid, paydays %s, last_hub_payday %s, board submissions frozen %s, lock open items %s (%s still open, est %s; %s matched to loaded board lines), paid-elsewhere markers %s (%s matched), agent names with no backend agent id: %s',
-                    n, s, cur.paydays, cur.last_hub_payday, frozen, c_open_rows, c_open_open, c_open_est, matched, c_adj_rows, pe_matched, coalesce(unmapped, 'none'));
+  summary := format('%s rows, %s paid, paydays %s, last_hub_payday %s, board submissions frozen %s, lock open items %s (%s still open, est %s; %s matched to loaded board lines), paid-elsewhere markers %s (%s matched), MUST RE-ENTER %s, agent names with no backend agent id: %s',
+                    n, s, cur.paydays, cur.last_hub_payday, frozen, c_open_rows, c_open_open, c_open_est, matched, c_adj_rows, pe_matched,
+                    {lit(f"{reenter['rows']} row(s), total {reenter['total']:+.2f} ({reenter['status']}), not imported" if reenter else 'n/a (no adjustments file)')},
+                    coalesce(unmapped, 'none'));
   if c_dry and blockers is not null then
     raise exception 'HUB CUTOVER DRY RUN BLOCKED (rolled back, nothing written; no token): names with hub dollars and no backend roster agent / alias: %. Plan: %', blockers, summary;
   elsif c_dry then
@@ -893,11 +991,12 @@ def cmd_sql(a):
     try:
         if a.confirm_hub and not re.fullmatch(r'[0-9A-F]{10}', a.dry_run_token or ''):
             raise Refused('--confirm-hub needs --dry-run-token TOKEN: the 10-character token printed by the DRY RUN of this file')
-        sql, sha, rows, warns = build_sql(a.csv, a.confirm_hub, open_path=a.lock_open, adj_path=a.adjustments,
-                                          token=a.dry_run_token if a.confirm_hub else None)
+        build_sql(a.csv, a.confirm_hub, open_path=a.lock_open, adj_path=a.adjustments)   # file errors report first
         if not a.snapshot:      # mandatory (checked after the files themselves, so a bad file reports its own error)
             raise Refused('--snapshot snapshot.json (written by build) is mandatory: every import file must come from one read of the tabs')
-        check_snapshot(a.snapshot, a.csv, a.lock_open, a.adjustments)
+        re_info = check_snapshot(a.snapshot, a.csv, a.lock_open, a.adjustments, a.confirm_hub)
+        sql, sha, rows, warns = build_sql(a.csv, a.confirm_hub, open_path=a.lock_open, adj_path=a.adjustments,
+                                          token=a.dry_run_token if a.confirm_hub else None, reenter=re_info)
     except Refused as e:
         die(f'REFUSED: {e}')
     for w in warns:
@@ -925,9 +1024,11 @@ if __name__ == '__main__':
     b.add_argument('--adjustments-formatted', help='the hub Manual Adjustments tab as displayed (CSV)'); b.add_argument('--adjustments-out')
     b.add_argument('--cover-seeds', help='private CSV of the hub code COVER_SEEDS_ (header: ' + ','.join(COVER_SEEDS_HEADER) + ')')
     b.add_argument('--no-cover-seeds', action='store_true'); b.add_argument('--no-adjustments', action='store_true')
+    b.add_argument('--must-reenter-out', help='where to write must_reenter.csv (default: next to --adjustments-out)')
+    b.add_argument('--reenter-ack', help='ack file (' + ','.join(ACK_HEADER) + ') listing every MUST RE-ENTER row (B-3)')
     b.add_argument('--no-lock-open', action='store_true', help='build without the Lock Open Items tab (not for the real cutover)')
     c = sp.add_parser('check'); c.add_argument('--csv', required=True)
-    for o in ('--roster', '--aliases', '--finalized', '--lock-open', '--adjustments', '--agents-sql'):
+    for o in ('--roster', '--aliases', '--finalized', '--lock-open', '--adjustments', '--agents-sql', '--must-reenter', '--reenter-ack'):
         c.add_argument(o)
     s = sp.add_parser('sql'); s.add_argument('--csv', required=True); s.add_argument('--dry-run', action='store_true')
     s.add_argument('--confirm-hub', action='store_true'); s.add_argument('--out'); s.add_argument('--psql')
