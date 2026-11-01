@@ -59,7 +59,7 @@ n1=$(passes $D supabase/tests/verify.sql); n2=$(passes $D supabase/tests/verify_
 n3=$(passes $D supabase/tests/verify_slice3.sql); t3=$(total $D supabase/tests/verify_slice3.sql); n4=$(passes $D supabase/tests/verify_slice4a.sql); t4=$(total $D supabase/tests/verify_slice4a.sql)
 res "F1 fresh build: verify 24/24, slice2era, verify_slice3, verify_slice4a all pass" "$([ $n1 = 24 ] && [ $n2 = $t2 ] && [ $t3 -gt 0 ] && [ $n3 = $t3 ] && [ $t4 -gt 0 ] && [ $n4 = $t4 ] && echo PASS || echo FAIL)" "$n1/24, $n2/$t2, $n3/$t3, $n4/$t4 $(fails $D supabase/tests/verify_slice4a.sql)"
 res "F2 fresh build ledger empty + healthy (no confirmed sources yet)" "$([ "$(q $D -c "$HEALTH")" = '0|0|0|0' ] && echo PASS || echo FAIL)" "$(q $D -c "$HEALTH")"
-CH=$(git diff --name-only main -- supabase/migrations/2026103119*.sql supabase/migrations/2026103120*.sql supabase/migrations/2026103121*.sql supabase/seed*.sql supabase/rollback supabase/deploy | paste -sd,)
+CH=$(git diff --name-only main -- supabase/migrations/2026103119*.sql supabase/migrations/2026103120*.sql supabase/migrations/2026103121*.sql supabase/seed*.sql supabase/rollback/slice[23]_* supabase/deploy/slice[23]_* | paste -sd,)
 res "F3 slices 1-3 migrations, seeds, rollback and deploy files unchanged vs main" "$([ -z "$CH" ] && echo PASS || echo FAIL)" "${CH:-none changed}"
 for d in t4_up t4_fresh; do psql -q -d postgres -c "drop database if exists $d" >/dev/null 2>&1; done
 # P. SQL Editor package: preflight / depcheck / paste / re-run / rollback / autopay paste, on a live-like DB (main + mock data)
