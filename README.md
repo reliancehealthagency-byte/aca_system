@@ -83,6 +83,60 @@ npm install && npm run build && npm start
 ```
 `supabase/tests/local_supabase_stub.sql` lets the migrations run on a plain local Postgres for testing. **Never run it against the real project.**
 
+## One-time hub cutover (Paid Lock + Lock Open Items import)
+Layout (Kyle 11/01 11:55 AM ET, relayed): `Pay Friday | Agent | Paid Total | System Total | Locked At (ET) | Note`, the hub's
+Paid Lock tab, plus the hub's Lock Open Items tab (read-only, from the SAME read). `scripts/hub_cutover.py`:
+- `build`: Paid Lock read twice (UNFORMATTED serials + as displayed; both must agree) -> normalized CSV (ISO dates, cents,
+  Locked At to the minute in ET; the display hides the time). Lock Open Items -> normalized CSV (kind post_date | unconfirmed),
+  tab rows only (the hub has no placeholder logic; a $0 pending line in a snapshot is only a rendering). Manual Adjustments ->
+  paid-elsewhere markers (below), with the hub code `COVER_SEEDS_` from a private `--cover-seeds` CSV (the hard-coded
+  wrong-ID links are left out). Writes `snapshot.json` (every import sha + the cover seeds file sha). `sql --snapshot` is
+  MANDATORY and refuses files from different reads or a changed seeds file. Real pay data never goes in this public repo.
+- `check`: rows and sums per payday, Paid vs System variances, duplicates, hub-roster and backend agent-id mapping, ET parsing,
+  System Total vs Finalized Paydays, open items by agent. Exit 1 on a hard error.
+- `sql --dry-run | --confirm-hub --dry-run-token T`: one SQL Editor paste = one transaction (migration
+  `20261101120000_hub_lock_open_items` if not yet in place, SQL Editor only + one DO block). The dry run validates against the
+  live state, prints `DRY RUN TOKEN T` (file shas + live-state fingerprint) and raises, so nothing persists. APPLY refuses unless
+  T matches the live state now (dry-run-before-confirm, enforced in SQL without writing). Apply: payroll owner login (migration
+  applied beforehand) or SQL Editor (postgres break-glass), audited by `payroll.hub_cutover.recorded` + `payroll.hub_cutover.import`.
+  Same files again = no-op; another file = refused; refused if this system already locked a payday or submitted one after the
+  file's last payday; in-DB re-check of duplicates, Fridays, per-payday counts and sums.
+- Roster check (in SQL): every name carrying hub dollars or a still-open item must resolve to a backend agent or
+  `agent_name_aliases` row, else DRY RUN BLOCKED (no token) / APPLY refused. `UNKNOWN` at $0 is exempt. Board rows loaded
+  before the roster keep a NULL agent id (not back-filled by the cutover).
+- Hub-era Manual Adjustments are NOT imported as pay (they are inside the Paid Lock totals). Every line-linked one
+  (Covers `pay|reverse|dup|claw spiff:<line>|comm:<line>`, or a cover-seed match) becomes a marker in `hub_paid_elsewhere`:
+  that line component pays $0 in the backend (status `hub_paid_elsewhere`) and `premier_lock_payday` never locks it, however
+  spiffs are recomputed later.
+- MUST RE-ENTER (B-3): every Manual Adjustments row dated after the last hub payday, line-linked or not (advance repays,
+  spot paybacks), was never paid by the hub and is NOT imported (neither pay nor marker). `build` writes `must_reenter.csv`
+  and refuses unless `--reenter-ack` lists each row exactly (Tab Row, Payday, Agent, Amount, Acknowledged By); both shas go
+  into `snapshot.json`, `sql` re-checks them and puts them in the dry-run token and the import event. A `REHEARSAL...` ack is
+  accepted for a dry run only; `--confirm-hub` refuses it. `check --must-reenter F --reenter-ack F` lists them.
+- Settled by hub: `premier_recon_clawbacks` shows `settled_by_hub` for a refund / void whose clawback payday is on/before
+  the cutover or whose commission the hub clawed by hand (`claw` marker); the event log says "settled by hub" instead of
+  "needs Kyle approve", and `pay_adjustments_hub_clawback_guard` refuses a `clawback_approved` for it (no second clawback).
+- Marker drift: `premier_recon_paid_elsewhere_drift` compares the hub-paid / clawed amount of each marked part with the
+  backend amount now; `differs` (a later add-on, a reinstatement) is logged once per amount
+  (`hub_cutover.paid_elsewhere_amount_differs`) for Kyle, never paid automatically.
+- Guards: migration 20261101120000 and the preflight refuse if slice 4a (20261101100000 / 20261101100100) is already
+  applied (merge order #7 first; 4a rebased on top ships the combined view and lock function). If the 10/31 views / lock
+  migrations are re-run after 20261101120000, `pay_line_locks_hub_schema_guard` refuses every payday lock (and the preflight
+  and the cutover paste refuse) until 20261101120000 is re-run (`hub_open_items_schema_ok()`).
+- Open items: a still-open item (Paid On blank) is exempt from `paid_by_hub`: once Premier confirms, it shows as
+  `hub_open_item` in `premier_recon_trueup` and pays ONCE on the next open payday (post dates: commission; unconfirmed:
+  commission + spiffs), locked by `premier_lock_payday`. An item with Paid On set was paid by the hub and stays $0.
+- Rebuild at the switch: `scripts/hub_cutover_rebuild.sh PKG` (then `TOKEN=T` for the apply). Timing: no live cutover before
+  the actual switch; re-export both tabs right before it; until it is recorded, no backend submits for paydays the hub still pays.
+  Paid Lock values are frozen after the import; later corrections go through `pay_adjustments`.
+- The older `csv_to_recon_sql.py --hub` path is superseded (it does not import open items, and after a cutover none can be added).
+- Roster prerequisite: the live dry run stays BLOCKED until the backend roster + `agent_name_aliases` are loaded (planned in
+  slice 4a/4c: the LIVE hub Agent Aliases tab plus the hub's code-only defaults).
+- Rollback of the migration: `supabase/rollback/hub_lock_open_items_rollback.sql` (SQL Editor; refused once the cutover has been
+  applied; otherwise restores the pre-migration schema exactly; run it before `slice3_rollback.sql`).
+- Read-only preflight: `supabase/deploy/hub_cutover_preflight.sql`. Tests: `scripts/local_test_hub_cutover.sh [REAL.csv]`
+  (fresh local build of this tree; fake fixtures `supabase/tests/fixtures/hub_paid_lock_mock.csv`, `hub_lock_open_mock.csv`).
+
 ## Seed data (fake)
 3 agents (1 admin, 2 agents), 10 contacts (`@example.com`, 555-01xx phones), 5 applications, 5 sales in the week of Sun 10/25 to Sat 10/31/2026:
 one at 38%, one with Wellness4You at 43%, one premium mismatch (board $150 vs Premier $140, paid on $140),
