@@ -8,7 +8,7 @@ M=supabase/migrations/20261031220000_q30_one_time_fee_include.sql
 {
   echo "-- Q30 (Kyle direct 10/31 9:04 PM ET): include one-time fees in the commission premium. SQL Editor, as postgres (break-glass, audited)."
   echo "-- Changes ONE setting (recon_pay_config.one_time_fee_policy pending_kyle -> include) only if it is still pending_kyle; re-running is a no-op."
-  echo "-- Expected final grid: one row: one_time_fee_policy = include, column_default = include, migration_recorded = true, decision_events = 1."
+  echo "-- Expected final grid: one row: one_time_fee_policy = include, column_default_include = true, migration_recorded = true, decision_events = 1."
   echo "begin;"
   echo "do \$\$ begin"
   echo "  if to_regclass('public.recon_pay_config') is null then raise exception 'Q30: slice three is not applied'; end if;"
