@@ -368,7 +368,7 @@ select pg_temp.r('Q30. policy at start: include once migration 20261031220000 ra
                else policy = 'pending_kyle' and not q30_recorded and q30_events = q30_reverts end from q30_start),
   (select format('policy=%s default=%s recorded=%s applies=%s reverts=%s', policy, col_default, q30_recorded, q30_events, q30_reverts) from q30_start));
 -- C11d (Kyle direct 9:31 PM, "The whole thing is one rate so yes fee included"): under include the +5% add-on rate applies
--- to the fee-inclusive premium. Mock-style case: S03 (AdvantCare 3 + AWA SecureElite AME-AD&D, 43%, recurring 379.00) gets a
+-- to the fee-inclusive premium. Mock-style case: S04 (member 687990128, AdvantCare 3 + AWA SecureElite AME-AD&D, 43%, recurring 379.00) gets a
 -- 50.00 Enrollment Fee on AdvantCare 3 (a later import of the same product, raw rows are immutable) inside an undone block: include pays 43% x 429.00 = 184.47 (premier_premium = the paid-on base 429.00); exclude 43% x 379.00 = 162.97.
 do $$ declare inc text; exc text; begin
   begin
@@ -390,7 +390,7 @@ do $$ declare inc text; exc text; begin
   exception when others then
     if sqlerrm <> 'undo' then inc := 'error: ' || sqlerrm; end if;
   end;
-  perform pg_temp.r('C11d. (Kyle direct 9:31 PM, one rate, fee included) add-on deal with a one-time fee: include pays 43% of recurring + one-time (S03 + 50.00 Enrollment Fee: 0.43 x 429.00 = 184.47); exclude pays 0.43 x 379.00 = 162.97',
+  perform pg_temp.r('C11d. (Kyle direct 9:31 PM, one rate, fee included) add-on deal with a one-time fee: include pays 43% of recurring + one-time (S04 + 50.00 Enrollment Fee: 0.43 x 429.00 = 184.47); exclude pays 0.43 x 379.00 = 162.97',
     inc = '0.4300|429.00|429.00|184.47|184.47' and exc = '0.4300|379.00|429.00|162.97|162.97',
     format('include=%s exclude=%s', inc, exc));
 end $$;
