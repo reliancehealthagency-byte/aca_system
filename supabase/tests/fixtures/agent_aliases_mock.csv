@@ -1,0 +1,7 @@
+BOARD NAME ALIASES (name as typed on Sales Board -> standard name),,,"DIALER AGENT MAP (dialer ""Agent Name"" with extension -> standard name)",
+Alias,Standard Name,,Dialer Agent Name,Standard Name
+Jamie Mockford,Jamie Mockford,,Jamie 901,Jamie Mockford
+Jim Mockford,Jamie Mockford,,Pat 902,Pat Exampleton
+Pat Exampleton,Pat Exampleton,,Chris 903,Chris Testwell
+Old Timer,Old Timer,,,
+jimmy mockford,Pat Exampleton,,,
