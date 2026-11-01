@@ -9,6 +9,7 @@ REAL=${1:-}
 PY="python3 scripts/hub_cutover.py --today 2026-11-01"
 FX=supabase/tests/fixtures/hub_paid_lock_mock.csv
 FO=supabase/tests/fixtures/hub_lock_open_mock.csv
+FA=supabase/tests/fixtures/hub_paid_elsewhere_mock.csv
 PMOCK=${PMOCK:-/workspace/artifacts/premier_mock/MOCK_PHS_Member_Products_2026-10-31.csv}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 pass=0; fail=0
@@ -22,14 +23,33 @@ fresh(){ psql -q -d postgres -c "drop database if exists $1" -c "create database
   psql -X -q -v ON_ERROR_STOP=1 -d $1 -f supabase/seed.sql >/dev/null 2>&1 || echo "FAIL seed.sql"; }
 run(){ psql -X -q -v ON_ERROR_STOP=1 -d "$1" -f "$2" >"$T/out" 2>&1; echo $?; }
 err(){ grep -oE '(ERROR|NOTICE): +.*' "$T/out" | head -1 | cut -c1-150; }
+# --snapshot is mandatory for sql: tests stand in for build by writing a snapshot of the exact files passed (and default to
+# --no-adjustments when no --adjustments is given). The snapshot checks themselves are tested in group S with $PY sql.
+mksnap(){ python3 - "$@" <<'PY'
+import hashlib, json, os, sys
+keys = ('paid_lock', 'lock_open', 'adjustments'); s = {'built_at_et': 'test'}
+for k, f in zip(keys, sys.argv[1:4]):
+    if f:
+        s[k] = {'file': os.path.realpath(f), 'sha256': hashlib.sha256(open(f, 'rb').read()).hexdigest()}
+if sys.argv[3]:
+    s['cover_seeds'] = {'file': None, 'sha256': None, 'note': 'test'}
+print(json.dumps(s))
+PY
+}
+hcsql(){ local csv='' lo='' adj='' noadj='' a=("$@") i
+  for ((i=0; i<${#a[@]}; i++)); do case "${a[$i]}" in --csv) csv=${a[$((i+1))]};; --lock-open) lo=${a[$((i+1))]};;
+    --adjustments) adj=${a[$((i+1))]};; --no-adjustments) noadj=1;; esac; done
+  mksnap "$csv" "$lo" "$adj" > $T/snap_auto.json
+  if [ -z "$adj" ] && [ -z "$noadj" ]; then set -- "$@" --no-adjustments; fi
+  $PY sql "$@" --snapshot $T/snap_auto.json; }
 # dry run FILE-args on DB, then build the APPLY with the printed token -> $T/apply_$1.sql (token in $T/tok_$1)
-mkapply(){ local db=$1; shift; $PY sql "$@" --dry-run --out $T/dry_$db.sql 2>/dev/null
+mkapply(){ local db=$1; shift; hcsql "$@" --dry-run --out $T/dry_$db.sql 2>/dev/null
   psql -X -q -v ON_ERROR_STOP=1 -d $db -f $T/dry_$db.sql >$T/dryout_$db 2>&1
   grep -oE 'DRY RUN TOKEN [0-9A-F]{10}' $T/dryout_$db | awk '{print $4}' > $T/tok_$db
-  $PY sql "$@" --confirm-hub --dry-run-token "$(cat $T/tok_$db)" --out $T/apply_$db.sql 2>/dev/null; }
+  hcsql "$@" --confirm-hub --dry-run-token "$(cat $T/tok_$db)" --out $T/apply_$db.sql 2>/dev/null; }
 mkcsv(){ printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\n%s\n' "$2" > "$T/$1.csv"; echo "$T/$1.csv"; }
 refuse(){ # name csv expected-substring
-  $PY sql --csv "$2" --dry-run --no-lock-open --out "$T/x.sql" 2>"$T/e"; rc=$?
+  $PY sql --csv "$2" --dry-run --no-lock-open --no-adjustments --out "$T/x.sql" 2>"$T/e"; rc=$?
   res "$1" "$([ $rc != 0 ] && grep -q -- "$3" "$T/e" && echo PASS || echo FAIL)" "$(grep -o 'REFUSED.*' "$T/e" | cut -c1-120)"; }
 
 # ---------- L. file loader refusals (no DB) ----------
@@ -45,17 +65,17 @@ refuse "L9 Locked At outside Pay Friday-7 .. today" "$(mkcsv l9 '2026-10-30,A,1.
 refuse "L10 impossible date" "$(mkcsv l10 '2026-02-30,A,1.00,1.00,2026-02-27 10:00,x')" "not a real date"
 refuse "L11 blank row inside the file" "$(mkcsv l11 $'2026-10-30,A,1.00,1.00,2026-10-29 16:40,x\n,,,,,\n2026-10-30,B,1.00,1.00,2026-10-29 16:40,x')" "blank row"
 refuse "L12 blank agent" "$(mkcsv l12 '2026-10-30, ,1.00,1.00,2026-10-29 16:40,x')" "Agent is blank"
-$PY sql --csv $FX --dry-run --lock-open $FO --out supabase/x_hub.sql 2>"$T/e"; rc=$?
+hcsql --csv $FX --dry-run --lock-open $FO --out supabase/x_hub.sql 2>"$T/e"; rc=$?
 res "L13 generated SQL can't be written inside the git tree" "$([ $rc != 0 ] && [ ! -e supabase/x_hub.sql ] && grep -q 'inside the git tree' "$T/e" && echo PASS || echo FAIL)" ""
-$PY sql --csv $FX --lock-open $FO --out "$T/x.sql" 2>"$T/e"; rc=$?
+hcsql --csv $FX --lock-open $FO --out "$T/x.sql" 2>"$T/e"; rc=$?
 res "L14 sql needs exactly one of --dry-run / --confirm-hub" "$([ $rc != 0 ] && grep -q 'exactly one' "$T/e" && echo PASS || echo FAIL)" ""
 # build: unformatted (serials) vs formatted reads must agree
 printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\n46325,A Test,170,170,46324.694444444445,n\n46318,A Test,425.59000000000003,,46318.47430555556,n\n' > $T/u.csv
 printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\n2026-10-30,A Test,$170.00,$170.00,2026-10-29 16:40,n\n2026-10-23,A Test,$425.59,,10/23/2026,n\n' > $T/f.csv
-$PY build --unformatted $T/u.csv --formatted $T/f.csv --out $T/b.csv --no-lock-open >/dev/null 2>&1; rc=$?
+$PY build --unformatted $T/u.csv --formatted $T/f.csv --out $T/b.csv --no-lock-open --no-adjustments >/dev/null 2>&1; rc=$?
 res "B1 build: serials -> ISO dates, cents, Locked At time recovered from the serial (display showed date only)" "$([ $rc = 0 ] && grep -q '^2026-10-23,A Test,425.59,,2026-10-23 11:23,n$' $T/b.csv && grep -q '^2026-10-30,A Test,170.00,170.00,2026-10-29 16:40,n$' $T/b.csv && [ "$(stat -c %a $T/b.csv)" = 600 ] && echo PASS || echo FAIL)" "$(sed -n 3p $T/b.csv)"
 sed -i 's/\$425.59/$425.60/' $T/f.csv
-$PY build --unformatted $T/u.csv --formatted $T/f.csv --out $T/b2.csv --no-lock-open >/dev/null 2>"$T/e"; rc=$?
+$PY build --unformatted $T/u.csv --formatted $T/f.csv --out $T/b2.csv --no-lock-open --no-adjustments >/dev/null 2>"$T/e"; rc=$?
 res "B2 build refuses when the two reads disagree (money)" "$([ $rc != 0 ] && [ ! -e $T/b2.csv ] && grep -q 'money differs' "$T/e" && echo PASS || echo FAIL)" ""
 $PY check --csv $FX > "$T/chk"; rc=$?
 res "C1 check on the mock file: per-payday rows / sums / variances / ET times" "$([ $rc = 0 ] && grep -q '| 2026-10-23 | 3 | 404.45 | 369.45 | +35.00 |' $T/chk && grep -q '| 2026-10-16 | 2 | 36.50 | — | n/a | 2026-10-19 00:00, 2026-10-19 15:58 |' $T/chk && grep -q '2 different Locked At values' $T/chk && grep -q '2026-10-16 → locked 2026-10-19 00:00 ET = 2026-10-19 04:00 UTC' $T/chk && echo PASS || echo FAIL)" "$(grep -c '' $T/chk) lines"
@@ -68,7 +88,7 @@ $PY check --csv $FX --roster $T/roster.csv > "$T/chk3"; rc=$?
 res "C3 an agent carrying dollars who is not on the roster is a HARD error (exit 1)" "$([ $rc = 1 ] && grep -q "agent 'Blair Sample (fake)' is not on the hub roster and carries 1286.16" $T/chk3 && echo PASS || echo FAIL)" ""
 # ---------- D. database: fresh build of this tree ----------
 D=hubcut_t1; fresh $D
-$PY sql --csv $FX --lock-open $FO --dry-run --out $T/dry.sql 2>/dev/null
+hcsql --csv $FX --lock-open $FO --dry-run --out $T/dry.sql 2>/dev/null
 mkapply $D --csv $FX --lock-open $FO; cp $T/apply_$D.sql $T/apply.sql
 EV0=$(q $D -c "select count(*) from event_log")
 rc=$(run $D $T/dry.sql)
@@ -94,7 +114,7 @@ rc=$(run $D $T/apply.sql)
 res "D9 re-running the same APPLY is a no-op (notice; rows, cutover and event_log unchanged)" "$([ $rc = 0 ] && grep -q 'already recorded from this file' $T/out && [ "$(q $D -c 'select count(*) from hub_paid_lock')" = 7 ] && [ "$(q $D -c 'select count(*) from event_log')" = $EV1 ] && echo PASS || echo FAIL)" "$(err)"
 rc=$(run $D $T/dry.sql)
 res "D10 dry run after it is recorded says so (nothing to do)" "$([ $rc != 0 ] && grep -q 'DRY RUN: already recorded from this file' $T/out && echo PASS || echo FAIL)" ""
-sed 's/MOCK desk submit/MOCK desk submit edited/' $FX > $T/other.csv; $PY sql --csv $T/other.csv --lock-open $FO --confirm-hub --dry-run-token ABCDEF0123 --out $T/other.sql 2>/dev/null
+sed 's/MOCK desk submit/MOCK desk submit edited/' $FX > $T/other.csv; hcsql --csv $T/other.csv --lock-open $FO --confirm-hub --dry-run-token ABCDEF0123 --out $T/other.sql 2>/dev/null
 rc=$(run $D $T/other.sql)
 res "D11 a different file after the cutover is refused (one-time, immutable)" "$([ $rc != 0 ] && grep -q 'already recorded from another file' $T/out && [ "$(q $D -c 'select count(*) from hub_paid_lock')" = 7 ] && echo PASS || echo FAIL)" "$(err)"
 rc=$(q $D -c "update hub_paid_lock set paid_total = 1 where row_num = 1" >/dev/null 2>&1; echo $?); rc2=$(q $D -c "delete from hub_cutover" >/dev/null 2>&1; echo $?)
@@ -138,7 +158,7 @@ mkapply $D --csv $FX --lock-open $FO; rc=$(run $D $T/apply_$D.sql)
 res "D20 with the mock board loaded: weeks through 10/30 frozen (reason hub_cutover); cutover_pending_kyle lines become paid_by_hub" "$([ $rc = 0 ] && [ "$(q $D -c "select count(*) from board_week_freezes where reason='hub_cutover'")" -gt 0 ] && [ "$(q $D -c "select count(*) from premier_recon_trueup where cutover_status = 'cutover_pending_kyle'")" = 0 ] && [ "$(q $D -c "select count(*) from premier_recon_trueup where cutover_status = 'paid_by_hub'")" -gt 0 ] && echo PASS || echo FAIL)" "$(grep -o 'board submissions frozen [0-9]*' $T/out) pending $PEND0 -> $(q $D -c "select count(*) from premier_recon_trueup where cutover_status = 'cutover_pending_kyle'"), paid_by_hub $(q $D -c "select count(*) from premier_recon_trueup where cutover_status = 'paid_by_hub'")"
 D=hubcut_t7; fresh $D
 q $D -c "insert into payroll_cutoffs (payday, cutoff_at, source, note) values ('2026-10-16', '2026-10-15 14:00 America/New_York', 'submit', 'test')" >/dev/null
-$PY sql --csv $FX --lock-open $FO --dry-run --out $T/d21.sql 2>/dev/null; rc=$(run $D $T/d21.sql)
+hcsql --csv $FX --lock-open $FO --dry-run --out $T/d21.sql 2>/dev/null; rc=$(run $D $T/d21.sql)
 res "D21 DB guard (hub_paid_lock_guard): a Pay Friday after the last recorded submit + 7 days is refused (typo guard)" "$([ $rc != 0 ] && grep -q 'after the last recorded submit' $T/out && [ "$(q $D -c 'select count(*) from hub_paid_lock')" = 0 ] && echo PASS || echo FAIL)" "$(err)"
 
 
@@ -146,15 +166,32 @@ res "D21 DB guard (hub_paid_lock_guard): a Pay Friday after the last recorded su
 printf 'Line ID,Agent,Member ID,Type,Original Pay Friday,Est Commission,Status at Lock,Locked Through,Paid On,Note\n20261005101010-600000001-P,A Test,600000001,Premier,10/9/2026,98.4,Awaiting first payment,10/16/2026,,post date open at the 10/16 start line\n20261012101010-600000002-P,A Test,600000002,Premier,10/23/2026,367.65,Awaiting first payment,10/23/2026,2026-10-30,post date open at the 10/23 lock\n20261013101010-600000004-P,A Test,600000004,Premier,10/23/2026,12,Not in PHS - unconfirmed,10/23/2026,,unconfirmed at the 10/23 lock - pays on the first open payday\n' > $T/lo.csv
 $PY build --unformatted $T/u.csv --formatted $T/f0.csv --out $T/b3.csv --lock-open-formatted $T/lo.csv --lock-open-out $T/lo_imp.csv >/dev/null 2>&1 || true
 printf 'Pay Friday,Agent,Paid Total,System Total,Locked At (ET),Note\n2026-10-30,A Test,$170.00,$170.00,2026-10-29 16:40,n\n2026-10-23,A Test,$425.59,,10/23/2026,n\n' > $T/f0.csv
-printf 'Line ID,Agent,Member ID,Type,Pay Friday,Note\n20261023110335-600000009-P,A Test,600000009,Premier,10/23/2026,hub code seed (fake): pending PHS at the 10/23 lock\n' > $T/seeds.csv
+# fake Manual Adjustments tab (hub layout) + fake hub code cover seeds (one with a wrong line id is simply not listed)
+printf 'Agent,Payday,Amount,Reason/Note,Member ID,Entered By,Date Entered,Covers\nA Test,10/23/2026,10,Transfers through 10/22 2:46pm ET,,Kyle,10/22/2026\nA Test,10/23/2026,-75,Weaver add-on spiff already paid,,Desk,10/22/2026\nA Test,10/30/2026,40,Fake 600000005 ABS x2 moved from 10/23,600000005,Kyle,10/23/2026,pay spiff:20261023110335-600000005-ABS\nA Test,10/23/2026,-40,Fake 600000005 ABS x2 moved to 10/30,600000005,Kyle,10/23/2026,reverse spiff:20261023110335-600000005-ABS\nA Test,10/30/2026,20,Fake 600000005 W4Y moved from 10/23,600000005,Kyle,10/29/2026,pay spiff:20261023110335-600000005-P\nA Test,10/30/2026,400,help (not line-linked),,Kyle,10/29/2026\n' > $T/ma.csv
+printf 'Agent,Payday,Amount,Note Regex,Kind,Items\n*,2026-10-23,,^Transfers through 10/22 2:46pm,pay,xfer\nA Test,2026-10-23,-75,^Weaver,dup,spiff:20261015131945-600000006-PADD\n' > $T/cs.csv
 $PY build --unformatted $T/u.csv --formatted $T/f0.csv --out $T/b3x.csv --lock-open-formatted $T/lo.csv --lock-open-out $T/lo_x.csv >/dev/null 2>"$T/e"; rcx=$?
-res "O0 build refuses without --hub-code-seeds (the hub's code-only open items) unless --no-code-seeds" "$([ $rcx != 0 ] && grep -q 'hub-code-seeds' $T/e && echo PASS || echo FAIL)" ""
-$PY build --unformatted $T/u.csv --formatted $T/f0.csv --out $T/b3.csv --lock-open-formatted $T/lo.csv --lock-open-out $T/lo_imp.csv --hub-code-seeds $T/seeds.csv >/dev/null 2>&1; rc=$?
-res "O1 build reads Lock Open Items in the SAME pass: normalized (ISO dates, cents, kind), hub code seed appended, snapshot.json records both shas" "$([ $rc = 0 ] && grep -q '^20261005101010-600000001-P,A Test,600000001,Premier,2026-10-09,98.40,Awaiting first payment,2026-10-16,,.*,post_date,lock_open_items_tab$' $T/lo_imp.csv && grep -q ',unconfirmed,lock_open_items_tab$' $T/lo_imp.csv && grep -q '^20261023110335-600000009-P,A Test,600000009,Premier,2026-10-23,0.00,.*,unconfirmed,hub_code_seed$' $T/lo_imp.csv && grep -q "$(sha256sum < $T/lo_imp.csv | cut -d' ' -f1)" $T/snapshot.json && echo PASS || echo FAIL)" "$(grep -c '' $T/lo_imp.csv) lines"
+res "O0 build refuses without the Manual Adjustments tab (unless --no-adjustments); no placeholder / hub-code-seed option exists" "$([ $rcx != 0 ] && grep -q 'adjustments-formatted' $T/e && ! $PY build --help | grep -q 'code-seeds' && echo PASS || echo FAIL)" ""
+$PY build --unformatted $T/u.csv --formatted $T/f0.csv --out $T/b3.csv --lock-open-formatted $T/lo.csv --lock-open-out $T/lo_imp.csv --adjustments-formatted $T/ma.csv --adjustments-out $T/adj_imp.csv --cover-seeds $T/cs.csv >/dev/null 2>&1; rc=$?
+res "O1 build reads Lock Open Items + Manual Adjustments in the SAME pass: tab rows only (no placeholder), snapshot.json records every sha incl. the hub code cover seeds file" "$([ $rc = 0 ] && grep -q '^20261005101010-600000001-P,A Test,600000001,Premier,2026-10-09,98.40,Awaiting first payment,2026-10-16,,.*,post_date,lock_open_items_tab$' $T/lo_imp.csv && [ "$(grep -c '' $T/lo_imp.csv)" = 4 ] && ! grep -q hub_code_seed $T/lo_imp.csv && for f in $T/lo_imp.csv $T/adj_imp.csv $T/cs.csv $T/b3.csv; do grep -q "$(sha256sum < $f | cut -d' ' -f1)" $T/snapshot.json || exit 1; done && echo PASS || echo FAIL)" "$(grep -c '' $T/lo_imp.csv) lines"
+res "A1 Manual Adjustments -> paid-elsewhere markers: every line-linked cover (Covers column pay/reverse, seed dup), xfer and plain adjustments skipped" "$([ "$(cut -d, -f1-8 $T/adj_imp.csv | tail -n +2 | sort | tr '\n' ' ')" = '3,20261015131945-600000006-PADD,spiffs,dup,A Test,2026-10-23,-75.00,cover_seed 4,20261023110335-600000005-ABS,spiffs,pay,A Test,2026-10-30,40.00,covers_column 5,20261023110335-600000005-ABS,spiffs,reverse,A Test,2026-10-23,-40.00,covers_column 6,20261023110335-600000005-P,spiffs,pay,A Test,2026-10-30,20.00,covers_column ' ] && echo PASS || echo FAIL)" "$(tail -n +2 $T/adj_imp.csv | cut -d, -f1-4 | tr '\n' ' ')"
+printf 'Agent,Payday,Amount,Reason/Note,Member ID,Entered By,Date Entered,Covers\nA Test,11/06/2026,20,later,,Kyle,10/29/2026,pay spiff:20261023110335-600000005-P\n' > $T/ma2.csv
+$PY build --unformatted $T/u.csv --formatted $T/f0.csv --out $T/b3y.csv --lock-open-formatted $T/lo.csv --lock-open-out $T/lo_y.csv --adjustments-formatted $T/ma2.csv --adjustments-out $T/adj_y.csv --no-cover-seeds >/dev/null 2>"$T/e"; rc=$?
+res "A2 a line-linked adjustment on a payday the hub has not paid (after the last Paid Lock payday) is refused: decide it first" "$([ $rc != 0 ] && grep -q 'the hub has not paid it' $T/e && echo PASS || echo FAIL)" ""
+# S. mandatory snapshot
+$PY sql --csv $T/b3.csv --lock-open $T/lo_imp.csv --adjustments $T/adj_imp.csv --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
+res "S1 sql without --snapshot is refused (mandatory)" "$([ $rc != 0 ] && grep -q 'snapshot.json (written by build) is mandatory' $T/e && echo PASS || echo FAIL)" ""
+$PY sql --csv $T/b3.csv --lock-open $T/lo_imp.csv --adjustments $T/adj_imp.csv --snapshot $T/snapshot.json --dry-run --out $T/x.sql >/dev/null 2>"$T/e"; rc=$?
+res "S2 sql with the build's snapshot: OK" "$([ $rc = 0 ] && echo PASS || echo FAIL)" "$(head -c 150 $T/e)"
+$PY sql --csv $T/b3.csv --lock-open $T/lo_imp.csv --no-adjustments --snapshot $T/snapshot.json --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
+res "S3 leaving out a file the snapshot has (--no-adjustments) is refused" "$([ $rc != 0 ] && grep -q 'has a adjustments file but none was passed' $T/e && echo PASS || echo FAIL)" ""
+cp $T/cs.csv $T/cs.bak; echo 'A Test,2026-10-23,5,^x,pay,xfer' >> $T/cs.csv
+$PY sql --csv $T/b3.csv --lock-open $T/lo_imp.csv --adjustments $T/adj_imp.csv --snapshot $T/snapshot.json --dry-run --out $T/x.sql 2>"$T/e"; rc=$?; cp $T/cs.bak $T/cs.csv
+res "S4 the hub code cover seeds file changed after build (its sha is in snapshot.json): refused" "$([ $rc != 0 ] && grep -q 'cover seeds .* changed or missing' $T/e && echo PASS || echo FAIL)" ""
+
 $PY build --unformatted $T/u.csv --formatted $T/f0.csv --out $T/b4.csv >/dev/null 2>"$T/e"; rc=$?
 res "O2 build refuses without the Lock Open Items tab (unless --no-lock-open)" "$([ $rc != 0 ] && grep -q 'SAME pass' $T/e && echo PASS || echo FAIL)" ""
 orefuse(){ printf 'Line ID,Agent,Member ID,Type,Original Pay Friday,Est Commission,Status at Lock,Locked Through,Paid On,Note,Kind,Source\n%s\n' "$2" > $T/o.csv
-  $PY sql --csv $FX --lock-open $T/o.csv --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
+  hcsql --csv $FX --lock-open $T/o.csv --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
   res "$1" "$([ $rc != 0 ] && grep -q -- "$3" "$T/e" && echo PASS || echo FAIL)" "$(grep -o 'REFUSED.*' "$T/e" | cut -c1-110)"; }
 orefuse "O3 open item: Line ID not <Timestamp>-<Member>-<Type>" '2026100510-600000001-P,A,600000001,Premier,2026-10-09,1.00,s,2026-10-16,,n,post_date,lock_open_items_tab' "is not <Timestamp>"
 orefuse "O4 open item: Type vs Line ID suffix" '20261005101010-600000001-P,A,600000001,ABS,2026-10-09,1.00,s,2026-10-16,,n,post_date,lock_open_items_tab' "does not match the Line ID suffix"
@@ -162,15 +199,15 @@ orefuse "O5 open item: Member ID vs Line ID" '20261005101010-600000001-P,A,60000
 orefuse "O6 open item: duplicate Line ID" $'20261005101010-600000001-P,A,600000001,Premier,2026-10-09,1.00,s,2026-10-16,,n,post_date,lock_open_items_tab\n20261005101010-600000001-P,B,600000001,Premier,2026-10-09,1.00,s,2026-10-16,,n,post_date,lock_open_items_tab' "duplicate Line ID"
 orefuse "O7 open item: Paid On not after Locked Through" '20261005101010-600000001-P,A,600000001,Premier,2026-10-09,1.00,s,2026-10-16,2026-10-16,n,post_date,lock_open_items_tab' "is not after Locked Through"
 orefuse "O8 open item: Paid On after the Paid Lock file's last payday (not the same snapshot)" '20261005101010-600000001-P,A,600000001,Premier,2026-10-09,1.00,s,2026-10-30,2026-11-06,n,post_date,lock_open_items_tab' "re-read both tabs together"
-$PY sql --csv $FX --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
+hcsql --csv $FX --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
 res "O9 sql refuses without --lock-open (or an explicit --no-lock-open)" "$([ $rc != 0 ] && grep -q 'pass --lock-open' $T/e && echo PASS || echo FAIL)" ""
-$PY sql --csv $FX --lock-open $FO --confirm-hub --out $T/x.sql 2>"$T/e"; rc=$?
+hcsql --csv $FX --lock-open $FO --confirm-hub --out $T/x.sql 2>"$T/e"; rc=$?
 res "O10 --confirm-hub refuses without the dry run's token" "$([ $rc != 0 ] && grep -q 'needs --dry-run-token' $T/e && echo PASS || echo FAIL)" ""
-$PY sql --csv $T/b3.csv --lock-open $FO --snapshot $T/snapshot.json --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
+$PY sql --csv $T/b3.csv --lock-open $FO --no-adjustments --snapshot $T/snapshot.json --dry-run --out $T/x.sql 2>"$T/e"; rc=$?
 res "O11 --snapshot refuses a Lock Open file that is not from the same read as the Paid Lock file" "$([ $rc != 0 ] && grep -q 'is not the lock_open file of snapshot' $T/e && echo PASS || echo FAIL)" ""
 
 D=hubcut_t8; fresh $D
-$PY sql --csv $FX --lock-open $FO --confirm-hub --dry-run-token ABCDEF0123 --out $T/badtok.sql 2>/dev/null; rc=$(run $D $T/badtok.sql)
+hcsql --csv $FX --lock-open $FO --confirm-hub --dry-run-token ABCDEF0123 --out $T/badtok.sql 2>/dev/null; rc=$(run $D $T/badtok.sql)
 res "T1 APPLY with a token from no dry run is refused (nothing written, DDL rolled back too)" "$([ $rc != 0 ] && grep -q 'dry-run token ABCDEF0123 does not match' $T/out && [ "$(q $D -c 'select (select count(*) from hub_paid_lock)+(select count(*) from hub_cutover)+(select count(*) from hub_lock_open_items)')" = 0 ] && echo PASS || echo FAIL)" "$(err)"
 mkapply $D --csv $FX --lock-open $FO
 q $D -c "insert into agent_name_aliases (alias, agent_id) select 'Alex T', id from agents where display_name = 'Alex Testagent (fake)'" >/dev/null
@@ -183,7 +220,7 @@ rc2=$(q $D -c "update hub_lock_open_items set paid_on = '2026-11-06'" >/dev/null
 res "T4 after the cutover no more open items can be added, and none edited (one-time, immutable)" "$([ $rc != 0 ] && [ $rc2 != 0 ] && [ "$(q $D -c 'select count(*) from hub_lock_open_items')" = 3 ] && echo PASS || echo FAIL)" ""
 D=hubcut_t9; fresh $D
 sed 's/^2026-10-30,Blair Sample (fake),/2026-10-30,Blair Sampel (fake),/' $FX > $T/typo.csv
-$PY sql --csv $T/typo.csv --lock-open $FO --dry-run --out $T/typo_dry.sql 2>/dev/null; rc=$(run $D $T/typo_dry.sql)
+hcsql --csv $T/typo.csv --lock-open $FO --dry-run --out $T/typo_dry.sql 2>/dev/null; rc=$(run $D $T/typo_dry.sql)
 res "N1 roster check: a misspelled agent carrying dollars BLOCKS the dry run (no token issued)" "$([ $rc != 0 ] && grep -q 'DRY RUN BLOCKED.*Blair Sampel (fake)' $T/out && ! grep -q 'DRY RUN TOKEN' $T/out && echo PASS || echo FAIL)" "$(grep -oE 'BLOCKED[^.]*' $T/out | cut -c1-150)"
 fp=$(grep -oE "fp := md5" $T/typo_dry.sql | head -1)
 sed "s/c_dry    constant boolean := true/c_dry    constant boolean := false/" $T/typo_dry.sql > $T/typo_force.sql
@@ -223,6 +260,54 @@ submit $D 2026-11-06; q $D -c "select premier_lock_payday('2026-11-06')" >/dev/n
 res "X6 control: the same confirmed line with NO open item is paid_by_hub (\$0), never locked" "$([ $rc = 0 ] && [ "$(pv $D)" = 'paid_by_hub|0|-|2026-10-23' ] && [ "$(locks $D)" = none ] && echo PASS || echo FAIL)" "$(pv $D)"
 
 
+# ---------- P. hub-era line-linked adjustments = paid-elsewhere markers: recomputing spiffs after the cutover pays $0 ----------
+PL1=20261030132409-687990114-P; PL2=20261030121103-687990909-ABS     # mock lines, spiffs due 11/06 (after the 10/30 cutover)
+spv(){ q $1 -c "select string_agg(l.hub_line_id||'='||coalesce(t.cutover_status,'-')||'/'||coalesce(t.pay_claimed_spiffs::text,'null')||'/'||coalesce(t.pay_missed_spiffs::text,'null'), ' ' order by l.hub_line_id) from premier_recon_trueup t join premier_recon_lines l using (line_key) where l.hub_line_id in ('$PL1','$PL2')"; }
+slocks(){ q $1 -c "select coalesce(string_agg(l.hub_line_id||':'||k.component||'@'||k.payday||'='||k.amount, ' ' order by l.hub_line_id, k.component), 'none') from pay_line_locks k join premier_recon_lines l using (line_key) where l.hub_line_id in ('$PL1','$PL2')"; }
+D=hubcut_pc; fresh $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed_slice3_mock.sql >/dev/null 2>&1
+mkapply $D --csv $FX --lock-open $FO --no-adjustments; rc=$(run $D $T/apply_$D.sql); submit $D 2026-11-06; q $D -c "select premier_lock_payday('2026-11-06')" >/dev/null
+res "P0 control (no markers): the two mock spiffs due 11/06 lock and pay on 11/06 (75 + 80)" "$([ $rc = 0 ] && [ "$(slocks $D)" = "$PL2:claimed_spiffs@2026-11-06=80.00 $PL1:claimed_spiffs@2026-11-06=75.00 $PL1:commission@2026-11-06=$(q $D -c "select actual_commission from premier_recon_lines where hub_line_id = '$PL1'")" ] && echo PASS || echo FAIL)" "$(slocks $D)"
+D=hubcut_pe; fresh $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed_slice3_mock.sql >/dev/null 2>&1
+mkapply $D --csv $FX --lock-open $FO --adjustments $FA; rc=$(run $D $T/apply_$D.sql)
+res "P1 cutover imports the line-linked adjustments as paid-elsewhere markers (3 markers, 2 line components on loaded board lines), not as pay" "$([ $rc = 0 ] && grep -q 'paid-elsewhere markers 3 (2 matched)' $T/dryout_$D && [ "$(q $D -c 'select count(*) from hub_paid_elsewhere')" = 3 ] && [ "$(q $D -c 'select count(*) from pay_adjustments')" = "$(q hubcut_pc -c 'select count(*) from pay_adjustments')" ] && echo PASS || echo FAIL)" "$(grep -oE 'paid-elsewhere markers [0-9]+ \([0-9]+ matched\)' $T/dryout_$D)"
+res "P2 true-up: both marked spiffs pay \$0 (status hub_paid_elsewhere); the line's commission is untouched" "$([ "$(spv $D)" = "$PL2=hub_paid_elsewhere/0/0 $PL1=hub_paid_elsewhere/0/0" ] && [ "$(q $D -c "select pay_commission from premier_recon_trueup t join premier_recon_lines l using (line_key) where l.hub_line_id = '$PL1'")" = "$(q hubcut_pc -c "select actual_commission from premier_recon_lines where hub_line_id = '$PL1'")" ] && echo PASS || echo FAIL)" "$(spv $D)"
+python3 scripts/csv_to_recon_sql.py --mock --premier $PMOCK --psql "-d $D" >/dev/null 2>&1; q $D -c "select premier_anchor_missed_spiffs()" >/dev/null 2>&1
+submit $D 2026-11-06; q $D -c "select premier_lock_payday('2026-11-06')" >/dev/null; submit $D 2026-11-13; q $D -c "select premier_lock_payday('2026-11-13')" >/dev/null
+res "P3 recompute spiffs after the cutover (Premier re-import + missed-spiff anchoring) and lock 11/06 + 11/13: the marked spiffs pay \$0, never locked; the commission still locks" "$([ "$(slocks $D)" = "$PL1:commission@2026-11-06=$(q hubcut_pc -c "select amount from pay_line_locks k join premier_recon_lines l using (line_key) where l.hub_line_id = '$PL1' and component = 'commission'")" ] && [ "$(spv $D)" = "$PL2=hub_paid_elsewhere/0/0 $PL1=hub_paid_elsewhere/0/0" ] && echo PASS || echo FAIL)" "$(slocks $D) | $(spv $D)"
+rc=$(q $D -c "insert into hub_paid_elsewhere (file_sha256, tab_row, line_id, component, cover_kind, agent_name, payday, amount, source) values (repeat('e',64), 9, '$PL1', 'commission', 'pay', 'x', '2026-10-30', 1, 'covers_column')" >/dev/null 2>&1; echo $?)
+rc2=$(q $D -c "delete from hub_paid_elsewhere" >/dev/null 2>&1; echo $?)
+res "P4 markers are one-time and immutable (no insert after the cutover, no delete)" "$([ $rc != 0 ] && [ $rc2 != 0 ] && [ "$(q $D -c 'select count(*) from hub_paid_elsewhere')" = 3 ] && echo PASS || echo FAIL)" ""
+# ---------- RG. rerun guard: the 10/31 views migration re-run after 20261101120000 is caught, not silent ----------
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/migrations/20261031210100_premier_recon_views.sql >/dev/null 2>&1; rr=$?
+submit $D 2026-11-20; psql -X -At -v ON_ERROR_STOP=1 -d $D -c "select premier_lock_payday('2026-11-20')" >/dev/null 2>"$T/e"; rc=$?
+res "RG1 after re-running 20261031210100 (exemption gone) locking a payday is REFUSED by the guard: re-run 20261101120000 first" "$([ $rr = 0 ] && [ $rc != 0 ] && grep -q 're-run 20261101120000 first' $T/e && [ "$(q $D -c 'select public.hub_open_items_schema_ok()')" = f ] && echo PASS || echo FAIL)" "$(grep -oE 'ERROR: .*' $T/e | cut -c1-140)"
+rc=$(run $D supabase/deploy/hub_cutover_preflight.sql)
+res "RG2 the read-only preflight refuses in that state too" "$([ $rc != 0 ] && grep -q 'lack the open-item exemption' $T/out && echo PASS || echo FAIL)" "$(err)"
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/migrations/20261101120000_hub_lock_open_items.sql >/dev/null 2>&1; rr=$?
+psql -X -At -v ON_ERROR_STOP=1 -d $D -c "select premier_lock_payday('2026-11-20')" >/dev/null 2>"$T/e"; rc=$?
+res "RG3 re-running 20261101120000 restores the exemption + markers; locking works again and the marked spiffs still never lock" "$([ $rr = 0 ] && [ $rc = 0 ] && [ "$(q $D -c 'select public.hub_open_items_schema_ok()')" = t ] && [ "$(spv $D)" = "$PL2=hub_paid_elsewhere/0/0 $PL1=hub_paid_elsewhere/0/0" ] && echo PASS || echo FAIL)" "$(spv $D)"
+# ---------- G. order guard: #7 must land before slice 4a (20261101100000 / 20261101100100) ----------
+D=hubcut_g1; psql -q -d postgres -c "drop database if exists $D" -c "create database $D" >/dev/null 2>&1
+psql -q -v ON_ERROR_STOP=1 -d $D -f supabase/tests/local_supabase_stub.sql >/dev/null 2>&1
+psql -q -d $D -c "insert into auth.users(email) values ('admin.test@example.com'),('agent.test@example.com'),('agent2.test@example.com')" >/dev/null
+for f in supabase/migrations/*.sql; do [ "$f" = supabase/migrations/20261101120000_hub_lock_open_items.sql ] && continue; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $f >/dev/null 2>&1; done
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed.sql >/dev/null 2>&1
+q $D -c "create schema if not exists supabase_migrations; create table if not exists supabase_migrations.schema_migrations (version text primary key, statements text[], name text); insert into supabase_migrations.schema_migrations (version, name) values ('20261101100100', 'closed_week_next_open_payday')" >/dev/null
+rc=$(run $D supabase/migrations/20261101120000_hub_lock_open_items.sql)
+res "G1 migration 20261101120000 refuses when 4a's 20261101100100 is already recorded (wrong order would drop 4a's carry); nothing created" "$([ $rc != 0 ] && grep -q 'slice 4a (20261101100000 / 20261101100100) is already applied' $T/out && [ "$(q $D -c "select to_regclass('public.hub_lock_open_items') is null")" = t ] && echo PASS || echo FAIL)" "$(err)"
+rc=$(run $D supabase/deploy/hub_cutover_preflight.sql)
+res "G2 the preflight refuses the wrong order too" "$([ $rc != 0 ] && grep -q 'wrong merge order' $T/out && echo PASS || echo FAIL)" "$(err)"
+q $D -c "delete from supabase_migrations.schema_migrations; create table public.closed_week_carry_anchors (id int)" >/dev/null
+rc=$(run $D supabase/migrations/20261101120000_hub_lock_open_items.sql)
+res "G3 also refuses on 4a's objects with no version row (closed_week_carry_anchors present)" "$([ $rc != 0 ] && grep -q 'slice 4a' $T/out && echo PASS || echo FAIL)" "$(err)"
+# M. the cutover paste on a build WITHOUT 20261101120000 (as live today: main + the paste) applies it in-transaction
+q $D -c "drop table public.closed_week_carry_anchors" >/dev/null
+mkapply $D --csv $FX --lock-open $FO --adjustments $FA
+res "M1 dry run on a build without migration 20261101120000: OK + token, and the in-transaction DDL is rolled back (nothing left)" "$(grep -q 'DRY RUN OK' $T/dryout_$D && grep -q 'DRY RUN TOKEN' $T/dryout_$D && [ "$(q $D -c "select (to_regclass('public.hub_lock_open_items') is null) and (to_regclass('public.hub_paid_elsewhere') is null)")" = t ] && echo PASS || echo FAIL)" "$(grep -oE '(ERROR|NOTICE): .{0,120}' $T/dryout_$D | head -1)"
+rc=$(run $D $T/apply_$D.sql)
+res "M2 APPLY on that build (SQL Editor): migration applied + cutover recorded in ONE transaction; version row recorded" "$([ $rc = 0 ] && [ "$(q $D -c "select (select count(*) from hub_cutover)||'|'||(select count(*) from hub_paid_elsewhere)||'|'||public.hub_open_items_schema_ok()||'|'||(select count(*) from supabase_migrations.schema_migrations where version = '20261101120000')")" = '1|3|true|1' ] && echo PASS || echo FAIL)" "$(err)"
+psql -q -d postgres -c "drop database if exists hubcut_g1" >/dev/null 2>&1
+
 # ---------- K. rollback of migration 20261101120000_hub_lock_open_items ----------
 RB=supabase/rollback/hub_lock_open_items_rollback.sql; MIG=supabase/migrations/20261101120000_hub_lock_open_items.sql
 dumps(){ pg_dump -s -d $1 | grep -vE '^\\(un)?restrict ' > $2; }
@@ -231,7 +316,7 @@ psql -q -v ON_ERROR_STOP=1 -d $D -f supabase/tests/local_supabase_stub.sql >/dev
 psql -q -d $D -c "insert into auth.users(email) values ('admin.test@example.com'),('agent.test@example.com'),('agent2.test@example.com')" >/dev/null
 for f in supabase/migrations/*.sql; do [ "$f" = $MIG ] && continue; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $f >/dev/null 2>&1 || echo "FAIL migration $f"; done
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed.sql >/dev/null 2>&1
-q $D -c "create schema if not exists supabase_migrations; create table if not exists supabase_migrations.schema_migrations (version text primary key, name text)" >/dev/null
+q $D -c "create schema if not exists supabase_migrations; create table if not exists supabase_migrations.schema_migrations (version text primary key, statements text[], name text)" >/dev/null
 dumps $D $T/k_before.sql
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f $MIG >/dev/null 2>&1; q $D -c "insert into supabase_migrations.schema_migrations (version, name) values ('20261101120000', 'hub_lock_open_items')" >/dev/null
 { echo "set role authenticated;"; cat $RB; } > $T/k_auth.sql; rc=$(run $D $T/k_auth.sql)
@@ -261,26 +346,27 @@ psql -q -d postgres -c "drop database if exists hubcut_k1" >/dev/null 2>&1
 
 # ---------- R. the real file (optional): dry run on a fresh build + the mock board, nothing written ----------
 if [ -n "$REAL" ]; then
-  RO=${REAL_OPEN:-$(dirname "$REAL")/lock_open_import.csv}; SN=$(dirname "$REAL")/snapshot.json
+  RO=${REAL_OPEN:-$(dirname "$REAL")/lock_open_import.csv}; RA=$(dirname "$REAL")/adjustments_import.csv; SN=$(dirname "$REAL")/snapshot.json
   D=hubcut_real; fresh $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f supabase/seed_slice3_mock.sql >/dev/null 2>&1
-  python3 scripts/hub_cutover.py sql --csv "$REAL" --lock-open "$RO" --snapshot "$SN" --dry-run --out $T/real_dry.sql 2>/dev/null
+  python3 scripts/hub_cutover.py sql --csv "$REAL" --lock-open "$RO" --adjustments "$RA" --snapshot "$SN" --dry-run --out $T/real_dry.sql 2>/dev/null
   rc=$(run $D $T/real_dry.sql)
   res "R1 real files, fresh build of this tree (+ mock board), backend roster NOT loaded (as live today): dry run BLOCKED on the 10 names, no token" "$([ $rc != 0 ] && grep -q 'DRY RUN BLOCKED' $T/out && ! grep -q 'DRY RUN TOKEN' $T/out && [ "$(q $D -c 'select (select count(*) from hub_paid_lock)+(select count(*) from hub_cutover)')" = 0 ] && echo PASS || echo FAIL)" "$(grep -o 'BLOCKED.*' $T/out | cut -c1-330)"
   # local roster = the agent names in the (private) real file itself; no real names live in this public repo
   python3 -c "import csv,sys; [print(n) for n in sorted({r['Agent'] for r in csv.DictReader(open(sys.argv[1])) if r['Agent'] != 'UNKNOWN'})]" "$REAL" |
   while IFS= read -r n; do q $D -c "insert into agents (display_name, role) values (\$n\$$n\$n\$, 'agent') on conflict do nothing" >/dev/null; done
-  python3 scripts/hub_cutover.py sql --csv "$REAL" --lock-open "$RO" --snapshot "$SN" --dry-run --out $T/real_dry.sql 2>/dev/null
+  python3 scripts/hub_cutover.py sql --csv "$REAL" --lock-open "$RO" --adjustments "$RA" --snapshot "$SN" --dry-run --out $T/real_dry.sql 2>/dev/null
   rc=$(run $D $T/real_dry.sql); tok=$(grep -oE 'DRY RUN TOKEN [0-9A-F]{10}' $T/out | awk '{print $4}')
   res "R2 same, after loading a LOCAL roster of the 10 agents: dry run OK, token issued, nothing written" "$([ $rc != 0 ] && [ -n "$tok" ] && [ "$(q $D -c 'select (select count(*) from hub_paid_lock)+(select count(*) from hub_cutover)+(select count(*) from hub_lock_open_items)')" = 0 ] && echo PASS || echo FAIL)" "$(grep -o 'DRY RUN OK.*' $T/out | cut -c1-420)"
-  python3 scripts/hub_cutover.py sql --csv "$REAL" --lock-open "$RO" --snapshot "$SN" --confirm-hub --dry-run-token "$tok" --out $T/real_apply.sql 2>/dev/null
+  python3 scripts/hub_cutover.py sql --csv "$REAL" --lock-open "$RO" --adjustments "$RA" --snapshot "$SN" --confirm-hub --dry-run-token "$tok" --out $T/real_apply.sql 2>/dev/null
   rc=$(run $D $T/real_apply.sql)
   res "R3 real APPLY on the LOCAL copy: Paid Lock rows / sum / last payday + Lock Open Items as checked" "$([ $rc = 0 ] && echo PASS || echo FAIL)" "$(q $D -c "select count(*)||' rows, '||sum(paid_total)||' paid, last '||(select last_hub_payday from hub_cutover)||', open items '||(select count(*) from hub_lock_open_items)||' ('||(select count(*) from hub_lock_open_items where paid_on is null)||' open, est '||(select sum(est_commission) from hub_lock_open_items where paid_on is null)||')' from hub_paid_lock")"
   q $D -c "select payday, count(*), sum(paid_total), sum(system_total) from hub_paid_lock group by 1 order by 1" | sed 's/^/     /'
   RP=$(python3 -c "import csv,sys; print(sorted(r['Line ID']+'|'+r['Paid On'] for r in csv.DictReader(open(sys.argv[1])) if r['Paid On'])[0])" "$RO" 2>/dev/null)
   res "R4 the open item the hub already paid (Paid On set in the file) is imported as paid by the hub, so NOT exempt" "$([ -n "$RP" ] && [ "$(q $D -c "select line_id||'|'||paid_on from hub_lock_open_items where paid_on is not null order by 1 limit 1")" = "$RP" ] && echo PASS || echo FAIL)" "$(q $D -c "select count(*)||' paid by hub, '||sum(est_commission) from hub_lock_open_items where paid_on is not null")"
+  res "R6 every line-linked hub adjustment in the private file is imported as a paid-elsewhere marker (not pay); none is paid by the backend" "$([ "$(q $D -c 'select count(*) from hub_paid_elsewhere')" = "$(($(grep -c '' "$RA") - 1))" ] && [ "$(q $D -c "select count(*) from premier_recon_trueup t join premier_recon_lines l using (line_key) join hub_paid_elsewhere p on p.line_id = l.hub_line_id where (p.component = 'spiffs' and (coalesce(t.pay_claimed_spiffs, 0) <> 0 or coalesce(t.pay_missed_spiffs, 0) <> 0)) or (p.component = 'commission' and coalesce(t.pay_commission, 0) <> 0)")" = 0 ] && echo PASS || echo FAIL)" "$(q $D -c "select count(*)||' markers on '||count(distinct line_id||component)||' line components' from hub_paid_elsewhere")"
   rc=$(run $D $T/real_apply.sql)
   res "R5 real APPLY re-run on the local copy: no-op" "$([ $rc = 0 ] && grep -q 'already recorded from this file' $T/out && echo PASS || echo FAIL)" ""
 fi
-for d in hubcut_t1 hubcut_t2 hubcut_t3 hubcut_t4 hubcut_t5 hubcut_t6 hubcut_t7 hubcut_t8 hubcut_t9 hubcut_ta hubcut_tb hubcut_tc hubcut_real; do psql -q -d postgres -c "drop database if exists $d" >/dev/null 2>&1; done
+for d in hubcut_t1 hubcut_t2 hubcut_t3 hubcut_t4 hubcut_t5 hubcut_t6 hubcut_t7 hubcut_t8 hubcut_t9 hubcut_ta hubcut_tb hubcut_tc hubcut_pc hubcut_pe hubcut_real; do psql -q -d postgres -c "drop database if exists $d" >/dev/null 2>&1; done
 echo "hub cutover tests: $pass passed, $fail failed"
 [ $fail = 0 ]

@@ -1,0 +1,4 @@
+Tab Row,Line ID,Component,Cover Kind,Agent,Payday,Amount,Source,Note
+5,20261030132409-687990114-P,spiffs,pay,Alex Testagent (fake),2026-10-30,75.00,covers_column,MOCK spiff paid via the 10/30 lock (Covers pay spiff:<line>)
+6,20261030121103-687990909-ABS,spiffs,pay,Alex Testagent (fake),2026-10-30,80.00,covers_column,MOCK ABS spiff moved to and paid on 10/30
+7,20261030121103-687990909-ABS,spiffs,reverse,Alex Testagent (fake),2026-10-23,-80.00,covers_column,MOCK ABS spiff moved off 10/23

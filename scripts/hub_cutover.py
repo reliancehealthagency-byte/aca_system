@@ -5,12 +5,17 @@ Layout (Kyle 11/01 11:55 AM ET, relayed by the Orchestrator): Pay Friday | Agent
 Locked At (ET) | Note, exactly these six columns in this order (the hub's PAID_LOCK_HDR_).
 
   build  --unformatted RAW.csv --formatted FMT.csv --out paid_lock_import.csv
+         --lock-open-formatted LOCK_OPEN.csv --lock-open-out lock_open_import.csv          (or --no-lock-open)
+         --adjustments-formatted MANUAL_ADJ.csv --adjustments-out adjustments_import.csv
+         --cover-seeds cover_seeds.csv (private)                                           (or --no-adjustments)
+         -> also snapshot.json (all shas); sql --snapshot is mandatory.
          RAW = the tab read with UNFORMATTED_VALUE (Sheets serials keep the Locked At time the display hides);
          FMT = the same tab as displayed. Both must agree (date, agent, money) or nothing is written.
   check  --csv paid_lock_import.csv [--roster agent_sheets.csv] [--aliases agent_aliases.csv]
          [--finalized finalized.csv] [--lock-open lock_open_items.csv] [--agents-sql "<psql args>"]
          Prints the checks table (markdown). Exit 1 on any hard error.
-  sql    --csv paid_lock_import.csv (--dry-run | --confirm-hub) (--out FILE | --psql "<psql args>")
+  sql    --csv paid_lock_import.csv --lock-open F --adjustments F --snapshot snapshot.json
+         (--dry-run | --confirm-hub --dry-run-token T) (--out FILE | --psql "<psql args>")
          Writes the SQL Editor paste (one DO block = one transaction). --dry-run ends by raising (nothing persists);
          --confirm-hub writes. Owner-only: the DB lets only the payroll owner's login or the SQL Editor (postgres
          break-glass, audited) insert hub rows. Re-running the same file after it is recorded is a no-op; a different
@@ -25,11 +30,18 @@ OPEN_HUB_HEADER = ['Line ID', 'Agent', 'Member ID', 'Type', 'Original Pay Friday
                    'Locked Through', 'Paid On', 'Note']                      # the hub's LOCK_OPEN_HDR_
 OPEN_HEADER = OPEN_HUB_HEADER + ['Kind', 'Source']                          # normalized import file
 OPEN_TYPES = {'Premier': 'P', 'Premier-addon': 'PADD', 'ACA': 'ACA', 'ABS': 'ABS'}
-# hub v19.11 LOCK_OPEN_SEEDS_ (Code_v19_11.gs L679-681): held open in code, written to the tab only when a lock pays it
-# (Line ID, Agent (standard name), Member ID, Type, Original Pay Friday, note). Skipped when the tab already has the Line ID.
-# Hub code seeds (v19.11 LOCK_OPEN_SEEDS_): open items that live in the hub's code, not in the tab. Real member data stays
-# out of this public repo: build reads them from a private CSV (--hub-code-seeds) with this header.
-SEEDS_HEADER = ['Line ID', 'Agent', 'Member ID', 'Type', 'Pay Friday', 'Note']
+# Lock Open Items come from the tab only: the hub has no placeholder logic (v19.9-v19.11); a $0 pending line seen in a
+# snapshot is only a rendering (Orchestrator B-2, 11/01).
+# Manual Adjustments (hub tab) -> paid-elsewhere markers. Hub-era adjustments are NOT imported as pay; every line-linked one
+# (Covers 'pay spiff:<line>', 'reverse ...', 'dup ...', 'claw comm:<line>', or a hub code COVER_SEEDS_ match) marks that
+# component of that line as paid elsewhere, so the backend pays it $0. 'xfer' covers are not line-linked (skipped).
+ADJ_HUB_HEADER = ['Agent', 'Payday', 'Amount', 'Reason/Note', 'Member ID', 'Entered By', 'Date Entered', 'Covers']
+ADJ_HEADER = ['Tab Row', 'Line ID', 'Component', 'Cover Kind', 'Agent', 'Payday', 'Amount', 'Source', 'Note']
+# hub code COVER_SEEDS_ (v19.11 L796-803) minus the hard-coded wrong-ID links (v19.9 L789-790: ignored, the tab's
+# Covers column carries the right line). Kept in a private CSV (real member data stays out of this public repo):
+COVER_SEEDS_HEADER = ['Agent', 'Payday', 'Amount', 'Note Regex', 'Kind', 'Items']
+COVER_KINDS = ('pay', 'reverse', 'dup', 'claw')
+LINE_RE = r'(\d{14})-([^-]+)-(P|PADD|ACA|ABS)'
 ET = ZoneInfo('America/New_York')
 REPO_ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 SERIAL0 = dt.datetime(1899, 12, 30)
@@ -215,8 +227,8 @@ def load_open(path, last_hub_payday=None, agents=None):
                               'that lock is not in the Paid Lock file (re-read both tabs together)')
         est = money(r[5], f'{w} Est Commission')
         kind, src = r[10].strip(), r[11].strip()
-        if kind not in ('post_date', 'unconfirmed') or src not in ('lock_open_items_tab', 'hub_code_seed'):
-            raise Refused(f'{w}: Kind / Source must be post_date|unconfirmed / lock_open_items_tab|hub_code_seed')
+        if kind not in ('post_date', 'unconfirmed') or src != 'lock_open_items_tab':
+            raise Refused(f'{w}: Kind / Source must be post_date|unconfirmed / lock_open_items_tab')
         if agents is not None and agent not in agents:
             warns.append(f'{w}: open item agent {agent!r} is not in the Paid Lock file')
         out.append(dict(row_num=i, line_id=lid, agent=agent, member=mem or None, type=typ, orig=orig, est=est,
@@ -225,11 +237,11 @@ def load_open(path, last_hub_payday=None, agents=None):
     return sha, out, warns
 
 
-def build_open(fmt_path, out_path, seeds=None):
+def build_open(fmt_path, out_path):
     t = read_csv(fmt_path)
     if [h.strip() for h in t[0]] != OPEN_HUB_HEADER:
         die(f'Lock Open Items header is not the hub layout: {t[0]}')
-    lines, ids = [], set()
+    lines = []
     try:
         for i, r in enumerate(t[1:], start=2):
             w = f'Lock Open Items row {i}'
@@ -238,49 +250,134 @@ def build_open(fmt_path, out_path, seeds=None):
             lines.append([r[0].strip(), r[1].strip(), r[2].strip(), r[3].strip(), parse_day(r[4], w).isoformat(), f'{est:.2f}',
                           r[6].strip(), parse_day(r[7], w).isoformat(), parse_day(r[8], w).isoformat() if r[8].strip() else '',
                           r[9].strip(), open_kind(r[6], r[9]), 'lock_open_items_tab'])
-            ids.add(r[0].strip())
     except Refused as e:
         die(str(e))
-    try:
-        seed_rows = load_seeds(seeds)
-    except Refused as e:
-        die(str(e))
-    for lid, ag, mem, typ, pf, note in seed_rows:
-        if lid not in ids:
-            lines.append([lid, ag, mem, typ, pf, '0.00', 'pending PHS at lock (hub code seed)', pf, '', note, 'unconfirmed',
-                          'hub_code_seed'])
     write_private(out_path, OPEN_HEADER, lines)
     return len(lines)
 
 
-def load_seeds(path):
-    if not path:
-        return []
+def friday_on_or_after(d):
+    return d + dt.timedelta(days=(4 - d.weekday()) % 7)
+
+
+def load_cover_seeds(path):
+    t = read_csv(path)
+    if not t or [h.strip() for h in t[0]] != COVER_SEEDS_HEADER:
+        raise Refused(f'{path}: cover seeds header must be {",".join(COVER_SEEDS_HEADER)}')
     out = []
-    with open(path, newline='') as f:
-        rd = csv.reader(f); hdr = next(rd, None)
-        if [h.strip() for h in (hdr or [])] != SEEDS_HEADER:
-            die(f'{path}: hub code seeds header must be: {",".join(SEEDS_HEADER)}')
-        for n, r in enumerate(rd, 2):
-            if not any(x.strip() for x in r):
-                continue
-            lid, ag, mem, typ = (x.strip() for x in r[:4])
-            if not re.match(r'^\d{14}-\d+-(P|PADD|ACA|ABS)$', lid) or lid.split('-')[1] != mem or not ag:
-                die(f'{path} row {n}: bad seed (Line ID / member / agent)')
-            pf = parse_day(r[4], f'{path} row {n}')
-            if pf.weekday() != 4:
-                die(f'{path} row {n}: Pay Friday {pf} is not a Friday')
-            out.append((lid, ag, mem, typ, pf.isoformat(), r[5].strip()))
+    for n, r in enumerate(t[1:], 2):
+        if not any(x.strip() for x in r):
+            continue
+        r = (r + [''] * 6)[:6]
+        kind = r[4].strip().lower()
+        if kind not in COVER_KINDS:
+            raise Refused(f'{path} row {n}: kind {r[4]!r}')
+        out.append(dict(agent=r[0].strip(), day=parse_day(r[1], f'{path} row {n}'),
+                        amt=money(r[2], f'{path} row {n}', required=False), rx=re.compile(r[3], re.I), kind=kind,
+                        items=r[5].split()))
     return out
 
 
-def check_snapshot(path, csv_path, open_path):
-    s = json.load(open(path))
-    for key, f in (('paid_lock', csv_path), ('lock_open', open_path)):
-        if f is None:
+def build_adj(fmt_path, seeds_path, out_path, last_hub_payday):
+    """Manual Adjustments tab -> paid-elsewhere markers (one row per line-linked item); mirrors hub parseCovers_."""
+    t = read_csv(fmt_path)
+    if [h.strip() for h in t[0]][:len(ADJ_HUB_HEADER)] != ADJ_HUB_HEADER:
+        raise Refused(f'Manual Adjustments header is not the hub layout: {t[0]}')
+    seeds = load_cover_seeds(seeds_path) if seeds_path else []
+    lines = []
+    for i, r in enumerate(t[1:], start=2):
+        r = (r + [''] * 8)[:8]
+        w = f'Manual Adjustments row {i}'
+        ag, note, cc = re.sub(r'\s+', ' ', r[0].strip()), r[3].strip(), r[7].strip()
+        if not ag or not r[1].strip() or not r[2].strip():
             continue
-        if key not in s or hashlib.sha256(open(f, 'rb').read()).hexdigest() != s[key]['sha256']:
-            raise Refused(f'{f} is not the {key} file of snapshot {path}: rebuild both from one read of the tabs')
+        d, amt = parse_day(r[1], w), money(r[2], w)
+        if amt == 0:
+            continue
+        kind = items = None; src = ''
+        if cc:
+            parts = [x for x in re.split(r'[\s,;]+', cc) if x]
+            if not parts or parts[0].lower() not in COVER_KINDS or len(parts) < 2:
+                raise Refused(f'{w}: Covers {cc!r} is not "<pay|reverse|dup|claw> <spiff:LineID|comm:LineID|xfer> ..."')
+            kind, items, src = parts[0].lower(), parts[1:], 'covers_column'
+        else:
+            for sd in seeds:
+                if (sd['agent'] in ('*', ag) and sd['day'] == d and (sd['amt'] is None or abs(sd['amt'] - amt) < Decimal('0.005'))
+                        and sd['rx'].search(note)):
+                    kind, items, src = sd['kind'], sd['items'], 'cover_seed'
+                    break
+        if not kind:
+            continue
+        pf = friday_on_or_after(d)
+        for it in items:
+            if ':' not in it:
+                if it.lower() != 'xfer':
+                    raise Refused(f'{w}: cover item {it!r}')
+                continue
+            typ, lid = it.split(':', 1)
+            if typ.lower() not in ('spiff', 'comm') or not re.fullmatch(LINE_RE, lid):
+                raise Refused(f'{w}: cover item {it!r} is not spiff:<Line ID> / comm:<Line ID>')
+            if pf > last_hub_payday:
+                raise Refused(f'{w}: line-linked adjustment on {pf}, after the last hub payday {last_hub_payday}: the hub has '
+                              'not paid it; decide it before the cutover')
+            lines.append([str(i), lid, 'spiffs' if typ.lower() == 'spiff' else 'commission', kind, ag, pf.isoformat(),
+                          f'{amt:.2f}', src, note])
+    write_private(out_path, ADJ_HEADER, lines)
+    return len(lines)
+
+
+def load_adj(path, last_hub_payday=None):
+    """Strict reader for the normalized paid-elsewhere import file -> (sha256, rows)."""
+    sha = hashlib.sha256(open(path, 'rb').read()).hexdigest()
+    t = read_csv(path)
+    if not t or [h.strip() for h in t[0]] != ADJ_HEADER:
+        raise Refused(f'{path}: header must be exactly {" | ".join(ADJ_HEADER)}')
+    out, seen = [], set()
+    for i, r in enumerate(t[1:], start=2):
+        w = f'paid-elsewhere line {i}'
+        if len(r) != len(ADJ_HEADER):
+            raise Refused(f'{w}: {len(r)} columns, expected {len(ADJ_HEADER)}')
+        row = int(r[0]); lid, comp, kind, ag = r[1].strip(), r[2].strip(), r[3].strip(), r[4].strip()
+        if not re.fullmatch(LINE_RE, lid) or comp not in ('spiffs', 'commission') or kind not in COVER_KINDS or not ag:
+            raise Refused(f'{w}: bad Line ID / Component / Cover Kind / Agent')
+        pf = parse_day(r[5], w)
+        if pf.weekday() != 4:
+            raise Refused(f'{w}: Payday {pf} is not a Friday')
+        if last_hub_payday is not None and pf > last_hub_payday:
+            raise Refused(f'{w}: Payday {pf} is after the Paid Lock file\'s last payday {last_hub_payday} (re-read the tabs together)')
+        if r[7].strip() not in ('covers_column', 'cover_seed'):
+            raise Refused(f'{w}: Source {r[7]!r}')
+        if (row, lid, comp) in seen:
+            raise Refused(f'{w}: duplicate tab row / line / component')
+        seen.add((row, lid, comp))
+        out.append(dict(row=row, line_id=lid, comp=comp, kind=kind, agent=ag, payday=pf, amt=money(r[6], w), source=r[7].strip(),
+                        note=r[8].strip() or None))
+    return sha, out
+
+
+def sha_of(f):
+    return hashlib.sha256(open(f, 'rb').read()).hexdigest()
+
+
+def check_snapshot(path, csv_path, open_path, adj_path):
+    """Mandatory: every import file must be the one build wrote in the same read; the hub code file still as hashed."""
+    try:
+        s = json.load(open(path))
+    except (OSError, ValueError) as e:
+        raise Refused(f'snapshot {path}: {e}')
+    for key, f in (('paid_lock', csv_path), ('lock_open', open_path), ('adjustments', adj_path)):
+        if f is None:
+            if key in s:
+                raise Refused(f'snapshot {path} has a {key} file but none was passed (pass it, not --no-...)')
+            continue
+        if key not in s or sha_of(f) != s[key]['sha256']:
+            raise Refused(f'{f} is not the {key} file of snapshot {path}: rebuild all from one read of the tabs')
+    cs = s.get('cover_seeds')
+    if adj_path is not None and cs is None:
+        raise Refused(f'snapshot {path} does not record the hub code cover seeds file (rebuild)')
+    if cs and cs.get('sha256'):
+        if not os.path.exists(cs['file']) or sha_of(cs['file']) != cs['sha256']:
+            raise Refused(f"hub code cover seeds {cs['file']} changed or missing since snapshot {path}: rebuild")
 
 
 def write_private(path, header, lines):
@@ -326,22 +423,36 @@ def cmd_build(a):
     if a.lock_open_formatted:
         if not a.lock_open_out:
             die('--lock-open-formatted needs --lock-open-out')
-        if not a.hub_code_seeds and not a.no_code_seeds:
-            die('pass --hub-code-seeds (private CSV of the hub code LOCK_OPEN_SEEDS_ items) or --no-code-seeds')
-        build_open(a.lock_open_formatted, a.lock_open_out, seeds=None if a.no_code_seeds else a.hub_code_seeds)
+        build_open(a.lock_open_formatted, a.lock_open_out)
     elif not a.no_lock_open:
         die('pass --lock-open-formatted (the hub Lock Open Items tab, read in the SAME pass as Paid Lock) or --no-lock-open')
+    if a.adjustments_formatted:
+        if not a.adjustments_out:
+            die('--adjustments-formatted needs --adjustments-out')
+        if not a.cover_seeds and not a.no_cover_seeds:
+            die('pass --cover-seeds (private CSV of the hub code COVER_SEEDS_, minus the wrong-ID links) or --no-cover-seeds')
+        last = max(dt.date.fromisoformat(x[0]) for x in lines)
+        try:
+            build_adj(a.adjustments_formatted, None if a.no_cover_seeds else a.cover_seeds, a.adjustments_out, last)
+        except Refused as e:
+            die(str(e))
+    elif not a.no_adjustments:
+        die('pass --adjustments-formatted (the hub Manual Adjustments tab, read in the SAME pass) or --no-adjustments')
     snap = {'built_at_et': dt.datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S'),
             'sources': {os.path.basename(x): hashlib.sha256(open(x, 'rb').read()).hexdigest()
-                        for x in (a.unformatted, a.formatted, a.lock_open_formatted) if x},
+                        for x in (a.unformatted, a.formatted, a.lock_open_formatted, a.adjustments_formatted) if x},
             'paid_lock': {'file': os.path.realpath(a.out), 'sha256': hashlib.sha256(open(a.out, 'rb').read()).hexdigest()}}
     if a.lock_open_formatted:
         snap['lock_open'] = {'file': os.path.realpath(a.lock_open_out), 'sha256': hashlib.sha256(open(a.lock_open_out, 'rb').read()).hexdigest()}
+    if a.adjustments_formatted:
+        snap['adjustments'] = {'file': os.path.realpath(a.adjustments_out), 'sha256': sha_of(a.adjustments_out)}
+        snap['cover_seeds'] = ({'file': os.path.realpath(a.cover_seeds), 'sha256': sha_of(a.cover_seeds)} if not a.no_cover_seeds
+                               else {'file': None, 'sha256': None, 'note': '--no-cover-seeds'})
     sp = os.path.join(os.path.dirname(os.path.realpath(a.out)), 'snapshot.json')
     fd = os.open(sp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as fh:
         json.dump(snap, fh, indent=1)
-    print(f'wrote {sp} (both import files come from this one read)')
+    print(f'wrote {sp} (all import files come from this one read)')
 
 
 # ------------------------------------------------------------------ check
@@ -452,13 +563,41 @@ def cmd_check(a):
         for r in orows:
             P(f"| {r['line_id']} | {r['agent']} | {r['type']} | {r['kind']} | {r['orig']} | {r['est']:,.2f} | {r['through']} | "
               f"{r['paid_on'] or '—'} | {r['source']} |")
-        tab = [r for r in op if r['source'] != 'hub_code_seed']; sd = [r for r in op if r['source'] == 'hub_code_seed']
         by = {}
-        for r in tab:
+        for r in op:
             by.setdefault(r['agent'], [0, Decimal('0')]); by[r['agent']][0] += 1; by[r['agent']][1] += r['est']
-        P('\nStill open from the tab, by agent: ' + '; '.join(f'{k} {v[0]} (${v[1]:,.2f})' for k, v in sorted(by.items()))
-          + f"; **total {len(tab)} items, ${sum(r['est'] for r in tab):,.2f} est. commission**"
-          + (f" (+ {len(sd)} hub code seed(s): " + '; '.join(f"{r['agent']} {r['line_id']} est ${r['est']:,.2f}, spiff pays when Premier confirms" for r in sd) + ')' if sd else ''))
+        P('\nStill open, by agent: ' + '; '.join(f'{k} {v[0]} (${v[1]:,.2f})' for k, v in sorted(by.items()))
+          + f"; **total {len(op)} items, ${sum(r['est'] for r in op):,.2f} est. commission** (tab only; no placeholder items)")
+    if a.adjustments:
+        try:
+            asha, arows = load_adj(a.adjustments, days[-1])
+        except Refused as e:
+            P(f'\n**Paid-elsewhere markers: REFUSED**: {e}'); sys.exit(1)
+        P(f"\n**Hub line-linked adjustments → paid-elsewhere markers** ({os.path.basename(a.adjustments)}, sha256 {asha}): "
+          f"{len(arows)} markers on {len({(r['line_id'], r['comp']) for r in arows})} line components. Not imported as pay "
+          f"(already inside the Paid Lock totals); the marked component pays $0 in the backend and is never locked.\n")
+        P('| Tab row | Payday | Agent | Kind | Line ID | Component | Amount | Source |\n|---:|---|---|---|---|---|---:|---|')
+        for r in sorted(arows, key=lambda x: (x['payday'], x['row'])):
+            P(f"| {r['row']} | {r['payday']} | {r['agent']} | {r['kind']} | {r['line_id']} | {r['comp']} | {r['amt']:+,.2f} | {r['source']} |")
+        P('\n**Per line component** (where the hub settled it; the backend pays it $0 from the cutover on):\n')
+        P('| Line ID | Component | Hub adjustments | Settled |\n|---|---|---|---|')
+        for lid, comp in sorted({(r['line_id'], r['comp']) for r in arows}):
+            rs = sorted([r for r in arows if r['line_id'] == lid and r['comp'] == comp], key=lambda x: (x['payday'], x['row']))
+            pays = [r for r in rs if r['kind'] == 'pay']
+            settled = (f"paid {pays[-1]['payday']} via the lock (Paid Lock {pays[-1]['payday']})" if pays
+                       else {'dup': 'paid outside the system (dup)', 'claw': 'clawed by the hub', 'reverse': 'reversed by the hub'}[rs[-1]['kind']])
+            P(f"| {lid} | {comp} | " + ', '.join(f"{r['payday']} {r['kind']} {r['amt']:+,.2f}" for r in rs) + f" | {settled} |")
+        # parity: Paid − System variances next to the line-linked adjustments of that agent / payday
+        P('\n**Parity: Paid − System vs line-linked adjustments** (per agent and payday):\n')
+        P('| Pay Friday | Agent | Paid − System | Line-linked adjustments that payday |\n|---|---|---:|---|')
+        keys = sorted({(r['payday'], r['agent']) for r in arows} | {(r['payday'], r['agent']) for r in vr})
+        for d, ag in keys:
+            v = sum((r['paid'] - r['system']) for r in vr if r['payday'] == d and r['agent'] == ag)
+            adj = [r for r in arows if r['payday'] == d and r['agent'] == ag]
+            seen_rows = {}
+            for r in adj:
+                seen_rows.setdefault(r['row'], r)
+            P(f"| {d} | {ag} | {v:+,.2f} | " + ('; '.join(f"row {x['row']} {x['kind']} {x['amt']:+,.2f} ({x['line_id']})" for x in seen_rows.values()) or '—') + ' |')
     P('\n**Duplicates** (Pay Friday + Agent, case-insensitive): none (the loader refuses any).')
     P(f"\n**Date parsing (ET)**: every Pay Friday is a Friday on/before today ET ({TODAY_ET}); Locked At is written as "
       f"`timestamp '<value>' at time zone 'America/New_York'` (no DateStyle dependence):")
@@ -480,13 +619,19 @@ def lit(s):
 MIGRATION = os.path.join(REPO_ROOT, 'supabase', 'migrations', '20261101120000_hub_lock_open_items.sql')
 
 
-def build_sql(path, confirm, today=None, open_path=None, token=None):
+def build_sql(path, confirm, today=None, open_path=None, adj_path=None, token=None):
     sha, rows, warns = load(path, today)
     days = sorted({r['payday'] for r in rows})
     osha, orows = None, []
     if open_path:
         osha, orows, ow = load_open(open_path, days[-1], {r['agent'] for r in rows}); warns += ow
     oopen = [r for r in orows if r['paid_on'] is None]
+    asha, arows = (None, [])
+    if adj_path:
+        asha, arows = load_adj(adj_path, days[-1])
+    avals = ',\n      '.join(
+        f"({r['row']}, {lit(r['line_id'])}, {lit(r['comp'])}, {lit(r['kind'])}, {lit(r['agent'])}, date '{r['payday']}', "
+        f"{r['amt']:.2f}, {lit(r['source'])}, {lit(r['note'])})" for r in arows)
     ovals = ',\n      '.join(
         f"({r['row_num']}, {lit(r['line_id'])}, {lit(r['agent'])}, {lit(r['member'])}, {lit(r['type'])}, date '{r['orig']}', "
         f"{r['est']:.2f}, {lit(r['status'])}, date '{r['through']}', {'null' if r['paid_on'] is None else "date '" + str(r['paid_on']) + "'"}, "
@@ -526,12 +671,30 @@ def build_sql(path, confirm, today=None, open_path=None, token=None):
   select count(*) into matched from _hub_open o where o.paid_on is null
      and exists (select 1 from public.premier_recon_lines l where l.hub_line_id = o.line_id);
 """
+    adj_block = '' if not arows else f"""
+  create temp table _hub_pe (tab_row int not null, line_id text not null, component text not null, cover_kind text not null,
+                             agent_name text not null, payday date not null, amount numeric(12,2) not null, source text not null,
+                             note text, primary key (tab_row, line_id, component)) on commit drop;
+  insert into _hub_pe values
+      {avals};
+  select count(*) into n from _hub_pe;
+  if n <> c_adj_rows then raise exception 'hub cutover REFUSED: % paid-elsewhere markers, expected %', n, c_adj_rows; end if;
+  if exists (select 1 from _hub_pe where payday > c_last) then
+    raise exception 'hub cutover REFUSED: a line-linked adjustment is after the Paid Lock file''s last payday %', c_last;
+  end if;
+  insert into public.hub_paid_elsewhere (file_sha256, tab_row, line_id, component, cover_kind, agent_name, payday, amount, source, note)
+  select c_adj_sha, tab_row, line_id, component, cover_kind, agent_name, payday, amount, source, note
+    from _hub_pe order by tab_row, line_id, component;
+  select count(distinct p.line_id || p.component) into pe_matched from _hub_pe p
+   where exists (select 1 from public.premier_recon_lines l where l.hub_line_id = p.line_id);
+"""
     return f"""-- HUB CUTOVER {mode}
 -- One-time import of the hub Paid Lock tab (Kyle 11/01 11:55 AM ET layout: Pay Friday | Agent | Paid Total | System Total |
 -- Locked At (ET) | Note). File {fname}: {len(rows)} rows, sha256 {sha}; paydays {', '.join(map(str, days))};
 -- last_hub_payday {days[-1]}; Paid Total sum {total:.2f}. Built by scripts/hub_cutover.py.
 -- Lock Open Items: {os.path.basename(open_path) if open_path else 'NONE (--no-lock-open)'}{f': {len(orows)} rows, sha256 {osha}; {len(oopen)} still open (est. {sum(r["est"] for r in oopen):.2f}) = exempt from paid_by_hub' if open_path else ''}.
--- Also (re)applies migration 20261101120000_hub_lock_open_items (idempotent DDL) in the same transaction.
+-- Hub line-linked adjustments: {os.path.basename(adj_path) if adj_path else 'NONE (--no-adjustments)'}{f': {len(arows)} paid-elsewhere markers, sha256 {asha} (not pay: the marked components pay $0)' if adj_path else ''}.
+-- Also applies migration 20261101120000_hub_lock_open_items if it is not in place yet (SQL Editor only), same transaction.
 -- Run in the Supabase SQL Editor (postgres break-glass, audited) or as the payroll owner. ONE statement (a DO block), so it
 -- is one transaction whatever the editor does. Re-running after it is recorded from this same file is a no-op; any other
 -- file is refused. Refused if this system already locked any payday (pay_line_locks), so no live locked week is touched.
@@ -542,10 +705,17 @@ begin;
 -- the SQL Editor (DDL); an owner-login run needs it applied beforehand.
 do $mig$
 declare present boolean := to_regclass('public.hub_lock_open_items') is not null
-   and to_regclass('public.premier_recon_hub_open') is not null
-   and exists (select 1 from pg_views where schemaname = 'public' and viewname = 'premier_recon_trueup' and definition like '%hub_lock_open_items%')
-   and exists (select 1 from pg_proc where proname = 'premier_lock_payday' and prosrc like '%hub_lock_open_items%');
+   and to_regclass('public.hub_paid_elsewhere') is not null and to_regclass('public.premier_recon_hub_open') is not null
+   and to_regprocedure('public.hub_open_items_schema_ok()') is not null;
+        ok boolean;
 begin
+  -- rerun guard: migration in place but the 10/31 views / lock function were re-run after it (exemption gone)
+  if present then
+    execute 'select public.hub_open_items_schema_ok()' into ok;
+  end if;
+  if present and not ok then
+    raise exception 'hub cutover REFUSED: premier_recon_trueup / premier_lock_payday lack the open-item exemption and paid-elsewhere markers (20261031210100 / 20261031210200 re-run after 20261101120000): re-run 20261101120000 first';
+  end if;
   if not present then
     if current_user not in ('postgres', 'supabase_admin') then
       raise exception 'hub cutover REFUSED: migration 20261101120000_hub_lock_open_items is not applied; apply it in the SQL Editor first';
@@ -575,8 +745,11 @@ declare
   c_open_rows constant int := {len(orows)};
   c_open_open constant int := {len(oopen)};
   c_open_est  constant numeric := {sum(r['est'] for r in oopen):.2f};
+  c_adj_sha   constant text := {lit(asha)};
+  c_adj_rows  constant int := {len(arows)};
   c_token     constant text := {lit(token)};
   cur record; b record; n int; v_open int; s numeric; bad text; unmapped text; frozen int; summary text; matched int := 0; ob int;
+  pe_matched int := 0;
   fp text; tok text; blockers text;
 begin
   if to_regclass('public.hub_cutover') is null or to_regclass('public.hub_paid_lock') is null then
@@ -586,7 +759,8 @@ begin
   select * into cur from public.hub_cutover;
   if found then
     select count(*) into ob from public.hub_lock_open_items where file_sha256 is not distinct from c_open_sha;
-    if cur.file_sha256 = c_sha and cur.row_count = c_rows and ob = c_open_rows then
+    if cur.file_sha256 = c_sha and cur.row_count = c_rows and ob = c_open_rows
+       and (select count(*) from public.hub_paid_elsewhere where file_sha256 is not distinct from c_adj_sha) = c_adj_rows then
       if c_dry then raise exception 'HUB CUTOVER DRY RUN: already recorded from this file at % (% rows, last_hub_payday %): nothing to do', cur.recorded_at, cur.row_count, cur.last_hub_payday; end if;
       raise notice 'hub cutover already recorded from this file at % (% rows, last_hub_payday %): no-op', cur.recorded_at, cur.row_count, cur.last_hub_payday;
       return;
@@ -598,6 +772,8 @@ begin
   if n > 0 then raise exception 'hub cutover REFUSED: hub_paid_lock already holds % row(s) without a cutover record: investigate first', n; end if;
   select count(*) into n from public.hub_lock_open_items;
   if n > 0 then raise exception 'hub cutover REFUSED: hub_lock_open_items already holds % row(s) without a cutover record: investigate first', n; end if;
+  select count(*) into n from public.hub_paid_elsewhere;
+  if n > 0 then raise exception 'hub cutover REFUSED: hub_paid_elsewhere already holds % row(s) without a cutover record: investigate first', n; end if;
   select * into b from public.recon_cutover_bounds();
   if b.first_locked is not null then
     raise exception 'hub cutover REFUSED: this system already locked payday % (pay_line_locks): the cutover must come first and never touches a locked week', b.first_locked;
@@ -609,9 +785,9 @@ begin
   -- N-1 dry run before confirm: the dry run prints a token = hash of both file shas + the live state it checked
   -- (hub tables, locks, submits, board / Premier loads, roster). The APPLY embeds that token and refuses unless the
   -- live state still hashes to it, i.e. this exact file was dry-run against this exact state. Nothing is written for it.
-  fp := md5(concat_ws('|', c_sha, coalesce(c_open_sha, '-'),
+  fp := md5(concat_ws('|', c_sha, coalesce(c_open_sha, '-'), coalesce(c_adj_sha, '-'),
               (select count(*) from public.hub_cutover), (select count(*) from public.hub_paid_lock),
-              (select count(*) from public.hub_lock_open_items),
+              (select count(*) from public.hub_lock_open_items), (select count(*) from public.hub_paid_elsewhere),
               (select count(*) || ':' || coalesce(max(id), 0) from public.pay_line_locks),
               (select count(*) || ':' || coalesce(max(payday)::text, '-') from public.payroll_cutoffs where source = 'submit'),
               (select count(*) || ':' || coalesce(max(id), 0) from public.board_submissions),
@@ -642,7 +818,7 @@ begin
 
   insert into public.hub_paid_lock (file_sha256, row_num, payday, agent_name, paid_total, system_total, locked_at, note)
   select c_sha, row_num, payday, agent_name, paid_total, system_total, locked_at, note from _hub_rows order by row_num;
-{open_block}
+{open_block}{adj_block}
   -- N-2: every name that carries hub dollars (or a still-open item) must resolve to a backend roster agent or alias,
   -- so a spelling mismatch can't silently orphan an agent's hub history. UNKNOWN at $0 is exempt.
   select string_agg(nm, ', ' order by nm) into blockers from (
@@ -676,12 +852,14 @@ begin
                              'lock_open_items', jsonb_build_object('file_sha256', c_open_sha, 'rows', c_open_rows,
                                                                    'still_open', c_open_open, 'est_commission', c_open_est,
                                                                    'matched_board_lines', matched),
+                             'paid_elsewhere', jsonb_build_object('file_sha256', c_adj_sha, 'markers', c_adj_rows,
+                                                                  'matched_board_line_components', pe_matched),
                              'path', case when public.audit_actor_role() in ('postgres', 'supabase_admin')
                                           then 'break-glass:' || public.audit_actor_role() else 'owner-login' end,
                              'ruling', 'Kyle 11/01 11:55 AM ET (relayed by Orchestrator): Paid Lock layout for the one-time import'));
   end if;
-  summary := format('%s rows, %s paid, paydays %s, last_hub_payday %s, board submissions frozen %s, lock open items %s (%s still open, est %s; %s matched to loaded board lines), agent names with no backend agent id: %s',
-                    n, s, cur.paydays, cur.last_hub_payday, frozen, c_open_rows, c_open_open, c_open_est, matched, coalesce(unmapped, 'none'));
+  summary := format('%s rows, %s paid, paydays %s, last_hub_payday %s, board submissions frozen %s, lock open items %s (%s still open, est %s; %s matched to loaded board lines), paid-elsewhere markers %s (%s matched), agent names with no backend agent id: %s',
+                    n, s, cur.paydays, cur.last_hub_payday, frozen, c_open_rows, c_open_open, c_open_est, matched, c_adj_rows, pe_matched, coalesce(unmapped, 'none'));
   if c_dry and blockers is not null then
     raise exception 'HUB CUTOVER DRY RUN BLOCKED (rolled back, nothing written; no token): names with hub dollars and no backend roster agent / alias: %. Plan: %', blockers, summary;
   elsif c_dry then
@@ -710,12 +888,16 @@ def cmd_sql(a):
         die('use --out FILE (outside the repo) or --psql "<args>"')
     if not a.lock_open and not a.no_lock_open:
         die('pass --lock-open lock_open_import.csv (the hub Lock Open Items), or --no-lock-open to cut over without them')
+    if not a.adjustments and not a.no_adjustments:
+        die('pass --adjustments adjustments_import.csv (hub line-linked adjustments = paid-elsewhere markers), or --no-adjustments')
     try:
         if a.confirm_hub and not re.fullmatch(r'[0-9A-F]{10}', a.dry_run_token or ''):
             raise Refused('--confirm-hub needs --dry-run-token TOKEN: the 10-character token printed by the DRY RUN of this file')
-        if a.snapshot:
-            check_snapshot(a.snapshot, a.csv, a.lock_open)
-        sql, sha, rows, warns = build_sql(a.csv, a.confirm_hub, open_path=a.lock_open, token=a.dry_run_token if a.confirm_hub else None)
+        sql, sha, rows, warns = build_sql(a.csv, a.confirm_hub, open_path=a.lock_open, adj_path=a.adjustments,
+                                          token=a.dry_run_token if a.confirm_hub else None)
+        if not a.snapshot:      # mandatory (checked after the files themselves, so a bad file reports its own error)
+            raise Refused('--snapshot snapshot.json (written by build) is mandatory: every import file must come from one read of the tabs')
+        check_snapshot(a.snapshot, a.csv, a.lock_open, a.adjustments)
     except Refused as e:
         die(f'REFUSED: {e}')
     for w in warns:
@@ -740,17 +922,19 @@ if __name__ == '__main__':
     sp = ap.add_subparsers(dest='cmd', required=True)
     b = sp.add_parser('build'); b.add_argument('--unformatted', required=True); b.add_argument('--formatted', required=True); b.add_argument('--out', required=True)
     b.add_argument('--lock-open-formatted', help='the hub Lock Open Items tab as displayed (CSV)'); b.add_argument('--lock-open-out')
-    b.add_argument('--hub-code-seeds', help='private CSV of the hub code LOCK_OPEN_SEEDS_ items (header: ' + ','.join(SEEDS_HEADER) + ')')
-    b.add_argument('--no-code-seeds', action='store_true', help='leave out the hub code LOCK_OPEN_SEEDS_ items')
+    b.add_argument('--adjustments-formatted', help='the hub Manual Adjustments tab as displayed (CSV)'); b.add_argument('--adjustments-out')
+    b.add_argument('--cover-seeds', help='private CSV of the hub code COVER_SEEDS_ (header: ' + ','.join(COVER_SEEDS_HEADER) + ')')
+    b.add_argument('--no-cover-seeds', action='store_true'); b.add_argument('--no-adjustments', action='store_true')
     b.add_argument('--no-lock-open', action='store_true', help='build without the Lock Open Items tab (not for the real cutover)')
     c = sp.add_parser('check'); c.add_argument('--csv', required=True)
-    for o in ('--roster', '--aliases', '--finalized', '--lock-open', '--agents-sql'):
+    for o in ('--roster', '--aliases', '--finalized', '--lock-open', '--adjustments', '--agents-sql'):
         c.add_argument(o)
     s = sp.add_parser('sql'); s.add_argument('--csv', required=True); s.add_argument('--dry-run', action='store_true')
     s.add_argument('--confirm-hub', action='store_true'); s.add_argument('--out'); s.add_argument('--psql')
     s.add_argument('--lock-open', help='normalized Lock Open Items import file (from build)'); s.add_argument('--no-lock-open', action='store_true')
     s.add_argument('--dry-run-token', help='token printed by the DRY RUN (required for --confirm-hub)')
-    s.add_argument('--snapshot', help='snapshot.json written by build: both files must be from that one read')
+    s.add_argument('--snapshot', help='snapshot.json written by build (mandatory): all files must be from that one read')
+    s.add_argument('--adjustments', help='normalized paid-elsewhere import file (from build)'); s.add_argument('--no-adjustments', action='store_true')
     a = ap.parse_args()
     TODAY_ET = dt.date.fromisoformat(a.today) if a.today else dt.datetime.now(ET).date()
     {'build': cmd_build, 'check': cmd_check, 'sql': cmd_sql}[a.cmd](a)

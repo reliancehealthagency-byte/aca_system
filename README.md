@@ -88,8 +88,10 @@ Layout (Kyle 11/01 11:55 AM ET, relayed): `Pay Friday | Agent | Paid Total | Sys
 Paid Lock tab, plus the hub's Lock Open Items tab (read-only, from the SAME read). `scripts/hub_cutover.py`:
 - `build`: Paid Lock read twice (UNFORMATTED serials + as displayed; both must agree) -> normalized CSV (ISO dates, cents,
   Locked At to the minute in ET; the display hides the time). Lock Open Items -> normalized CSV (kind post_date | unconfirmed),
-  plus the hub code's `LOCK_OPEN_SEEDS_` items from a private `--hub-code-seeds` CSV. Writes `snapshot.json` (both shas):
-  `sql --snapshot` refuses files from different reads. Real pay data never goes in this public repo (`--out` refuses).
+  tab rows only (the hub has no placeholder logic; a $0 pending line in a snapshot is only a rendering). Manual Adjustments ->
+  paid-elsewhere markers (below), with the hub code `COVER_SEEDS_` from a private `--cover-seeds` CSV (the hard-coded
+  wrong-ID links are left out). Writes `snapshot.json` (every import sha + the cover seeds file sha). `sql --snapshot` is
+  MANDATORY and refuses files from different reads or a changed seeds file. Real pay data never goes in this public repo.
 - `check`: rows and sums per payday, Paid vs System variances, duplicates, hub-roster and backend agent-id mapping, ET parsing,
   System Total vs Finalized Paydays, open items by agent. Exit 1 on a hard error.
 - `sql --dry-run | --confirm-hub --dry-run-token T`: one SQL Editor paste = one transaction (migration
@@ -102,6 +104,14 @@ Paid Lock tab, plus the hub's Lock Open Items tab (read-only, from the SAME read
 - Roster check (in SQL): every name carrying hub dollars or a still-open item must resolve to a backend agent or
   `agent_name_aliases` row, else DRY RUN BLOCKED (no token) / APPLY refused. `UNKNOWN` at $0 is exempt. Board rows loaded
   before the roster keep a NULL agent id (not back-filled by the cutover).
+- Hub-era Manual Adjustments are NOT imported as pay (they are inside the Paid Lock totals). Every line-linked one
+  (Covers `pay|reverse|dup|claw spiff:<line>|comm:<line>`, or a cover-seed match) becomes a marker in `hub_paid_elsewhere`:
+  that line component pays $0 in the backend (status `hub_paid_elsewhere`) and `premier_lock_payday` never locks it, however
+  spiffs are recomputed later. A line-linked adjustment on a payday after the last hub payday is refused (decide it first).
+- Guards: migration 20261101120000 and the preflight refuse if slice 4a (20261101100000 / 20261101100100) is already
+  applied (merge order #7 first; 4a rebased on top ships the combined view and lock function). If the 10/31 views / lock
+  migrations are re-run after 20261101120000, `pay_line_locks_hub_schema_guard` refuses every payday lock (and the preflight
+  and the cutover paste refuse) until 20261101120000 is re-run (`hub_open_items_schema_ok()`).
 - Open items: a still-open item (Paid On blank) is exempt from `paid_by_hub`: once Premier confirms, it shows as
   `hub_open_item` in `premier_recon_trueup` and pays ONCE on the next open payday (post dates: commission; unconfirmed:
   commission + spiffs), locked by `premier_lock_payday`. An item with Paid On set was paid by the hub and stays $0.
