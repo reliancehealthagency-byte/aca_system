@@ -19,6 +19,8 @@ o as (
          to_regprocedure('public.recon_line_pays(text, boolean)') is not null and to_regprocedure('public.premier_lock_payday(date)') is not null
            and to_regprocedure('public.payroll_cutoffs_guard()') is not null and to_regclass('public.premier_recon_trueup') is not null s3_objs,
          to_regclass('public.hub_lock_open_items') is not null and to_regclass('public.premier_recon_hub_open') is not null
+           and to_regclass('public.hub_paid_elsewhere') is not null and to_regprocedure('public.hub_open_items_schema_ok()') is not null
+           and strpos(pg_get_viewdef('public.premier_recon_trueup'::regclass), 'hub_paid_elsewhere') > 0
            and strpos(pg_get_viewdef('public.premier_recon_trueup'::regclass), 'hub_lock_open_items') > 0
            and strpos(pg_get_functiondef('public.premier_lock_payday(date)'::regprocedure), 'hub_lock_open_items') > 0 p7_objs,
          (select to_jsonb(c) ->> 'closed_week_policy' from public.recon_pay_config c where c.id) pol)

@@ -5,7 +5,8 @@
 -- Policy 'hold' (flag, pay NULL, Kyle decides) is the default; supabase/manual/closed_week_autopay_on.sql (NOT a migration:
 -- `supabase db push` can't apply it) switches it to 'next_open_payday' with Kyle's go-ahead; closed_week_autopay_off.sql back.
 -- ONE combined premier_recon_trueup / premier_lock_payday (Orchestrator X-1, 11/01 12:45 PM): PR #7's hub Lock Open Items
--- exemption (20261101120000, required first) + the closed-week carry + the cutover prerequisites (4a.1, all inside the clock,
+-- exemption AND hub_paid_elsewhere markers (20261101120000, required first; its rerun guard hub_open_items_schema_ok()
+-- stays satisfied because both definitions keep naming hub_lock_open_items and hub_paid_elsewhere) + the closed-week carry + the cutover prerequisites (4a.1, all inside the clock,
 -- i.e. no effect before the hub cutover is recorded):
 --   G1 a component that was $0 / not yet payable when its payday locked (e.g. Premier confirmed after the lock) pays ONCE on
 --      the next locked payday (zero amounts are no longer locked);
@@ -172,7 +173,7 @@ begin
               else 'locked by premier_lock_payday' end
     from (
       select l.line_key, l.agent_name, l.agent_id, l.expected_total, l.actual_total, v.component, v.due, v.amount, l.spiff_pay_friday,
-             (ho.kind is not null and v.component = 'commission' or ho.kind = 'unconfirmed') as ex,
+             coalesce(ho.kind is not null and v.component = 'commission' or ho.kind = 'unconfirmed', false) as ex,
              c.carried,
              case when c.carried and pol = 'next_open_payday'
                   then coalesce((select a.payday from public.closed_week_carry_anchors a where a.line_key = l.line_key and a.component = v.component),
@@ -181,6 +182,8 @@ begin
              c.late_held
         from public.premier_recon_lines l
         left join public.hub_lock_open_items ho on ho.line_id = l.hub_line_id and ho.paid_on is null
+        left join (select line_id, bool_or(component = 'commission') pe_c, bool_or(component = 'spiffs') pe_s
+                     from public.hub_paid_elsewhere group by line_id) pe on pe.line_id = l.hub_line_id
         cross join lateral (select coalesce(l.added_to_closed_week, false) or public.recon_hub_era_late(l.submission_key, l.submitted_at) as carried_any) cl
         cross join lateral (select cl.carried_any and pol = 'next_open_payday' as carried,
                                    cl.carried_any and pol = 'hold' as late_held) c
@@ -189,6 +192,9 @@ begin
                                    ('missed_spiffs', l.missed_spiff_pay_friday, coalesce(l.missed_spiffs, 0))) v(component, due, amount)
        where l.agent_name is not null and l.actual_commission is not null and l.actual_spiffs is not null
          and public.recon_line_pays(l.line_status, cl.carried_any)   -- status rule; a late / closed-week row is held under 'hold'
+         -- PR #7 hub_paid_elsewhere: that component was paid elsewhere (hub adjustment); never locked / paid again
+         and not (v.component = 'commission' and coalesce(pe.pe_c, false))
+         and not (v.component <> 'commission' and coalesce(pe.pe_s, false))
     ) x
    where x.amount <> 0
      and not exists (select 1 from public.pay_line_locks k where k.line_key = x.line_key and k.component = x.component)
@@ -226,6 +232,9 @@ pol as (select closed_week_policy from public.recon_pay_config where id),
 last_submit as (select max(payday) payday from public.payroll_cutoffs where source = 'submit'),
 -- PR #7: hub Lock Open Items still open at the cutover (no Paid On): exempt from paid_by_hub
 ho as (select line_id, kind from public.hub_lock_open_items where paid_on is null and public.recon_can_read()),
+-- PR #7: hub-era line-linked Manual Adjustments = paid-elsewhere markers: that component pays $0 and is never locked
+pe as (select line_id, bool_or(component = 'commission') pe_c, bool_or(component = 'spiffs') pe_s
+         from public.hub_paid_elsewhere where public.recon_can_read() group by line_id),
 lk as (select line_key,
               sum(amount) filter (where component = 'commission') commission,
               sum(amount) filter (where component = 'claimed_spiffs') claimed,
@@ -248,11 +257,14 @@ c as (
          public.recon_hub_era_late(l.submission_key, l.submitted_at) as hub_era_late,
          l.commission_pay_friday as orig_commission_due, l.spiff_pay_friday as orig_spiff_due, l.missed_spiff_pay_friday as orig_missed_due,
          (coalesce(l.added_to_closed_week, false) or public.recon_hub_era_late(l.submission_key, l.submitted_at)) and (select closed_week_policy from pol) = 'next_open_payday' as carried,
-         ho.kind is not null as ex_c,                               -- PR #7: commission exempt (post date or unconfirmed)
-         coalesce(ho.kind = 'unconfirmed', false) as ex_s           -- PR #7: spiffs exempt too (unconfirmed only, as the hub)
+         coalesce(pe.pe_c, false) as pe_c,                          -- PR #7: commission paid elsewhere (hub adjustment)
+         coalesce(pe.pe_s, false) as pe_s,                          -- PR #7: spiffs paid elsewhere (hub adjustment)
+         ho.kind is not null and not coalesce(pe.pe_c, false) as ex_c,                       -- PR #7: commission exempt
+         coalesce(ho.kind = 'unconfirmed', false) and not coalesce(pe.pe_s, false) as ex_s  -- PR #7: spiffs exempt (unconfirmed only)
     from public.premier_recon_lines l
     left join lk on lk.line_key = l.line_key
     left join ho on ho.line_id = l.hub_line_id
+    left join pe on pe.line_id = l.hub_line_id
 ),
 c2 as (
   -- slice 4a (Kyle directive 11/01, Hub v19.11 L1771-1779): under next_open_payday a closed-week (or hub-era late) row pays
@@ -269,6 +281,7 @@ c2 as (
 d as (
   select c.*,
          case when lc_commission is not null then lc_commission
+              when pe_c then 0                                         -- paid elsewhere (hub adjustment): never again
               when actual_commission is null then null
               when actual_commission = 0 then 0
               when held and hub_era_late then null                                                   -- G2 (never $0 hub-paid)
@@ -277,6 +290,7 @@ d as (
               when held then null
               else actual_commission end as pay_commission,
          case when ls_spiffs is not null then ls_spiffs
+              when pe_s then 0
               when claimed_spiffs = 0 then 0
               when held and hub_era_late then null
               when cutover is not null and eff_spiff_due <= cutover and not ex_s then 0
@@ -284,6 +298,7 @@ d as (
               when held then null
               else claimed_spiffs end as pay_claimed_spiffs,
          case when lm_missed is not null then lm_missed
+              when pe_s then 0
               when coalesce(missed_spiffs, 0) = 0 then 0
               when held and hub_era_late then null
               when cutover is not null and eff_missed_due <= cutover and not ex_s then 0
@@ -295,6 +310,8 @@ d as (
                   or (ls_spiffs is null and claimed_spiffs <> 0 and eff_spiff_due <= last_submit)
                   or (lm_missed is null and coalesce(missed_spiffs, 0) <> 0 and eff_missed_due <= last_submit))
               then 'cutover_pending_kyle'
+              when cutover is not null and ((pe_c and lc_commission is null) or (pe_s and ls_spiffs is null and lm_missed is null))
+              then 'hub_paid_elsewhere'
               when cutover is not null and (
                      (ex_c and lc_commission is null and orig_commission_due <= cutover and coalesce(actual_commission, 0) <> 0)
                   or (ex_s and ls_spiffs is null and claimed_spiffs <> 0 and orig_spiff_due <= cutover)
@@ -307,9 +324,9 @@ d as (
                   or (lm_missed is null and coalesce(missed_spiffs, 0) <> 0 and eff_missed_due <= cutover and not ex_s))
               then 'paid_by_hub' end as cutover_status,
          cutover is not null and last_submit is not null and (
-                (lc_commission is null and coalesce(actual_commission, 0) <> 0 and eff_commission_due > cutover and eff_commission_due <= last_submit)
-             or (ls_spiffs is null and claimed_spiffs <> 0 and eff_spiff_due > cutover and eff_spiff_due <= last_submit)
-             or (lm_missed is null and coalesce(missed_spiffs, 0) <> 0 and eff_missed_due > cutover and eff_missed_due <= last_submit))
+                (lc_commission is null and not pe_c and coalesce(actual_commission, 0) <> 0 and eff_commission_due > cutover and eff_commission_due <= last_submit)
+             or (ls_spiffs is null and not pe_s and claimed_spiffs <> 0 and eff_spiff_due > cutover and eff_spiff_due <= last_submit)
+             or (lm_missed is null and not pe_s and coalesce(missed_spiffs, 0) <> 0 and eff_missed_due > cutover and eff_missed_due <= last_submit))
            as due_on_submitted_payday_unlocked
     from c2 c
 )

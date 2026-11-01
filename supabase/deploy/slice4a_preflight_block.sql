@@ -1,6 +1,6 @@
 -- ===== PREFLIGHT (read-only; runs inside the transaction before any change) =====
 -- Fresh apply requires: slice three (5 versions) + Q30 (20261031220000) + PR #7's 20261101120000 (hub Lock Open Items)
--- applied and recorded WITH its objects (hub_lock_open_items, premier_recon_hub_open, the exemption in the true-up / lock),
+-- applied and recorded WITH its objects (hub_lock_open_items, hub_paid_elsewhere, premier_recon_hub_open, its rerun guard, the exemption in the true-up / lock),
 -- one recon_pay_config row, and NO slice-4a object yet (ledger tables, closed_week_policy column, carry anchors). Anything else aborts the whole paste.
 -- Re-run: if ledger_accounts exists AND both slice-4a versions are recorded, slice 4a is already applied: the rest is a no-op
 -- (every statement is idempotent; the backfill posts nothing new).
@@ -30,8 +30,10 @@ begin
   end if;
   -- PR #7 lands FIRST (merge order, Orchestrator X-1): recorded AND incorporated, else 4a would overwrite its exemption
   if p7 <> 1 or to_regclass('public.hub_lock_open_items') is null or to_regclass('public.premier_recon_hub_open') is null
+     or to_regclass('public.hub_paid_elsewhere') is null or to_regprocedure('public.hub_open_items_schema_ok()') is null
      or strpos(pg_get_viewdef('public.premier_recon_trueup'::regclass), 'hub_lock_open_items') = 0
-     or strpos(pg_get_functiondef('public.premier_lock_payday(date)'::regprocedure), 'hub_lock_open_items') = 0 then
+     or strpos(pg_get_functiondef('public.premier_lock_payday(date)'::regprocedure), 'hub_lock_open_items') = 0
+     or strpos(pg_get_viewdef('public.premier_recon_trueup'::regclass), 'hub_paid_elsewhere') = 0 then
     raise exception 'preflight failed: PR #7 (20261101120000 hub_lock_open_items) must be applied, recorded and in the true-up / lock first (recorded=%/1, table=%, view=%)',
       p7, to_regclass('public.hub_lock_open_items') is not null, to_regclass('public.premier_recon_hub_open') is not null;
   end if;

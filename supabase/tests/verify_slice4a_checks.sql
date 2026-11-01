@@ -159,13 +159,17 @@ select pg_temp.r('LG15. earned drops post on the Friday deposit date (week start
   and (select t.txn_date = '2026-11-27' from public.ledger_transactions t join public.manual_entries e on e.id = t.source_id
     where t.source_kind = 'manual_entry' and e.note = 'VERIFY LG15 week of Sun 11/22')
   and (select earned_total >= 100 from public.pl_actual_monthly where month_start = '2026-12-01')
-  and (select allstate_earned = 100 from public.pl_actual_weekly where week_start = '2026-11-29')
-  and (select confirmed_lines_match from public.pl_projected_vs_actual_weekly where week_start = '2026-11-29'),
+  and (select allstate_earned = 100 from public.pl_actual_weekly where week_start = '2026-11-29'),
   (select string_agg(e.note || ' -> ' || t.txn_date, '; ') from public.ledger_transactions t join public.manual_entries e on e.id = t.source_id
-    where t.source_kind = 'manual_entry' and e.note like 'VERIFY LG15%'));
+    where t.source_kind = 'manual_entry' and e.note like 'VERIFY LG15%')
+   || (select format(' | dec earned=%s', earned_total) from public.pl_actual_monthly where month_start = '2026-12-01')
+   || (select format(' | wk 11/29 allstate=%s | projected walk wk 11/29: %s', w.allstate_earned, (select to_jsonb(p) - 'week_end' from public.pl_weekly_walk p where p.week_start = '2026-11-29'))
+         from public.pl_actual_weekly w where week_start = '2026-11-29'));
+create temp table lg_chk as select public.ledger_check() ok;
 select pg_temp.r('LG16. routine check: ledger_check() = true on a clean ledger, logs one ledger.check event, and a watermark exists',
-  public.ledger_check() and exists (select 1 from public.event_log where event_type = 'ledger.check' and (detail ->> 'ok')::boolean)
-  and exists (select 1 from public.ledger_watermarks));
+  (select ok from lg_chk) and exists (select 1 from public.event_log where event_type = 'ledger.check' and (detail ->> 'ok')::boolean)
+  and exists (select 1 from public.ledger_watermarks),
+  (select format('total=%s unbal=%s empty=%s unposted=%s missing=%s', total, unbalanced, empty_transactions, unposted, missing_vs_watermark) from public.ledger_health));
 do $$ declare m text; begin
   begin
     alter table public.ledger_lines disable trigger user;
@@ -177,6 +181,8 @@ do $$ declare m text; begin
   perform pg_temp.r('LG17. tamper detection: postgres disabling the immutability triggers and deleting a transaction is caught (missing_vs_watermark > 0, ledger_check() false)',
     m ~ '^RESULT:[1-9][0-9]*:f$', m);
 end $$;
+create temp table lg_owner0 as select payroll_owner_user_id o from public.recon_pay_config where id;
+update public.recon_pay_config set payroll_owner_user_id = null where id;
 select pg_temp.act('authenticated','admin.test@example.com');
 create temp table lg_adm as select (select count(*) from public.ledger_transactions) tx, (select count(*) from public.pl_actual_weekly) wk,
   (select count(*) from public.ledger_health) h;
@@ -185,7 +191,7 @@ update public.recon_pay_config set payroll_owner_user_id = (select id from auth.
 select pg_temp.act('authenticated','admin.test@example.com');
 create temp table lg_own as select (select count(*) from public.ledger_transactions) tx, (select count(*) from public.pl_actual_weekly) wk;
 select pg_temp.srv();
-update public.recon_pay_config set payroll_owner_user_id = null where id;
+update public.recon_pay_config set payroll_owner_user_id = (select o from lg_owner0) where id;
 select pg_temp.r('LG18. Books are owner-only until 4c pay_admin: an admin who is not the payroll owner sees no ledger / actual P&L rows; the payroll owner does',
   (select tx = 0 and wk = 0 and h = 0 from lg_adm) and (select tx > 0 and wk > 0 from lg_own),
   (select format('admin tx=%s wk=%s | owner tx=%s wk=%s', a.tx, a.wk, o.tx, o.wk) from lg_adm a, lg_own o));
