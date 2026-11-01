@@ -1,8 +1,8 @@
 -- Slice 4a: READ-ONLY dependency and backfill check. Run in the SQL Editor before the paste; it changes nothing.
 -- kind 'dependent'  : objects that depend on the objects 20261101130100 replaces (create or replace keeps them). Expected
---                     exactly three: PR #7's view premier_recon_hub_open (reads premier_recon_trueup; 4a only appends
---                     columns), PR #7's rerun guard hub_open_items_schema_ok() (4a's definitions satisfy it), and the
---                     payroll_cutoffs_guard trigger. Any other 'dependent' row = review before applying.
+--                     PR #7's view premier_recon_hub_open (reads premier_recon_trueup; 4a only appends columns), PR #7's
+--                     rerun guard functions hub_open_items_schema_ok() / pay_line_locks_hub_schema_guard() (4a's
+--                     definitions satisfy them), and the payroll_cutoffs_guard trigger. Any other 'dependent' row = review before applying.
 -- kind 'collision'  : a slice-4a name already in use (expected: none; the preflight also refuses).
 -- kind 'backfill'   : source rows (count | total) and, for pay_adjustments, how many actually post (only those on a LOCKED
 --                     payday after the hub cutover; hub-era / unlocked ones never post). Live today: expected 0 everywhere

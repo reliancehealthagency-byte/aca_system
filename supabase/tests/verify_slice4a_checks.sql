@@ -257,3 +257,11 @@ do $$ begin
 exception when others then perform pg_temp.r('G4. a manual adjustment dated on/before the last hub payday (10/23 <= 10/30) is refused for an admin (hub-era adjustments are never pay)',
   sqlerrm like '%on or before the last hub payday%', sqlerrm); end $$;
 select pg_temp.srv();
+-- G4b: adjustments dated AFTER the last hub payday (hub rows after 10/30 are MUST RE-ENTER in PR #7, re-entered here) pass G4
+select pg_temp.act('authenticated','admin.test@example.com');
+do $$ begin
+  insert into public.pay_adjustments (agent_name, payday, kind, amount, reason) values ('Alex Testagent (fake)', '2026-11-06', 'manual', 5, 'VERIFY G4b re-entered after cutover');
+  perform pg_temp.r('G4b. an adjustment dated after the last hub payday (11/06 > 10/30; #7 MUST RE-ENTER rows) is not refused by G4', true, 'inserted');
+exception when others then perform pg_temp.r('G4b. an adjustment dated after the last hub payday (11/06 > 10/30; #7 MUST RE-ENTER rows) is not refused by G4',
+  sqlerrm not like '%on or before the last hub payday%', 'refused by another rule (allowed by G4): ' || sqlerrm); end $$;
+select pg_temp.srv();
