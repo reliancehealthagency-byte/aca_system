@@ -1,0 +1,39 @@
+-- Slice 4a: READ-ONLY dependency and backfill check. Run in the SQL Editor before the paste; it changes nothing.
+-- kind 'dependent'  : objects that depend on the four slice-three objects 20261101100100 replaces (create or replace keeps
+--                     them; expected: none besides grants). Any 'dependent' row = review before applying.
+-- kind 'collision'  : a slice-4a name already in use (expected: none; the preflight also refuses).
+-- kind 'backfill'   : confirmed source rows the ledger will post at apply time (count | total), for the review.
+with tgt(n) as (values ('premier_recon_trueup')),
+fns(n) as (values ('recon_line_pays'), ('premier_lock_payday'), ('payroll_cutoffs_guard'))
+select kind, object, detail from (
+  select 'dependent' kind, v.relname::text object, 'view depends on ' || s.relname detail
+    from pg_depend d
+    join pg_rewrite r on r.oid = d.objid and d.classid = 'pg_rewrite'::regclass
+    join pg_class v on v.oid = r.ev_class
+    join pg_class s on s.oid = d.refobjid and d.refclassid = 'pg_class'::regclass
+   where s.relnamespace = 'public'::regnamespace and s.relname in (select n from tgt) and v.oid <> s.oid
+  union all
+  select 'dependent', p.oid::regprocedure::text, 'function body names premier_recon_trueup'
+    from pg_proc p where p.pronamespace = 'public'::regnamespace and p.prosrc ~ '\mpremier_recon_trueup\M'
+  union all
+  select 'dependent', t.tgname || ' on ' || t.tgrelid::regclass::text, 'trigger calls ' || p.proname
+    from pg_trigger t join pg_proc p on p.oid = t.tgfoid where not t.tgisinternal and p.proname in (select n from fns)
+  union all
+  select 'collision', c.relname::text, c.relkind::text from pg_class c
+   where c.relnamespace = 'public'::regnamespace
+     and (c.relname like 'ledger\_%' or c.relname like 'pl\_actual\_%' or c.relname like 'pl\_projected\_%' or c.relname = 'closed_week_carry_anchors')
+     and c.relname not like 'pl\_projected\_rep\_pay%'
+  union all
+  select 'collision', 'recon_pay_config.closed_week_policy', 'column exists'
+    from information_schema.columns where table_schema = 'public' and table_name = 'recon_pay_config' and column_name = 'closed_week_policy'
+  union all
+  select 'backfill', 'manual_entries (current, confirmed kinds)', count(*) || ' | ' || coalesce(sum(amount), 0) from public.manual_entries
+  union all
+  select 'backfill', 'overhead_entries', count(*) || ' | ' || coalesce(sum(amount), 0) from public.overhead_entries
+  union all
+  select 'backfill', 'pay_line_locks', count(*) || ' | ' || coalesce(sum(amount), 0) from public.pay_line_locks
+  union all
+  select 'backfill', 'pay_adjustments', count(*) || ' | ' || coalesce(sum(amount), 0) from public.pay_adjustments
+  union all
+  select 'backfill', 'hub_paid_lock', count(*) || ' | ' || coalesce(sum(paid_total), 0) from public.hub_paid_lock
+) z order by 1, 2;
