@@ -18,3 +18,21 @@ supabase/.temp/
 supabase/.branches/
 dist/
 .DS_Store
+
+# recon hash salt (lives in /workspace/secrets, never in the repo)
+*salt*
+# payroll owner id (lives in /workspace/secrets, never in the repo)
+*payroll_owner_user_id*
+# generated import / owner SQL must never be committed (rev 4)
+/*.sql
+scripts/*.sql
+*.import.sql
+*_import*.sql
+owner*.sql
+# scratch SQL dropped next to the seeds (e.g. supabase/owner.sql, supabase/x.sql) is never committed (rev 4, Orchestrator);
+# supabase/*.sql matches only files directly in supabase/ (migrations/, deploy/, rollback/, tests/ are unaffected)
+supabase/*.sql
+!supabase/seed.sql
+!supabase/seed_slice2.sql
+!supabase/seed_slice3_mock.sql
+x.sql
