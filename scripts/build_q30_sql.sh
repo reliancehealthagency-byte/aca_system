@@ -12,6 +12,7 @@ M=supabase/migrations/20261031220000_q30_one_time_fee_include.sql
   echo "begin;"
   echo "do \$\$ begin"
   echo "  if to_regclass('public.recon_pay_config') is null then raise exception 'Q30: slice three is not applied'; end if;"
+  echo "  if not exists (select 1 from public.recon_pay_config where id) then raise exception 'Q30: the recon_pay_config row is missing: nothing changed'; end if;"
   echo "  if (select one_time_fee_policy from public.recon_pay_config where id) not in ('pending_kyle', 'include') then"
   echo "    raise exception 'Q30: one_time_fee_policy is %, not pending_kyle: not changed (owner already chose)', (select one_time_fee_policy from public.recon_pay_config where id);"
   echo "  end if;"
