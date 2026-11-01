@@ -20,6 +20,16 @@ begin
   execute format('set local role %I', role_name);
 end $$;
 
+-- Q30 (Kyle direct 10/31 9:04 PM): one_time_fee_policy is 'include' once migration 20261031220000 is applied, else the
+-- slice-three default 'pending_kyle'. The scenario checks below were written against the OPEN reading, so they run with
+-- 'pending_kyle' set explicitly (inside this rolled-back transaction) and test 'include' / 'exclude' directly (C11a-c).
+create temp table q30_start as
+  select (select one_time_fee_policy from public.recon_pay_config where id) as policy,
+         (select column_default from information_schema.columns where table_schema = 'public' and table_name = 'recon_pay_config' and column_name = 'one_time_fee_policy') as col_default,
+         exists (select 1 from information_schema.tables where table_schema = 'supabase_migrations' and table_name = 'schema_migrations')
+           and (xpath('/row/c/text()', query_to_xml('select count(*) as c from supabase_migrations.schema_migrations where version = ''20261031220000''', false, true, '')))[1]::text::int = 1 as q30_recorded,
+         (select count(*) from public.event_log where event_type = 'recon.config.decision' and detail->>'setting' = 'one_time_fee_policy') as q30_events;
+update public.recon_pay_config set one_time_fee_policy = 'pending_kyle' where id;
 -- T0. slice-one LIKE claim, checked against Premier's REAL labels in the mock file (before loading: use the raw CSV labels)
 \ir ../seed_slice3_mock.sql
 select pg_temp.r('T0. claim CONFIRMED: slice-one case-sensitive LIKE list matches only Wellness4You + ChampionCare among mock Premier labels',
@@ -338,12 +348,22 @@ end $$;
 select pg_temp.r('I1. no date-range filter: S37 board row booked 10/16 (outside the file''s 10/25-10/31) is ingested and paid',
   (select date_booked = '2026-10-16' and actual_commission = 119.32 from public.premier_recon_lines where member_id='687990338'),
   (select format('date_booked=%s', date_booked) from public.premier_recon_lines where member_id='687990338'));
+create temp table q30_pend as select line_key, member_id, row(open_item, premier_premium, premier_premium_incl_one_time, projected_commission, projected_spiffs, actual_commission, actual_spiffs, actual_total)::text r from public.premier_recon_lines;
 update public.recon_pay_config set one_time_fee_policy = 'exclude' where id;
 select pg_temp.r('C11a. S18 one-time-fee policy is config: exclude -> paid on recurring only (reading A 93.86), no longer OPEN',
   (select actual_total = 93.86 and open_item is null from public.premier_recon_lines where member_id='687990233'));
 update public.recon_pay_config set one_time_fee_policy = 'include' where id;
 select pg_temp.r('C11b. include -> recurring + enrollment fee (reading B 112.86)',
   (select actual_total = 112.86 and open_item is null from public.premier_recon_lines where member_id='687990233'));
+create temp table q30_diff as select l.line_key, l.member_id from public.premier_recon_lines l join q30_pend p using (line_key)
+  where row(l.open_item, l.premier_premium, l.premier_premium_incl_one_time, l.projected_commission, l.projected_spiffs, l.actual_commission, l.actual_spiffs, l.actual_total)::text is distinct from p.r;
+select pg_temp.r('C11c. (Q30, Kyle direct 9:04 PM) include changes only S18: no other line''s pay, premium or open item moves vs pending_kyle; the premium_mismatch input (premium incl. one-time) is the same under both',
+  (select count(*) = 1 and bool_and(member_id = '687990233') from q30_diff),
+  (select coalesce(string_agg(member_id || ' ' || line_key, ', '), 'none') from q30_diff));
+select pg_temp.r('Q30. policy at start: include once migration 20261031220000 ran (fresh build, or live after the Q30 file: column default include, one decision event), else pending_kyle (slice three only, not recorded, no event)',
+  (select case when col_default ~ 'include' then policy = 'include' and q30_events = 1
+               else policy = 'pending_kyle' and not q30_recorded and q30_events = 0 end from q30_start),
+  (select format('policy=%s default=%s recorded=%s events=%s', policy, col_default, q30_recorded, q30_events) from q30_start));
 update public.recon_pay_config set one_time_fee_policy = 'pending_kyle' where id;
 select pg_temp.r('C12a. Q11 resolved (Kyle 10/31): default post-date field = Premier First Billing Date, else board Active Date; status confirmed',
   (select post_date_source = 'premier_fbd_else_board_active' and post_date_source_status = 'confirmed' from public.recon_pay_config where id));
