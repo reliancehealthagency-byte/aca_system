@@ -1187,9 +1187,9 @@ create temp table walk as
          w.daily_net w_daily_net, w.overhead w_oh, w.earned_total w_earned, w.neo_book w_neo, w.allstate_earned w_allstate, w.net w_net,
          m.daily_net m_daily_net, m.overhead m_oh, m.earned_total m_earned, m.net m_net, m.projected_commission m_pc,
          (select sum(projected_commission) from public.pl_daily_walk where month_start = '2026-10-01') mo_pc_sum,
-         (select (sum(projected_commission) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_pays(line_status, added_to_closed_week)) eng_comm,
-         (select (sum(projected_spiffs) filter (where line_type = 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_pays(line_status, added_to_closed_week)) eng_abs,
-         (select (sum(projected_spiffs) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_pays(line_status, added_to_closed_week)) eng_sp,
+         (select (sum(projected_commission) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_status_pays(line_status)) eng_comm,
+         (select (sum(projected_spiffs) filter (where line_type = 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_status_pays(line_status)) eng_abs,
+         (select (sum(projected_spiffs) filter (where line_type <> 'ABS'))::numeric(12,2) from public.premier_recon_lines where date_booked = '2026-10-30' and public.recon_line_status_pays(line_status)) eng_sp,
          (select count(*) from public.pl_manual_entry_lines where description in ('VERIFY premium entered', 'VERIFY count')) ml,
          -- rev 4 B2: rep pay with NO pay predicate (what 2b5187d summed), for the 10/29 day, the 10/25 week and October
          (select sum(coalesce(projected_commission, 0) + coalesce(projected_spiffs, 0)) from public.premier_recon_lines
@@ -1204,31 +1204,43 @@ create temp table walk as
          (select line_status from public.premier_recon_lines where line_key = '20261029114007-P') dup_status,
          (select count(*) from public.pl_projected_rep_pay_lines where line_key = '20261029114007-P') dup_in_pl,
          (select count(*) from public.pl_projected_rep_pay_lines p join public.premier_recon_lines l using (line_key)
-           where not public.recon_line_pays(l.line_status, l.added_to_closed_week)) pl_nonpay,
+           where not public.recon_line_status_pays(l.line_status)) pl_nonpay,
          (select count(*) from public.premier_recon_lines l
-           where public.recon_line_pays(l.line_status, l.added_to_closed_week)
+           where public.recon_line_status_pays(l.line_status)
              and coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) is not null
              and not exists (select 1 from public.pl_projected_rep_pay_lines p where p.line_key = l.line_key)) pay_missing,
          -- parity with payroll pay: every line payroll has a corrected pay figure for (Premier collected), P&L rep pay = that pay
          (select count(*) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
             join public.premier_recon_lines l using (line_key)
            where l.actual_commission is not null and t.stage2_premier_corrected is not null
-             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')) par_n,
-         (select sum(coalesce(projected_commission, 0) + coalesce(projected_spiffs, 0)) from public.premier_recon_lines
-           where not public.recon_line_pays(line_status, added_to_closed_week) and line_status <> 'duplicate_board_row'
-             and coalesce(date_booked, (submitted_at at time zone 'America/New_York')::date) between '2026-10-25' and '2026-10-31') held_wk,
+             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')
+             and not p.added_to_closed_week) par_n,
+         -- Kyle direct 8:03 PM: the closed-week added rows count in their booked week on the P&L (payroll doesn't pay them)
+         (select count(*) from public.pl_projected_rep_pay_lines where added_to_closed_week) cw_n,
+         (select count(*) from public.pl_projected_rep_pay_lines p join public.premier_recon_lines l using (line_key)
+           where p.added_to_closed_week and public.recon_line_pays(l.line_status, l.added_to_closed_week)) cw_payroll_pays,
+         (select format('%s|%s|%s', p.day, p.deal_commission + p.spiffs + p.abs_pay, p.added_to_closed_week)
+            from public.pl_projected_rep_pay_lines p where p.line_key = '20261030163000-P') cw_line,
+         (select (projected_commission + coalesce(projected_spiffs, 0))::numeric(12,2) from public.premier_recon_lines where line_key = '20261030163000-P') cw_amt,
+         (select public.recon_line_pays(line_status, added_to_closed_week) from public.premier_recon_lines where line_key = '20261030163000-P') cw_recon_pays,
+         (select count(*) from public.pay_line_locks where line_key = '20261030163000-P') cw_locks,
+         (select format('stage2=%s final_payable=%s hold=%s', stage2_premier_corrected, final_payable, hold_status) from public.premier_recon_trueup where line_key = '20261030163000-P') cw_trueup,
+         (select sum(deal_commission + spiffs + abs_pay) from public.pl_projected_rep_pay_lines where day between '2026-10-25' and '2026-10-31' and not added_to_closed_week) pc_wk_open,
          (select sum(p.deal_commission + p.spiffs + p.abs_pay) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
             join public.premier_recon_lines l using (line_key)
            where l.actual_commission is not null and t.stage2_premier_corrected is not null
-             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')) par_pl,
+             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')
+             and not p.added_to_closed_week) par_pl,
          (select sum(t.stage2_premier_corrected) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
             join public.premier_recon_lines l using (line_key)
            where l.actual_commission is not null and t.stage2_premier_corrected is not null
-             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')) par_pay,
+             and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')
+             and not p.added_to_closed_week) par_pay,
          (select count(*) from public.pl_projected_rep_pay_lines p join public.premier_recon_trueup t using (line_key)
             join public.premier_recon_lines l using (line_key)
            where l.actual_commission is not null and t.stage2_premier_corrected is not null
              and l.line_status not in ('awaiting_first_payment', 'failed_payment', 'never_paid', 'not_in_premier')
+             and not p.added_to_closed_week
              and p.deal_commission + p.spiffs + p.abs_pay <> t.stage2_premier_corrected) par_bad,
          (select coalesce(t.stage2_premier_corrected, 0) from public.premier_recon_trueup t where t.line_key = '20261029114007-P') dup_payroll
     from public.pl_daily_walk d, public.pl_weekly_walk w, public.pl_monthly_walk m
@@ -1252,22 +1264,30 @@ select pg_temp.r('PL4. monthly rollup: October = every October daily net + earne
   (select format('daily_net=%s earned=%s overhead=%s net=%s projected_commission=%s', m_daily_net, m_earned, m_oh, m_net, m_pc) from walk));
 select pg_temp.r('PL5. entered Premier premium / policy counts are visible lines, not in the walk net',
   (select ml = 2 from walk), (select 'lines=' || ml from walk));
-select pg_temp.r('PL6. (B2) P&L rep pay counts exactly the lines payroll pays: the duplicate board row 20261029114007-P (98.47 + 50.00 spiff) is out, no non-paying line is in, no paying line is missing; lock and P&L share recon_line_pays()',
+select pg_temp.r('PL6. (B2) P&L rep pay uses payroll''s status rule: the duplicate board row 20261029114007-P (98.47 + 50.00 spiff) is out, no non-paying status is in, no line with a paying status is missing; the lock uses recon_line_pays() = recon_line_status_pays() + not added to a closed week, the P&L uses recon_line_status_pays()',
   (select dup_status = 'duplicate_board_row' and dup_amt = 148.47 and dup_in_pl = 0 and pl_nonpay = 0 and pay_missing = 0 and dup_payroll = 0 from walk)
   and (select prosrc ~ 'recon_line_pays' from pg_proc where proname = 'premier_lock_payday')
-  and (select pg_get_viewdef('public.pl_projected_rep_pay_lines'::regclass) ~ 'recon_line_pays'),
+  and (select prosrc ~ 'recon_line_status_pays' from pg_proc where proname = 'recon_line_pays')
+  and (select pg_get_viewdef('public.pl_projected_rep_pay_lines'::regclass) ~ 'recon_line_status_pays'
+          and pg_get_viewdef('public.pl_projected_rep_pay_lines'::regclass) !~ 'recon_line_pays\('),
   (select format('dup=%s %s in_pl=%s nonpay_in_pl=%s paying_missing=%s payroll_pays_dup=%s', dup_status, dup_amt, dup_in_pl, pl_nonpay, pay_missing, dup_payroll) from walk));
-select pg_temp.r('PL7. (B2) parity: for every line Premier has collected, P&L rep pay = payroll pay (uncollected lines: the P&L carries the projected cost by Date Booked, payroll pays 0 until collected) (premier_recon_trueup.stage2_premier_corrected), line by line and in total',
-  (select par_n > 20 and par_bad = 0 and par_pl = par_pay from walk),
-  (select format('lines=%s pl=%s payroll=%s mismatched=%s', par_n, par_pl, par_pay, par_bad) from walk));
-select pg_temp.r('PL8. (B2) corrected figures: 10/29 rep pay is 148.47 lower than the unfiltered sum 2b5187d used (the duplicate row); the 10/25 week and October are 148.47 lower plus, in this test only, the row verify adds to a closed week (held, so payroll does not pay it either); mock-only figures: local suite D4',
-  (select raw_1029 - pc_1029 = 148.47 and raw_wk - pc_wk = 148.47 + held_wk and raw_oct - m_pc = 148.47 + held_wk from walk),
-  (select format('10/29 %s (unfiltered %s); week rep pay %s (unfiltered %s; held closed-week row %s); week net %s; October rep pay %s (unfiltered %s), net %s',
-          pc_1029, raw_1029, pc_wk, raw_wk, held_wk, w_net, m_pc, raw_oct, m_net) from walk));
+select pg_temp.r('PL7. (B2) parity: for every line Premier has collected, P&L rep pay = payroll pay (premier_recon_trueup.stage2_premier_corrected), line by line and in total, EXCEPT the documented closed-week added rows (on the P&L in their booked week, never paid by payroll: PL9); uncollected lines carry the projected cost by Date Booked, payroll pays 0 until collected',
+  (select par_n > 20 and par_bad = 0 and par_pl = par_pay and cw_n >= 1 from walk),
+  (select format('lines=%s pl=%s payroll=%s mismatched=%s; excluded closed-week added rows=%s', par_n, par_pl, par_pay, par_bad, cw_n) from walk));
+select pg_temp.r('PL8. (B2) corrected figures: 10/29, the 10/25 week and October rep pay are each exactly 148.47 lower than the unfiltered sum 2b5187d used (only the duplicate row is out; the closed-week added row stays in, Kyle 8:03 PM); mock-only figures: local suite D4',
+  (select raw_1029 - pc_1029 = 148.47 and raw_wk - pc_wk = 148.47 and raw_oct - m_pc = 148.47 from walk),
+  (select format('10/29 %s (unfiltered %s); week rep pay %s (unfiltered %s); week net %s; October rep pay %s (unfiltered %s), net %s',
+          pc_1029, raw_1029, pc_wk, raw_wk, w_net, m_pc, raw_oct, m_net) from walk));
+select pg_temp.r('PL9. (Kyle direct 8:03 PM "No sales count to the week it happen, they don''t move for payroll") the 119.32 row verify adds to the closed week (20261030163000-P, booked 10/30) is in the 10/30 day and the 10/25 week rep pay; payroll still does not pay it (recon_line_pays false, no pay locks, true-up final payable empty, hold = held_added_to_closed_week); no separate held line',
+  (select cw_line = '2026-10-30|119.32|t' and cw_amt = 119.32 and cw_recon_pays = false and cw_locks = 0 and cw_payroll_pays = 0
+          and cw_trueup ~ 'final_payable= hold=held_added_to_closed_week'
+          and pc_wk - pc_wk_open = 119.32 from walk)
+  and not exists (select 1 from information_schema.columns where table_schema = 'public' and table_name in ('pl_daily_walk', 'pl_weekly_walk', 'pl_monthly_walk') and column_name ~ 'held'),
+  (select format('P&L line=%s; week rep pay %s incl. it, %s without; payroll: recon_line_pays=%s locks=%s %s', cw_line, pc_wk, pc_wk_open, cw_recon_pays, cw_locks, cw_trueup) from walk));
 select pg_temp.r('RV1. slice-two P&L views retired (Kyle directly 7:35 PM): pl_line_items / pl_daily / pl_weekly / pl_monthly / pl_unpriced_sales are gone',
   to_regclass('public.pl_line_items') is null and to_regclass('public.pl_daily') is null and to_regclass('public.pl_weekly') is null
   and to_regclass('public.pl_monthly') is null and to_regclass('public.pl_unpriced_sales') is null);
-select pg_temp.r('RV2. kept: slice-two tables expense_categories / revenue_adjustments (data), touch_updated_at(), slice-one sales_commission / commission_rates() / daily_pl / weekly_pl / monthly_pl',
+select pg_temp.r('RV2. kept: slice-two tables expense_categories / revenue_adjustments (data; drop in a later cleanup migration, Kyle direct 8:03 PM), touch_updated_at(), slice-one sales_commission / commission_rates() / daily_pl / weekly_pl / monthly_pl',
   to_regclass('public.expense_categories') is not null and to_regclass('public.revenue_adjustments') is not null
   and to_regprocedure('public.touch_updated_at()') is not null and to_regclass('public.sales_commission') is not null
   and to_regprocedure('public.commission_rates()') is not null and to_regclass('public.daily_pl') is not null

@@ -177,6 +177,7 @@ drop function if exists public.premier_product_addon(text, text, boolean);
 drop function if exists public.premier_row_fees(jsonb, text);
 drop function if exists public.recon_friday_after_week(date);
 drop function if exists public.recon_line_pays(text, boolean);
+drop function if exists public.recon_line_status_pays(text);
 drop function if exists public.recon_can_read();
 drop function if exists public.recon_col_letter(int);
 drop function if exists public.recon_digits(text);

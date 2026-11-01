@@ -211,21 +211,23 @@ comment on view public.pl_manual_entry_lines is
 -- Weekly:  the sum of the daily nets + the four weekly earned lines (Allstate Earned, Premier Book, Neo Book, O'Neil ACA)
 --          - overhead (Kyle directly 7:24 PM: earned sources affect weekly, never daily; overhead derived from the monthly input).
 -- Monthly: the same rolled up: daily nets + earned lines of the weeks whose Sunday falls in the month - full monthly overhead.
--- These views sit ALONGSIDE slice two's pl_daily / pl_weekly / pl_monthly, which are not changed (they still show
--- premium as revenue and the 38/43% figure as commission; see slice3_review.md "slice two impact").
--- Per line first (rev 4 B2): only lines payroll pays, by the SAME predicate premier_lock_payday uses
--- (recon_line_pays: no duplicate board rows, no rows held as added to a closed week).
+-- (Slice two's pl_daily / pl_weekly / pl_monthly showed premium as revenue; they are retired by migration
+-- 20261031210400, Kyle direct 7:35 PM.)
+-- Per line first (rev 4 B2): the same STATUS rule payroll uses (recon_line_status_pays: no duplicate board rows).
+-- Rows added to a closed week are INCLUDED in their booked date / week (Kyle direct 8:03 PM ET: "No sales count to the
+-- week it happen, they don't move for payroll"); payroll still doesn't pay them (recon_line_pays). No separate held line.
 create or replace view public.pl_projected_rep_pay_lines with (security_invoker = true) as
 select l.line_key, l.line_type, l.agent_name, l.line_status,
        coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) as day,
        (case when l.line_type <> 'ABS' then coalesce(l.projected_commission, 0) else 0 end)::numeric(12,2) as deal_commission,
        (case when l.line_type <> 'ABS' then coalesce(l.projected_spiffs, 0) else 0 end)::numeric(12,2)     as spiffs,
-       (case when l.line_type = 'ABS' then coalesce(l.projected_spiffs, 0) else 0 end)::numeric(12,2)      as abs_pay
+       (case when l.line_type = 'ABS' then coalesce(l.projected_spiffs, 0) else 0 end)::numeric(12,2)      as abs_pay,
+       coalesce(l.added_to_closed_week, false) as added_to_closed_week   -- shown, not excluded (Kyle 8:03 PM)
   from public.premier_recon_lines l
- where public.is_admin() and public.recon_line_pays(l.line_status, l.added_to_closed_week)
+ where public.is_admin() and public.recon_line_status_pays(l.line_status)
    and coalesce(l.date_booked, (l.submitted_at at time zone 'America/New_York')::date) is not null;
 comment on view public.pl_projected_rep_pay_lines is
-  'Projected rep pay per line (deal commission / spiffs / ABS pay), only lines payroll pays (recon_line_pays). Admin only.';
+  'Projected rep pay per line (deal commission / spiffs / ABS pay), by Date Booked; status rule shared with payroll (recon_line_status_pays); closed-week added rows count in their booked week. Admin only.';
 create or replace view public.pl_projected_rep_pay_daily with (security_invoker = true) as
 select day, sum(deal_commission)::numeric(12,2) as deal_commission, sum(spiffs)::numeric(12,2) as spiffs,
        sum(abs_pay)::numeric(12,2) as abs_pay, count(*) as line_count

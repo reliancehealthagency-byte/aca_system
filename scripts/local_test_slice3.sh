@@ -252,7 +252,7 @@ PLQ="select set_config('request.jwt.claims', json_build_object('sub','$ADM','rol
  select concat_ws('|', (select projected_commission from pl_daily_walk where day='2026-10-29'), (select net from pl_weekly_walk where week_start='2026-10-25'),
    (select projected_commission from pl_monthly_walk where month_start='2026-10-01'), (select net from pl_monthly_walk where month_start='2026-10-01'))"
 fig=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -c "begin" -c "$PLQ" -c "rollback" 2>/dev/null | grep '|' | tail -1)
-res "D4 (B2) mock-only P&L figures with the duplicate row excluded: 10/29 rep pay 1020.33 (was 1168.80), week 10/25 net -4336.15 (was -4484.62), October rep pay 4455.47 / net -4455.47 (were 4603.94 / -4603.94)" "$([ "$fig" = '1020.33|-4336.15|4455.47|-4455.47' ] && echo PASS || echo FAIL)" "$fig"
+res "D4 (B2) mock-only P&L figures with the duplicate row excluded (the plain mock has no closed-week added rows, so Kyle 8:03 PM changes nothing here): 10/29 rep pay 1020.33 (was 1168.80), week 10/25 net -4336.15 (was -4484.62), October rep pay 4455.47 / net -4455.47 (were 4603.94 / -4603.94)" "$([ "$fig" = '1020.33|-4336.15|4455.47|-4455.47' ] && echo PASS || echo FAIL)" "$fig"
 for m in supabase/migrations/2026103121*.sql; do psql -q -v ON_ERROR_STOP=1 -d $D -f $m >/dev/null 2>&1 || echo "FAIL rerun $m"; done
 res "D3 slice-three migrations re-run on a loaded DB (idempotent, data kept)" "$([ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select count(*) from premier_addon_map')" = "$(q t3_live -c 'select count(*) from premier_addon_map')" ] && echo PASS || echo FAIL)" ""
 

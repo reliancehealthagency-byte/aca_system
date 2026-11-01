@@ -21,13 +21,21 @@ language sql stable set search_path = public, pg_temp as $$
   select public.is_admin() or current_user in ('postgres', 'service_role', 'supabase_admin')
 $$;
 
--- rev 4 (Orchestrator review of 2b5187d, B2): the ONE "does this line pay" predicate. Payroll (premier_lock_payday) and
--- the P&L projected rep pay (pl_projected_rep_pay_lines) both use it, so they can't drift: a duplicate board row never
--- pays, and a row first seen in a closed week is held for Kyle (not payable until he decides). Superseded board versions
--- never reach premier_recon_lines (board_submissions_current keeps only the newest version).
+-- rev 4 (Orchestrator review of 2b5187d, B2; Kyle direct 8:03 PM ET): the line-pay rules, in two layers so the status
+-- rules can't drift between payroll and the P&L.
+--   recon_line_status_pays(status): the STATUS rule, shared by both: a duplicate board row never pays. Superseded board
+--     versions never reach premier_recon_lines (board_submissions_current keeps only the newest version).
+--   recon_line_pays(status, added_to_closed_week): PAYROLL (premier_lock_payday) = the status rule AND not a row first
+--     seen in a closed week (closed weeks are flag-only and never reopened; Kyle 10/31).
+-- The P&L rep pay (pl_projected_rep_pay_lines) uses the status rule only: "No sales count to the week it happen, they
+-- don't move for payroll" (Kyle direct 8:03 PM), so a closed-week added row counts in its booked date / week.
+create or replace function public.recon_line_status_pays(p_line_status text) returns boolean
+language sql immutable as $$
+  select coalesce(p_line_status, '') <> 'duplicate_board_row'
+$$;
 create or replace function public.recon_line_pays(p_line_status text, p_added_to_closed_week boolean) returns boolean
 language sql immutable as $$
-  select coalesce(p_line_status, '') <> 'duplicate_board_row' and not coalesce(p_added_to_closed_week, false)
+  select public.recon_line_status_pays(p_line_status) and not coalesce(p_added_to_closed_week, false)
 $$;
 
 create or replace function public.recon_friday_after_week(d date) returns date
