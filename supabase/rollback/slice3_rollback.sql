@@ -313,9 +313,10 @@ revoke all on public.pl_line_items, public.pl_daily, public.pl_weekly, public.pl
 grant select on public.pl_line_items, public.pl_daily, public.pl_weekly, public.pl_monthly, public.pl_unpriced_sales to authenticated;
 
 do $$ begin
+  -- (also the Q30 config migration 20261031220000 if it was applied: its only effects live in recon_pay_config, dropped above)
   if to_regclass('supabase_migrations.schema_migrations') is not null then
     execute $q$delete from supabase_migrations.schema_migrations
-                where version in ('20261031210000','20261031210100','20261031210200','20261031210300','20261031210400')$q$;
+                where version in ('20261031210000','20261031210100','20261031210200','20261031210300','20261031210400','20261031220000')$q$;
   end if;
 end $$;
 

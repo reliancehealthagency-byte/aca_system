@@ -242,6 +242,38 @@ res "F1 slice-one/two migrations, seeds, verify files and rollback unchanged vs 
 bash scripts/build_slice2_paste.sh "$T/s2.sql" >/dev/null
 res "F2 slice-two paste rebuilt from this branch is byte-identical to the applied one" "$([ "$(sha256sum < "$T/s2.sql")" = "$(sha256sum < $PASTE2)" ] && echo PASS || echo FAIL)" "$(sha256sum < "$T/s2.sql" | cut -c1-16)"
 
+# Q. Q30 (Kyle direct 10/31 9:04 PM): the live SQL Editor apply + revert files on a live-like DB after the slice-three paste
+D=t3_q30; liveish $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1 || echo "FAIL paste"
+Q30F=$(mktemp); Q30R=$(mktemp); bash scripts/build_q30_sql.sh "$Q30F" >/dev/null; bash scripts/build_q30_revert_sql.sh "$Q30R" >/dev/null
+Q30STATE="select concat_ws('|', md5((to_jsonb(c) - 'note' - 'updated_at')::text), (select column_default from information_schema.columns where table_schema='public' and table_name='recon_pay_config' and column_name='one_time_fee_policy'),
+  (select count(*) from supabase_migrations.schema_migrations where version = '20261031220000')) from public.recon_pay_config c where c.id"
+PRE=$(q $D -c "$Q30STATE"); SCHQ0=$(q $D -c "$SCHEMA")
+r0=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30R" 2>&1 | grep -o 'not include: nothing changed' | head -1)
+res "Q0 Q30 revert refuses before the apply (value pending_kyle), changes nothing" "$([ -n "$r0" ] && [ "$(q $D -c "$Q30STATE")" = "$PRE" ] && echo PASS || echo FAIL)" "${r0:-no refusal}"
+r1=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30F" 2>&1 | tail -1); r2=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30F" 2>&1 | tail -1)
+res "Q1 Q30 file: pending_kyle -> include, default include, version recorded, one decision event; re-run is a no-op" "$([ "$r1" = 'include|t|t|1' ] && [ "$r2" = 'include|t|t|1' ] && echo PASS || echo FAIL)" "run1=$r1 run2=$r2"
+ev=$(q $D -c "select concat_ws('/', count(*) filter (where event_type = 'row.update' and table_name = 'recon_pay_config' and after->>'one_time_fee_policy' = 'include'), count(*) filter (where event_type = 'recon.config.decision' and detail->>'reason' = 'Kyle direct 10/31 9:04 PM Q30' and detail->>'path' = 'break-glass:postgres')) from event_log")
+res "Q2 Q30 audited: row.update on recon_pay_config + recon.config.decision (reason, break-glass:postgres)" "$([ "$ev" = 1/1 ] && echo PASS || echo FAIL)" "$ev"
+n=$(passes $D supabase/tests/verify_slice3.sql); res "Q3 verify_slice3 after the Q30 file" "$([ $T3 -gt 0 ] && [ $n = $T3 ] && echo PASS || echo FAIL)" "$n/$T3 $(fails $D supabase/tests/verify_slice3.sql)"
+q $D -c "update public.recon_pay_config set one_time_fee_policy = 'exclude' where id" >/dev/null
+r3=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30F" 2>&1 | grep -o 'not pending_kyle: not changed' | head -1); r3v=$(q $D -c "select one_time_fee_policy from recon_pay_config")
+r3r=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30R" 2>&1 | grep -o 'not include: nothing changed' | head -1); r3rv=$(q $D -c "select one_time_fee_policy from recon_pay_config")
+res "Q4 apply and revert both refuse (change nothing) when the owner already chose another value (exclude)" "$([ -n "$r3" ] && [ -n "$r3r" ] && [ "$r3v" = exclude ] && [ "$r3rv" = exclude ] && echo PASS || echo FAIL)" "apply: ${r3:-no refusal}; revert: ${r3rv:+$r3r} value=$r3rv"
+q $D -c "update public.recon_pay_config set one_time_fee_policy = 'include' where id" >/dev/null
+rv=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30R" 2>&1 | tail -1); POST=$(q $D -c "$Q30STATE")
+rve=$(q $D -c "select count(*) from event_log where event_type = 'recon.config.decision' and detail->>'to' = 'pending_kyle' and detail->>'path' = 'break-glass:postgres'")
+res "Q5 Q30 revert: value + column default back to pending_kyle, history row deleted, decision event; recon_pay_config (minus note / updated_at), default and history == pre-Q30" "$([ "$rv" = 'pending_kyle|t|f|1' ] && [ "$POST" = "$PRE" ] && [ "$rve" = 1 ] && [ "$(q $D -c "$SCHEMA")" = "$SCHQ0" ] && echo PASS || echo FAIL)" "grid=$rv state_equal=$([ "$POST" = "$PRE" ] && echo yes || echo no) events=$rve"
+r6=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30R" 2>&1 | grep -o 'not include: nothing changed' | head -1)
+n=$(passes $D supabase/tests/verify_slice3.sql)
+res "Q6 revert re-run refuses; verify_slice3 passes after the revert" "$([ -n "$r6" ] && [ $n = $T3 ] && echo PASS || echo FAIL)" "${r6:-no refusal}; verify $n/$T3"
+psql -X -q -v ON_ERROR_STOP=1 -d $D -f $RB >/dev/null 2>/tmp/q30rb.txt; rc=$?
+res "Q7 after apply + revert the full slice-three rollback works again (exit 0, the five slice-two views back, no slice-three version left)" "$([ $rc = 0 ] && [ -n "$(q $D -c "$V5")" ] && [ "$(q $D -c "select count(*) from supabase_migrations.schema_migrations where version >= '20261031210000'")" = 0 ] && echo PASS || echo FAIL)" "rc=$rc $(grep -m1 ERROR /tmp/q30rb.txt)"
+D=t3_q30b; liveish $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1 || echo "FAIL paste"
+q $D -c "delete from public.recon_pay_config" >/dev/null
+m1=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30F" 2>&1 | grep -o 'recon_pay_config row is missing' | head -1); m2=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30R" 2>&1 | grep -o 'recon_pay_config row is missing' | head -1)
+res "Q8 apply and revert raise when the recon_pay_config row is missing (nothing recorded)" "$([ -n "$m1" ] && [ -n "$m2" ] && [ "$(q $D -c "select count(*) from supabase_migrations.schema_migrations where version = '20261031220000'")" = 0 ] && echo PASS || echo FAIL)" "apply: ${m1:-no raise}; revert: ${m2:-no raise}"
+rm -f "$Q30F" "$Q30R"
+
 # D. fresh build from the repo
 D=t3_fresh; newdb $D
 for f in supabase/migrations/*.sql supabase/seed.sql supabase/seed_slice2.sql; do psql -q -v ON_ERROR_STOP=1 -d $D -f $f >/dev/null 2>&1 || echo "FAIL $f"; done
@@ -254,7 +286,7 @@ PLQ="select set_config('request.jwt.claims', json_build_object('sub','$ADM','rol
  select concat_ws('|', (select projected_commission from pl_daily_walk where day='2026-10-29'), (select net from pl_weekly_walk where week_start='2026-10-25'),
    (select projected_commission from pl_monthly_walk where month_start='2026-10-01'), (select net from pl_monthly_walk where month_start='2026-10-01'))"
 fig=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -c "begin" -c "$PLQ" -c "rollback" 2>/dev/null | grep '|' | tail -1)
-res "D4 (B2) mock-only P&L figures with the duplicate row excluded (the plain mock has no closed-week added rows, so Kyle 8:03 PM changes nothing here): 10/29 rep pay 1020.33 (was 1168.80), week 10/25 net -4336.15 (was -4484.62), October rep pay 4455.47 / net -4455.47 (were 4603.94 / -4603.94)" "$([ "$fig" = '1020.33|-4336.15|4455.47|-4455.47' ] && echo PASS || echo FAIL)" "$fig"
+res "D4 mock-only P&L figures (fresh build incl. Q30 include: S18 112.86 on 10/30): 10/29 rep pay 1020.33, week 10/25 net -4449.01, October rep pay 4568.33 / net -4568.33 (before Q30: -4336.15 / 4455.47 / -4455.47; before B2: -4484.62 / 4603.94)" "$([ "$fig" = '1020.33|-4449.01|4568.33|-4568.33' ] && echo PASS || echo FAIL)" "$fig"
 for m in supabase/migrations/2026103121*.sql; do psql -q -v ON_ERROR_STOP=1 -d $D -f $m >/dev/null 2>&1 || echo "FAIL rerun $m"; done
 res "D3 slice-three migrations re-run on a loaded DB (idempotent, data kept)" "$([ "$(q $D -c 'select count(*) from premier_member_products')" = 66 ] && [ "$(q $D -c 'select count(*) from premier_addon_map')" = "$(q t3_live -c 'select count(*) from premier_addon_map')" ] && echo PASS || echo FAIL)" ""
 
