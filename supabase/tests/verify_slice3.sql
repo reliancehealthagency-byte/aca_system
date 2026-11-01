@@ -28,7 +28,10 @@ create temp table q30_start as
          (select column_default from information_schema.columns where table_schema = 'public' and table_name = 'recon_pay_config' and column_name = 'one_time_fee_policy') as col_default,
          exists (select 1 from information_schema.tables where table_schema = 'supabase_migrations' and table_name = 'schema_migrations')
            and (xpath('/row/c/text()', query_to_xml('select count(*) as c from supabase_migrations.schema_migrations where version = ''20261031220000''', false, true, '')))[1]::text::int = 1 as q30_recorded,
-         (select count(*) from public.event_log where event_type = 'recon.config.decision' and detail->>'setting' = 'one_time_fee_policy') as q30_events;
+         (select count(*) from public.event_log where event_type = 'recon.config.decision' and detail->>'setting' = 'one_time_fee_policy'
+            and detail->>'to' = 'include') as q30_events,
+         (select count(*) from public.event_log where event_type = 'recon.config.decision' and detail->>'setting' = 'one_time_fee_policy'
+            and detail->>'from' = 'include' and detail->>'to' = 'pending_kyle') as q30_reverts;
 update public.recon_pay_config set one_time_fee_policy = 'pending_kyle' where id;
 -- T0. slice-one LIKE claim, checked against Premier's REAL labels in the mock file (before loading: use the raw CSV labels)
 \ir ../seed_slice3_mock.sql
@@ -360,10 +363,10 @@ create temp table q30_diff as select l.line_key, l.member_id from public.premier
 select pg_temp.r('C11c. (Q30, Kyle direct 9:04 PM) include changes only S18: no other line''s pay, premium or open item moves vs pending_kyle; the premium_mismatch input (premium incl. one-time) is the same under both',
   (select count(*) = 1 and bool_and(member_id = '687990233') from q30_diff),
   (select coalesce(string_agg(member_id || ' ' || line_key, ', '), 'none') from q30_diff));
-select pg_temp.r('Q30. policy at start: include once migration 20261031220000 ran (fresh build, or live after the Q30 file: column default include, one decision event), else pending_kyle (slice three only, not recorded, no event)',
-  (select case when col_default ~ 'include' then policy = 'include' and q30_events = 1
-               else policy = 'pending_kyle' and not q30_recorded and q30_events = 0 end from q30_start),
-  (select format('policy=%s default=%s recorded=%s events=%s', policy, col_default, q30_recorded, q30_events) from q30_start));
+select pg_temp.r('Q30. policy at start: include once migration 20261031220000 ran (fresh build, or live after the Q30 file: column default include, one more apply event than revert events), else pending_kyle (slice three only, or after the Q30 revert: not recorded, applies = reverts)',
+  (select case when col_default ~ 'include' then policy = 'include' and q30_events = q30_reverts + 1
+               else policy = 'pending_kyle' and not q30_recorded and q30_events = q30_reverts end from q30_start),
+  (select format('policy=%s default=%s recorded=%s applies=%s reverts=%s', policy, col_default, q30_recorded, q30_events, q30_reverts) from q30_start));
 update public.recon_pay_config set one_time_fee_policy = 'pending_kyle' where id;
 select pg_temp.r('C12a. Q11 resolved (Kyle 10/31): default post-date field = Premier First Billing Date, else board Active Date; status confirmed',
   (select post_date_source = 'premier_fbd_else_board_active' and post_date_source_status = 'confirmed' from public.recon_pay_config where id));

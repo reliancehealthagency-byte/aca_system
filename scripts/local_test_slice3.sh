@@ -267,7 +267,7 @@ r6=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30R" 2>&1 | grep -o 'not include
 n=$(passes $D supabase/tests/verify_slice3.sql)
 res "Q6 revert re-run refuses; verify_slice3 passes after the revert" "$([ -n "$r6" ] && [ $n = $T3 ] && echo PASS || echo FAIL)" "${r6:-no refusal}; verify $n/$T3"
 psql -X -q -v ON_ERROR_STOP=1 -d $D -f $RB >/dev/null 2>/tmp/q30rb.txt; rc=$?
-res "Q7 after apply + revert the full slice-three rollback works again (exit 0, the five slice-two views back, no slice-three version left)" "$([ $rc = 0 ] && [ -n "$(q $D -c "$V5")" ] && [ "$(q $D -c "select count(*) from supabase_migrations.schema_migrations where version like '202610312%'")" = 0 ] && echo PASS || echo FAIL)" "rc=$rc $(grep -m1 ERROR /tmp/q30rb.txt)"
+res "Q7 after apply + revert the full slice-three rollback works again (exit 0, the five slice-two views back, no slice-three version left)" "$([ $rc = 0 ] && [ -n "$(q $D -c "$V5")" ] && [ "$(q $D -c "select count(*) from supabase_migrations.schema_migrations where version >= '20261031210000'")" = 0 ] && echo PASS || echo FAIL)" "rc=$rc $(grep -m1 ERROR /tmp/q30rb.txt)"
 D=t3_q30b; liveish $D; psql -X -q -v ON_ERROR_STOP=1 -d $D -f $PASTE >/dev/null 2>&1 || echo "FAIL paste"
 q $D -c "delete from public.recon_pay_config" >/dev/null
 m1=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30F" 2>&1 | grep -o 'recon_pay_config row is missing' | head -1); m2=$(psql -X -At -v ON_ERROR_STOP=1 -d $D -f "$Q30R" 2>&1 | grep -o 'recon_pay_config row is missing' | head -1)
