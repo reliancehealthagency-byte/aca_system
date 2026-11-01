@@ -83,20 +83,34 @@ npm install && npm run build && npm start
 ```
 `supabase/tests/local_supabase_stub.sql` lets the migrations run on a plain local Postgres for testing. **Never run it against the real project.**
 
-## One-time hub cutover (Paid Lock import)
+## One-time hub cutover (Paid Lock + Lock Open Items import)
 Layout (Kyle 11/01 11:55 AM ET, relayed): `Pay Friday | Agent | Paid Total | System Total | Locked At (ET) | Note`, the hub's
-Paid Lock tab. `scripts/hub_cutover.py`:
-- `build`: the tab read twice (UNFORMATTED serials + as displayed; both must agree) -> normalized CSV (ISO dates, cents,
-  Locked At to the minute in ET; the display hides the time). Real pay data never goes in this public repo (`--out` refuses).
+Paid Lock tab, plus the hub's Lock Open Items tab (read-only, from the SAME read). `scripts/hub_cutover.py`:
+- `build`: Paid Lock read twice (UNFORMATTED serials + as displayed; both must agree) -> normalized CSV (ISO dates, cents,
+  Locked At to the minute in ET; the display hides the time). Lock Open Items -> normalized CSV (kind post_date | unconfirmed),
+  plus the hub code's `LOCK_OPEN_SEEDS_` items from a private `--hub-code-seeds` CSV. Writes `snapshot.json` (both shas):
+  `sql --snapshot` refuses files from different reads. Real pay data never goes in this public repo (`--out` refuses).
 - `check`: rows and sums per payday, Paid vs System variances, duplicates, hub-roster and backend agent-id mapping, ET parsing,
-  System Total vs Finalized Paydays, hub Lock Open Items still open. Exit 1 on a hard error.
-- `sql --dry-run | --confirm-hub`: one SQL Editor paste = one DO block (one transaction). The dry run validates against the
-  live state and then raises, so nothing persists. Apply: payroll owner login or SQL Editor (postgres break-glass, audited by
-  `payroll.hub_cutover.recorded` + `payroll.hub_cutover.import`). Same file again = no-op; another file = refused; refused if
-  this system already locked a payday or submitted one after the file's last payday; in-DB re-check of duplicates, Fridays,
-  per-payday counts and sums.
+  System Total vs Finalized Paydays, open items by agent. Exit 1 on a hard error.
+- `sql --dry-run | --confirm-hub --dry-run-token T`: one SQL Editor paste = one transaction (migration
+  `20261101120000_hub_lock_open_items` if not yet in place, SQL Editor only + one DO block). The dry run validates against the
+  live state, prints `DRY RUN TOKEN T` (file shas + live-state fingerprint) and raises, so nothing persists. APPLY refuses unless
+  T matches the live state now (dry-run-before-confirm, enforced in SQL without writing). Apply: payroll owner login (migration
+  applied beforehand) or SQL Editor (postgres break-glass), audited by `payroll.hub_cutover.recorded` + `payroll.hub_cutover.import`.
+  Same files again = no-op; another file = refused; refused if this system already locked a payday or submitted one after the
+  file's last payday; in-DB re-check of duplicates, Fridays, per-payday counts and sums.
+- Roster check (in SQL): every name carrying hub dollars or a still-open item must resolve to a backend agent or
+  `agent_name_aliases` row, else DRY RUN BLOCKED (no token) / APPLY refused. `UNKNOWN` at $0 is exempt. Board rows loaded
+  before the roster keep a NULL agent id (not back-filled by the cutover).
+- Open items: a still-open item (Paid On blank) is exempt from `paid_by_hub`: once Premier confirms, it shows as
+  `hub_open_item` in `premier_recon_trueup` and pays ONCE on the next open payday (post dates: commission; unconfirmed:
+  commission + spiffs), locked by `premier_lock_payday`. An item with Paid On set was paid by the hub and stays $0.
+- Rebuild at the switch: `scripts/hub_cutover_rebuild.sh PKG` (then `TOKEN=T` for the apply). Timing: no live cutover before
+  the actual switch; re-export both tabs right before it; until it is recorded, no backend submits for paydays the hub still pays.
+  Paid Lock values are frozen after the import; later corrections go through `pay_adjustments`.
+- The older `csv_to_recon_sql.py --hub` path is superseded (it does not import open items, and after a cutover none can be added).
 - Read-only preflight: `supabase/deploy/hub_cutover_preflight.sql`. Tests: `scripts/local_test_hub_cutover.sh [REAL.csv]`
-  (fresh local build of this tree; mock fixture `supabase/tests/fixtures/hub_paid_lock_mock.csv`).
+  (fresh local build of this tree; fake fixtures `supabase/tests/fixtures/hub_paid_lock_mock.csv`, `hub_lock_open_mock.csv`).
 
 ## Seed data (fake)
 3 agents (1 admin, 2 agents), 10 contacts (`@example.com`, 555-01xx phones), 5 applications, 5 sales in the week of Sun 10/25 to Sat 10/31/2026:
