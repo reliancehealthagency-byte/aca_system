@@ -35,6 +35,20 @@ create temp table q30_start as
 update public.recon_pay_config set one_time_fee_policy = 'pending_kyle' where id;
 -- T0. slice-one LIKE claim, checked against Premier's REAL labels in the mock file (before loading: use the raw CSV labels)
 \ir ../seed_slice3_mock.sql
+\if :{?slice4a}
+-- slice 4a: closed_week_policy is 'next_open_payday' once migration 20261101100200 ran (fresh build), else 'hold' (live today).
+-- The scenario checks below were written against 'hold'; they run with it set explicitly (rolled back) and the carry is
+-- tested directly at the end (CW0-CW6).
+create temp table cw_start as
+  select (select closed_week_policy from public.recon_pay_config where id) as policy,
+         (select column_default from information_schema.columns where table_schema = 'public' and table_name = 'recon_pay_config' and column_name = 'closed_week_policy') as col_default;
+\endif
+-- slice 4a: where the closed_week_policy column exists (20261101100100+), these checks run under 'hold' (rolled back).
+do $$ begin
+  if exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'recon_pay_config' and column_name = 'closed_week_policy') then
+    execute $q$update public.recon_pay_config set closed_week_policy = 'hold' where id$q$;
+  end if;
+end $$;
 select pg_temp.r('T0. claim CONFIRMED: slice-one case-sensitive LIKE list matches only Wellness4You + ChampionCare among mock Premier labels',
   (select array_agg(distinct product_label order by product_label) from public.premier_member_products p
     where exists (select 1 from unnest((select qualifying_addon_patterns from public.commission_config where id)) pat where p.product_label like pat))
@@ -1343,6 +1357,9 @@ select pg_temp.r('RV2. kept: slice-two tables expense_categories / revenue_adjus
   and to_regprocedure('public.commission_rates()') is not null and to_regclass('public.daily_pl') is not null
   and to_regclass('public.weekly_pl') is not null and to_regclass('public.monthly_pl') is not null);
 
+\if :{?slice4a}
+\ir verify_slice4a_checks.sql
+\endif
 reset role;
 \o
 select n, case when pass then 'PASS' else 'FAIL' end as result, check_name, detail from results order by n;
